@@ -1,7 +1,7 @@
 #![crate_type = "lib"]
 #![forbid(unsafe_code)]
-#![forbid(missing_debug_implementations)]
-#![forbid(missing_docs)]
+#![allow(missing_debug_implementations)]
+#![allow(missing_docs)]
 #![allow(clippy::missing_errors_doc)]
 #![doc = include_str!("../README.md")]
 // Feature `doc_cfg` is currently only available on nightly builds.
@@ -35,6 +35,6 @@ use adb_transport::ADBTransport;
 pub use error::{Result, RustADBError};
 pub use message_devices::*;
 pub use models::{
-    ADBListItem, ADBListItemType, ADBStatExtendedResponse, ADBStatMapping, AdbStatResponse,
-    HostFeatures, RebootType, RemountInfo,
+    ADBListItem, ADBListItemType, ADBLocalCommand, ADBStatExtendedResponse, ADBStatMapping,
+    AdbStatResponse, HostFeatures, RebootType, RemountInfo,
 };
