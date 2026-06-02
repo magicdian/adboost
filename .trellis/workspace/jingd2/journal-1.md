@@ -39,3 +39,36 @@ Imported the functional hunks of 0001-xdb-usb-extensions.patch (authored against
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Bootstrap backend coding guidelines
+
+**Date**: 2026-06-02
+**Task**: Bootstrap backend coding guidelines
+**Branch**: `main`
+
+### Summary
+
+Filled the five placeholder backend spec files from real adb_client/adb_cli/pyadb_client source (verified file:line citations): directory-structure (workspace + mod.rs convention + models/commands/*_commands split + ADBDeviceExt layering), error-handling (RustADBError thiserror + Result alias, CLI ADBCliError classification, PyO3 anyhow mapping, panic policy, persistent.rs lock().unwrap() flagged as tech debt), logging-guidelines (log facade, log::<level>! style, level conventions), database-guidelines (repurposed as Persistence & External State since there is no DB), quality-guidelines (clippy pedantic, MSRV 1.88, feature flags + CI feature gap, inline test style, quality gate). Updated index with pre-dev checklist. Completed and archived 00-bootstrap-guidelines.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b074d8e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
