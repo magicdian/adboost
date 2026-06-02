@@ -1,12 +1,31 @@
 # Backend Development Guidelines
 
-> Best practices for backend development in this project.
+> Coding guidelines for `xp_adb_client` — a pure-Rust ADB (Android Debug
+> Bridge) client library, forked from `cocool97/adb_client` at v3.2.2 and
+> maintained independently.
 
 ---
 
 ## Overview
 
-This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
+This is a Rust Cargo workspace (edition 2024, MSRV 1.88.0): the `adb_client`
+core library, the `adb_cli` binary, the `pyadb_client` PyO3 bindings, and an
+mDNS example. There is **no web/database backend** — "backend" here means the
+Rust library + CLI code. The guidelines below document the codebase's **actual**
+conventions with real file paths and line numbers.
+
+---
+
+## Pre-Development Checklist
+
+Read the relevant guideline before writing code in that area:
+
+- **Always**: [Directory Structure](./directory-structure.md),
+  [Quality Guidelines](./quality-guidelines.md)
+- **Touching errors / `Result` / panics**: [Error Handling](./error-handling.md)
+- **Adding `log` calls**: [Logging Guidelines](./logging-guidelines.md)
+- **Persistence / RSA key / session state**: [Persistence & External State](./database-guidelines.md)
+- **Importing an upstream `.patch`**: [Upstream Patch Import](./upstream-patch-import.md)
 
 ---
 
@@ -14,26 +33,13 @@ This directory contains guidelines for backend development. Fill in each file wi
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
-| [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
-| [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
+| [Directory Structure](./directory-structure.md) | Workspace + module layout, mod.rs convention, models/commands split, device trait layering | Filled |
+| [Persistence & External State](./database-guidelines.md) | No DB; RSA key on disk, USB session multiplexing, state conventions | Filled |
+| [Error Handling](./error-handling.md) | `RustADBError` (thiserror), `Result` alias, CLI `ADBCliError`, PyO3 `anyhow` mapping | Filled |
+| [Quality Guidelines](./quality-guidelines.md) | clippy pedantic, MSRV, features, testing style, quality gate | Filled |
+| [Logging Guidelines](./logging-guidelines.md) | `log` facade, `log::<level>!` style, level conventions | Filled |
 | [Upstream Patch Import](./upstream-patch-import.md) | How to import patches into this fork (skip Cargo.toml, handle version drift) | Filled |
 
 ---
 
-## How to Fill These Guidelines
-
-For each guideline file:
-
-1. Document your project's **actual conventions** (not ideals)
-2. Include **code examples** from your codebase
-3. List **forbidden patterns** and why
-4. Add **common mistakes** your team has made
-
-The goal is to help AI assistants and new team members understand how YOUR project works.
-
----
-
-**Language**: All documentation should be written in **English**.
+**Language**: All documentation is written in **English**.
