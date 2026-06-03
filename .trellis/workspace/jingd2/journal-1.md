@@ -72,3 +72,37 @@ Filled the five placeholder backend spec files from real adb_client/adb_cli/pyad
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Migrate USB transport from rusb to nusb
+
+**Date**: 2026-06-03
+**Task**: Migrate USB transport from rusb to nusb
+**Branch**: `main`
+
+### Summary
+
+Migrated adb_client USB layer from rusb (libusb/vendored-C) to pure-Rust nusb. Thin adapter keeps USBTransport public API stable; new_from_device now takes nusb::DeviceInfo. Per-call timeout via Endpoint::transfer_blocking; TransferError::Cancelled mapped to new RustADBError::UsbTimeout and matched structurally in the persistent reader loop (replacing fragile error-string matching). IN/OUT endpoints behind two separate Arc<Mutex> locks (USBTransport stays Clone per ADBMessageTransport bound) so reader never blocks writer. Preserved header/payload accumulate loop, zero-length-packet write, CRC32 integrity. Verified: adb_client/adb_cli build+clippy+test green; pyadb_client green under Python 3.10/3.12 (3.9 failure was a pre-existing abi3-py310 env issue). 4 new unit tests. Remaining: Windows WinUSB on-device manual test (USB I/O not CI-testable).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1af81a5` | (see git log) |
+| `3336689` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
