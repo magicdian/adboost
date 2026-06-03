@@ -54,6 +54,7 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::IntegerConversionError(_)
             | RustADBError::NoHomeDirectory
             | RustADBError::UsbError(_)
+            | RustADBError::UsbTransferError(_)
             | RustADBError::InvalidIntegrity(_, _)
             | RustADBError::Base64DecodeError(_)
             | RustADBError::Base64EncodeError(_)
@@ -81,6 +82,7 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::USBDeviceNotFound(_, _)
             | RustADBError::WrongFileExtension(_)
             | RustADBError::AddrParseError(_)
+            | RustADBError::UsbTimeout
             | RustADBError::DeviceBusy => Self::Standard(value),
         }
     }

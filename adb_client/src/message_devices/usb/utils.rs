@@ -1,6 +1,16 @@
-use rusb::{Context, Device, DeviceDescriptor, UsbContext, constants::LIBUSB_CLASS_VENDOR_SPEC};
+use nusb::{DeviceInfo, MaybeFuture};
 
 use crate::{Result, RustADBError};
+
+const ADB_SUBCLASS: u8 = 0x42;
+const ADB_PROTOCOL: u8 = 0x1;
+
+// Some devices require choosing the file transfer mode
+// for usb debugging to take effect.
+const BULK_CLASS: u8 = 0xdc;
+const BULK_ADB_SUBCLASS: u8 = 2;
+
+const LIBUSB_CLASS_VENDOR_SPEC: u8 = 0xff;
 
 /// Represents an Android device connected via USB
 #[derive(Clone, Debug)]
@@ -17,36 +27,23 @@ pub struct ADBDeviceInfo {
 pub fn find_all_connected_adb_devices() -> Result<Vec<ADBDeviceInfo>> {
     let mut found_devices = vec![];
 
-    let context = Context::new()?;
-    for device in context.devices()?.iter() {
-        let Ok(des) = device.device_descriptor() else {
+    for device in nusb::list_devices().wait()? {
+        if !is_adb_device(&device) {
             continue;
-        };
-
-        if is_adb_device(&device, &des) {
-            let Ok(device_handle) = device.open() else {
-                found_devices.push(ADBDeviceInfo {
-                    vendor_id: des.vendor_id(),
-                    product_id: des.product_id(),
-                    device_description: "Unknown device".to_string(),
-                });
-                continue;
-            };
-
-            let manufacturer = device_handle
-                .read_manufacturer_string_ascii(&des)
-                .unwrap_or_else(|_| "Unknown".to_string());
-
-            let product = device_handle
-                .read_product_string_ascii(&des)
-                .unwrap_or_else(|_| "Unknown".to_string());
-
-            found_devices.push(ADBDeviceInfo {
-                vendor_id: des.vendor_id(),
-                product_id: des.product_id(),
-                device_description: format!("{manufacturer} {product}"),
-            });
         }
+
+        // `nusb` exposes the manufacturer / product strings on the cached
+        // `DeviceInfo` (populated during enumeration), so unlike the previous
+        // `rusb` code we do not need to open the device to read them. We still
+        // preserve the "Unknown" fallback when a string is unavailable.
+        let manufacturer = device.manufacturer_string().unwrap_or("Unknown");
+        let product = device.product_string().unwrap_or("Unknown");
+
+        found_devices.push(ADBDeviceInfo {
+            vendor_id: device.vendor_id(),
+            product_id: device.product_id(),
+            device_description: format!("{manufacturer} {product}"),
+        });
     }
 
     Ok(found_devices)
@@ -76,33 +73,19 @@ pub fn get_single_connected_adb_device() -> Result<Option<ADBDeviceInfo>> {
     }
 }
 
-/// Check whether a device with given descriptor is an ADB device
-fn is_adb_device<T: UsbContext>(device: &Device<T>, des: &DeviceDescriptor) -> bool {
-    const ADB_SUBCLASS: u8 = 0x42;
-    const ADB_PROTOCOL: u8 = 0x1;
-
-    // Some devices require choosing the file transfer mode
-    // for usb debugging to take effect.
-    const BULK_CLASS: u8 = 0xdc;
-    const BULK_ADB_SUBCLASS: u8 = 2;
-
-    for n in 0..des.num_configurations() {
-        let Ok(config_des) = device.config_descriptor(n) else {
-            continue;
-        };
-        for interface in config_des.interfaces() {
-            for interface_des in interface.descriptors() {
-                let proto = interface_des.protocol_code();
-                let class = interface_des.class_code();
-                let subcl = interface_des.sub_class_code();
-                if proto == ADB_PROTOCOL
-                    && ((class == LIBUSB_CLASS_VENDOR_SPEC && subcl == ADB_SUBCLASS)
-                        || (class == BULK_CLASS && subcl == BULK_ADB_SUBCLASS))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Check whether a device is an ADB device, based on its interface
+/// class / subclass / protocol triple.
+///
+/// `nusb` exposes the per-interface class/subclass/protocol on the cached
+/// `DeviceInfo`, so this matches the previous `rusb` logic without opening the
+/// device or walking configuration descriptors.
+fn is_adb_device(device: &DeviceInfo) -> bool {
+    device.interfaces().any(|interface| {
+        let proto = interface.protocol();
+        let class = interface.class();
+        let subcl = interface.subclass();
+        proto == ADB_PROTOCOL
+            && ((class == LIBUSB_CLASS_VENDOR_SPEC && subcl == ADB_SUBCLASS)
+                || (class == BULK_CLASS && subcl == BULK_ADB_SUBCLASS))
+    })
 }

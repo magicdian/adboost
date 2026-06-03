@@ -55,7 +55,7 @@ impl<T: ADBMessageTransport> Read for ADBSessionStream<T> {
             .session
             .get_transport_mut()
             .read_message()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         match message.header().command() {
             MessageCommand::Write => {
@@ -66,11 +66,11 @@ impl<T: ADBMessageTransport> Read for ADBSessionStream<T> {
                     self.session.remote_id(),
                     &[],
                 )
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
                 self.session
                     .get_transport_mut()
                     .write_message(okay)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 let payload = message.into_payload();
                 if payload.is_empty() {
@@ -95,10 +95,7 @@ impl<T: ADBMessageTransport> Read for ADBSessionStream<T> {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "unexpected command: {}",
-                    message.header().command()
-                ),
+                format!("unexpected command: {}", message.header().command()),
             )),
         }
     }
@@ -120,28 +117,25 @@ impl<T: ADBMessageTransport> Write for ADBSessionStream<T> {
             self.session.remote_id(),
             chunk,
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
         self.session
             .get_transport_mut()
             .write_message(message)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Wait for OKAY acknowledgement
         let response = self
             .session
             .get_transport_mut()
             .read_message_with_timeout(Duration::from_secs(10))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         if response.header().command() != MessageCommand::Okay {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "expected OKAY after WRTE, got {}",
-                    response.header().command()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "expected OKAY after WRTE, got {}",
+                response.header().command()
+            )));
         }
 
         Ok(chunk_size)

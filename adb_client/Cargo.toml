@@ -20,7 +20,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["framebuffer"]
 mdns = ["dep:mdns-sd"]
-usb = ["dep:rusb"]
+usb = ["dep:nusb"]
 framebuffer = ["dep:image"]
 
 [dependencies]
@@ -52,7 +52,7 @@ mdns-sd = { version = "0.19.2", default-features = false, features = [
 #########
 #########
 # USB-only dependencies
-rusb = { version = "0.9.4", features = ["vendored"], optional = true }
+nusb = { version = "0.2", optional = true }
 num_enum = { version = "0.7.6" }
 #########
 

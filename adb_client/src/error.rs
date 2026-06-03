@@ -78,7 +78,22 @@ pub enum RustADBError {
     #[cfg(feature = "usb")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
     #[error("USB Error: {0}")]
-    UsbError(#[from] rusb::Error),
+    UsbError(#[from] nusb::Error),
+    /// USB transfer error
+    #[cfg(feature = "usb")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
+    #[error("USB transfer error: {0}")]
+    UsbTransferError(#[from] nusb::transfer::TransferError),
+    /// A USB transfer timed out (no data within the requested timeout).
+    ///
+    /// Produced from `nusb`'s `TransferError::Cancelled`, which is what a
+    /// `transfer_blocking` call returns when it hits its timeout. This is a
+    /// non-fatal condition used by polling loops to distinguish "nothing to
+    /// read yet" from a genuine disconnect.
+    #[cfg(feature = "usb")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
+    #[error("USB transfer timed out")]
+    UsbTimeout,
     /// Selected device is busy.
     #[cfg(feature = "usb")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]

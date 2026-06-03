@@ -53,8 +53,8 @@ impl ADBUSBDevice {
         transport: USBTransport,
         private_key_path: P,
     ) -> Result<Self> {
-        let vendor_id = transport.vendor_id()?;
-        let product_id = transport.product_id()?;
+        let vendor_id = transport.vendor_id();
+        let product_id = transport.product_id();
 
         Ok(Self {
             inner: ADBMessageDevice::new(transport, private_key_path)?,
