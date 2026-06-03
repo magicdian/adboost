@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/06-02-migrate-rusb-to-nusb/research/nusb-api-mapping.md", "reason": "rusb→nusb API mapping table, timeout handling, endpoint ownership, IN-length alignment — the core implementation reference"}
+{"file": ".trellis/tasks/06-02-migrate-rusb-to-nusb/prd.md", "reason": "requirements, confirmed decisions (thin adapter, endpoint split, no Clone), behavior-equivalence hard constraint, verification strategy"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError/thiserror conventions — needed when replacing UsbError(rusb::Error) with nusb error mapping + new timeout variant"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "module layout / mod.rs / device trait layering — needed when refactoring USBTransport structure"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "USB session multiplexing + state conventions — persistent.rs reader/writer endpoint ownership refactor must preserve these"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "log facade level conventions — preserve existing log calls during USB rewrite"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, MSRV, feature gating, testing style — guides the unit tests and the build/clippy gate"}

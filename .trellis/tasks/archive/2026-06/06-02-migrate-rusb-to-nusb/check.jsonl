@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-02-migrate-rusb-to-nusb/prd.md", "reason": "acceptance criteria + behavior-equivalence hard constraint to verify against"}
+{"file": ".trellis/tasks/06-02-migrate-rusb-to-nusb/research/nusb-api-mapping.md", "reason": "verify the nusb usage (timeout→Cancelled match, IN length alignment, endpoint ownership) was implemented correctly"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic / MSRV / feature gating / testing style — the quality gate to enforce"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify RustADBError mapping + new timeout variant follows thiserror conventions"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "verify persistent USB session multiplexing behavior preserved after endpoint-ownership refactor"}
