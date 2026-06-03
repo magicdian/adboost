@@ -61,14 +61,15 @@ silence a lint locally, justify it in a comment.
 [features]
 default = ["framebuffer"]
 mdns = ["dep:mdns-sd"]
-usb = ["dep:rusb"]
+usb = ["dep:nusb"]
 framebuffer = ["dep:image"]
 ```
 
 - **`framebuffer`** (default) — gates framebuffer dump/decode + related error
   variants. Code in `message_devices/commands/framebuffer.rs`.
 - **`usb`** — gates the whole `message_devices/usb/` subsystem + USB error
-  variants. `adb_cli` and `pyadb_client` enable it.
+  variants. `adb_cli` and `pyadb_client` enable it. Backed by **`nusb`**
+  (pure Rust, no libusb/C toolchain — `usb = ["dep:nusb"]`).
 - **`mdns`** — gates `pub mod mdns` + mDNS discovery.
 - **There is no `tcp` feature** — TCP transport is always compiled. The `tcp`
   keyword in `Cargo.toml:9` is a crates.io keyword, not a feature.

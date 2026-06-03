@@ -41,6 +41,23 @@ The closest thing to a "connection pool" is the persistent USB session layer:
   debt** — new lock sites must propagate `RustADBError::PoisonError` via `?`
   instead (see `error-handling.md` → "Common Mistakes").
 
+### USB transport concurrency (nusb endpoint-split model)
+
+The USB transport (`message_devices/usb/usb_transport.rs`) runs on **`nusb`**,
+whose `Endpoint<EpType, Dir>` is `&mut self`-exclusive and **not `Clone`**. The
+IN and OUT endpoints are two independent objects. To preserve the reader-thread
+(IN) + writer (OUT) concurrency model — and because `ADBMessageTransport` is
+bounded `: ADBTransport + Clone + Send + 'static` so `USBTransport` **must stay
+`Clone`** (the non-persistent `ADBMessageDevice<USBTransport>` path clones the
+transport to share it across its own reader/writer) — the IN and OUT endpoints
+live behind **two separate `Arc<Mutex<…>>` locks**, not one shared lock.
+
+> **Why two locks, not one:** the reader's blocking 1s read holds only the IN
+> lock; the writer holds only the OUT lock. No code path acquires both, so the
+> reader can never stall the writer and there is no lock-ordering deadlock. A
+> single shared `Arc<Mutex<USBTransport>>` would let a long blocking read starve
+> writes — do not collapse the two locks back into one.
+
 ---
 
 ## State conventions

@@ -40,16 +40,39 @@ Variant conventions (use these patterns when adding a variant):
 | Multi-field format variant | `WrongResponseReceived(String, String)` | 22–23 |
 | Unit variant, static message | `#[error("Conversion error")] ConversionError` | 46–47 |
 | Numeric-payload variant | `InvalidIntegrity(u32, u32)` | 94–95 |
-| Feature-gated variant | `#[cfg(feature = "usb")] UsbError(#[from] rusb::Error)` | 78–81 |
+| Feature-gated variant | `#[cfg(feature = "usb")] UsbError(#[from] nusb::Error)` | 78–81 |
 
 There are ~18 `#[from]` conversions for foreign error types (std::io, Utf8,
-AddrParse, regex, ParseInt, image, rusb, base64, rsa, rcgen, rustls, pem,
+AddrParse, regex, ParseInt, image, nusb, base64, rsa, rcgen, rustls, pem,
 mdns_sd, chrono, …). Because `std::sync::PoisonError<T>` is generic, it gets a
 **manual** `From` impl (`error.rs:151-155`) mapping any `PoisonError<T>` →
 `Self::PoisonError`.
 
 **Rule:** add a new foreign error with `#[from]` + `#[error(transparent)]`; add a
 new domain error as a named variant with a `{0}`-style format message.
+
+### USB error variants (`nusb`, feature = "usb")
+
+The USB transport uses **`nusb`** (pure-Rust, not `rusb`/libusb). Three
+feature-gated variants (`error.rs:80-96`):
+
+| Variant | Source | Meaning |
+|---|---|---|
+| `UsbError(#[from] nusb::Error)` | nusb non-transfer ops (enumerate/open/claim/descriptors) | generic USB error |
+| `UsbTransferError(#[from] nusb::transfer::TransferError)` | a bulk `transfer_blocking` failure that is NOT a timeout | transfer-level error |
+| `UsbTimeout` (unit) | produced from `TransferError::Cancelled` | **non-fatal** read/write timeout |
+
+> **Gotcha — USB timeout must be matched structurally, never by string.**
+> `nusb`'s `Endpoint::transfer_blocking(buf, timeout)` returns
+> `TransferError::Cancelled` on timeout (it does NOT carry a "timed out"
+> string). The reader/drain loops in `persistent.rs` distinguish "nothing to
+> read yet → keep looping" from "genuine disconnect → break" by matching
+> `Err(RustADBError::UsbTimeout)`. The mapping `Cancelled → UsbTimeout` lives in
+> `usb_transport.rs` (`map_transfer_status`); all other `TransferError`s map to
+> `UsbTransferError` so they correctly break the loop. **Never reintroduce a
+> `err.to_string().contains("timed out")` check** — nusb's wording differs from
+> libusb's and the string match silently breaks the disconnect/timeout
+> distinction.
 
 ### CLI: `ADBCliError` (`adb_cli/src/models/adb_cli_error.rs`)
 
