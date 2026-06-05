@@ -4,6 +4,7 @@ mod adb_local_command;
 mod adb_request_status;
 mod adb_stat_extended_response;
 mod adb_stat_response;
+mod device_feature_set;
 mod host_features;
 mod list_info;
 mod reboot_type;
@@ -19,6 +20,12 @@ pub use adb_local_command::ADBLocalCommand;
 pub use adb_request_status::AdbRequestStatus;
 pub use adb_stat_extended_response::{ADBStatExtendedResponse, ADBStatMapping};
 pub use adb_stat_response::AdbStatResponse;
+pub use device_feature_set::DeviceFeatureSet;
+// `FEATURE_DELAYED_ACK` is consumed only by the persistent USB connection's
+// banner negotiation, which is `usb`-gated. Re-export it under the same gate so
+// the default-feature build does not flag it as an unused import.
+#[cfg(feature = "usb")]
+pub use device_feature_set::FEATURE_DELAYED_ACK;
 pub use host_features::HostFeatures;
 pub use list_info::{ADBListItem, ADBListItemType};
 pub use reboot_type::RebootType;

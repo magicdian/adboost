@@ -9,13 +9,13 @@ pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
 pub const AUTH_RSAPUBLICKEY: u32 = 3;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ADBTransportMessage {
     header: ADBTransportMessageHeader,
     payload: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(C)]
 pub struct ADBTransportMessageHeader {
     command: MessageCommand, /* command identifier constant      */
@@ -38,22 +38,27 @@ impl ADBTransportMessageHeader {
         })
     }
 
+    #[must_use]
     pub const fn command(&self) -> MessageCommand {
         self.command
     }
 
+    #[must_use]
     pub const fn arg0(&self) -> u32 {
         self.arg0
     }
 
+    #[must_use]
     pub const fn arg1(&self) -> u32 {
         self.arg1
     }
 
+    #[must_use]
     pub const fn data_length(&self) -> u32 {
         self.data_length
     }
 
+    #[must_use]
     pub const fn data_crc32(&self) -> u32 {
         self.data_crc32
     }
@@ -67,6 +72,7 @@ impl ADBTransportMessageHeader {
         command_u32 ^ 0xFFFF_FFFF
     }
 
+    #[must_use]
     pub fn as_bytes(&self) -> Vec<u8> {
         self.encode()
     }
@@ -114,6 +120,7 @@ impl ADBTransportMessage {
         })
     }
 
+    #[must_use]
     pub const fn from_header_and_payload(
         header: ADBTransportMessageHeader,
         payload: Vec<u8>,
@@ -121,6 +128,7 @@ impl ADBTransportMessage {
         Self { header, payload }
     }
 
+    #[must_use]
     pub fn check_message_integrity(&self) -> bool {
         ADBTransportMessageHeader::compute_magic(self.header.command) == self.header.magic
             && ADBTransportMessageHeader::compute_crc32(&self.payload) == self.header.data_crc32
@@ -138,14 +146,17 @@ impl ADBTransportMessage {
         ))
     }
 
+    #[must_use]
     pub const fn header(&self) -> &ADBTransportMessageHeader {
         &self.header
     }
 
+    #[must_use]
     pub const fn payload(&self) -> &Vec<u8> {
         &self.payload
     }
 
+    #[must_use]
     pub fn into_payload(self) -> Vec<u8> {
         self.payload
     }
