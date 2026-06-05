@@ -1,0 +1,13 @@
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/prd.md", "reason": "Task PRD: 8 decisions (D1-D8), requirements R1-R5, test strategy, spec constraints"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/01-asks-verification.md", "reason": "6 Ask 带行号验证 + 推荐 API + 隐患(try_send 静默丢包)"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/03-adb-protocol-truth.md", "reason": "ADB 线协议真相: 帧格式/SYNC v1/shell-v2 帧/device-OPEN/reverse"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/07-aosp-delayed-ack-wire-semantics.md", "reason": "delayed_ack 定真: OKAY payload int32 delta, 32MiB 初始窗口(关键,纠正早期错误)"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/08-implementation-file-map.md", "reason": "每个 PR 精确文件/符号/行号 + 跨PR共享编辑点矩阵"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/04-synthesis-sequencing.md", "reason": "依赖图 + PR 排序(#6闸门 → #2/#3 一次重设计 → #1 → #4/#5)"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/06-forward-async-synthesis.md", "reason": "forward 原语已最优 + async sans-io 形态约束(I/O 驱动可替换)"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError/PoisonError 传播/新变体须加 adb_cli_error 分类arm/USB超时结构化匹配"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "nusb 双锁模型(IN/OUT 各一把,绝不合并)/session 多路复用 state 约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic -D warnings/MSRV 1.88/features usb 本地复验/inline test"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "全限定 log::level!/PersistentUsb: 前缀/不记密钥与payload"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "mod.rs-per-dir/models-commands 三分/lib.rs re-export 习惯"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "MultiplexedSession 与 split halves 读写逻辑已重复,改动须抽共享"}

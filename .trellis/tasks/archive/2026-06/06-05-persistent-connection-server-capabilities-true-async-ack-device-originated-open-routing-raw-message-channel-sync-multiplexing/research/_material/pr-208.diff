@@ -1,0 +1,251 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0aa0bb8..d0f638a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,5 @@
+ [workspace]
+-members = ["adb_cli", "adb_client", "examples/mdns", "pyadb_client"]
++members = ["adb_cli", "adb_client", "examples/mdns", "examples/tcp_forward", "pyadb_client"]
+ resolver = "2"
+ 
+ [workspace.package]
+diff --git a/adb_client/src/lib.rs b/adb_client/src/lib.rs
+index ecfba04..11c7807 100644
+--- a/adb_client/src/lib.rs
++++ b/adb_client/src/lib.rs
+@@ -35,6 +35,6 @@ use adb_transport::ADBTransport;
+ pub use error::{Result, RustADBError};
+ pub use message_devices::*;
+ pub use models::{
+-    ADBListItem, ADBListItemType, ADBStatExtendedResponse, ADBStatMapping, AdbStatResponse,
+-    HostFeatures, RebootType, RemountInfo,
++    ADBListItem, ADBListItemType, ADBLocalCommand, ADBStatExtendedResponse, ADBStatMapping,
++    AdbStatResponse, HostFeatures, RebootType, RemountInfo,
+ };
+diff --git a/adb_client/src/message_devices/adb_message_device.rs b/adb_client/src/message_devices/adb_message_device.rs
+index 963b429..81a38ac 100644
+--- a/adb_client/src/message_devices/adb_message_device.rs
++++ b/adb_client/src/message_devices/adb_message_device.rs
+@@ -155,7 +155,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         self.open_session(&ADBLocalCommand::Sync)
+     }
+ 
+-    pub(crate) fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
++    /// Open a new ADB session with the given local command.
++    pub fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
+         let mut rng = rand::rng();
+         let local_id: u32 = rng.random();
+ 
+diff --git a/adb_client/src/message_devices/adb_session.rs b/adb_client/src/message_devices/adb_session.rs
+index 8c3440f..3398173 100644
+--- a/adb_client/src/message_devices/adb_session.rs
++++ b/adb_client/src/message_devices/adb_session.rs
+@@ -26,6 +26,7 @@ pub struct ADBSession<T: ADBMessageTransport> {
+ }
+ 
+ impl<T: ADBMessageTransport> ADBSession<T> {
++    /// Create a new session with the given transport and IDs.
+     pub const fn new(transport: T, local_id: u32, remote_id: u32) -> Self {
+         Self {
+             transport,
+@@ -34,14 +35,17 @@ impl<T: ADBMessageTransport> ADBSession<T> {
+         }
+     }
+ 
++    /// Get a mutable reference to the underlying transport.
+     pub const fn get_transport_mut(&mut self) -> &mut T {
+         &mut self.transport
+     }
+ 
++    /// Get the local session ID.
+     pub const fn local_id(&self) -> u32 {
+         self.local_id
+     }
+ 
++    /// Get the remote session ID.
+     pub const fn remote_id(&self) -> u32 {
+         self.remote_id
+     }
+diff --git a/adb_client/src/message_devices/mod.rs b/adb_client/src/message_devices/mod.rs
+index eb41e22..031cf97 100644
+--- a/adb_client/src/message_devices/mod.rs
++++ b/adb_client/src/message_devices/mod.rs
+@@ -6,14 +6,16 @@ pub mod usb;
+ /// Device reachable over TCP related definition
+ pub mod tcp;
+ 
+-mod adb_message_device;
++pub(crate) mod adb_message_device;
+ mod adb_message_device_commands;
+-mod adb_message_transport;
+-mod adb_session;
+-mod adb_transport_message;
++pub(crate) mod adb_message_transport;
++/// ADB session management for open transport streams.
++pub mod adb_session;
++pub(crate) mod adb_transport_message;
+ mod commands;
+-mod message_commands;
++pub(crate) mod message_commands;
+ mod models;
+ mod utils;
+ 
++pub use adb_message_device::ADBMessageDevice;
+ pub use utils::BinaryDecodable;
+diff --git a/adb_client/src/message_devices/usb/adb_usb_device.rs b/adb_client/src/message_devices/usb/adb_usb_device.rs
+index 800e4ca..e01d2f3 100644
+--- a/adb_client/src/message_devices/usb/adb_usb_device.rs
++++ b/adb_client/src/message_devices/usb/adb_usb_device.rs
+@@ -75,6 +75,11 @@ impl ADBUSBDevice {
+         self.product_id
+     }
+ 
++    /// Returns a mutable reference to the inner message device for advanced operations.
++    pub fn inner_mut(&mut self) -> &mut ADBMessageDevice<USBTransport> {
++        &mut self.inner
++    }
++
+     /// Autodetect connected ADB devices and establish a connection with the first device found
+     ///
+     /// # Errors
+diff --git a/adb_client/src/models/adb_local_command.rs b/adb_client/src/models/adb_local_command.rs
+index d30849e..25f17d0 100644
+--- a/adb_client/src/models/adb_local_command.rs
++++ b/adb_client/src/models/adb_local_command.rs
+@@ -3,30 +3,53 @@ use std::fmt::Display;
+ use crate::RebootType;
+ 
+ /// ADB commands that relates to an actual device.
++#[derive(Debug)]
+ pub enum ADBLocalCommand {
++    /// Run a shell command with arguments
+     ShellCommand(String, Vec<String>),
++    /// Open an interactive shell session
+     Shell,
++    /// Execute a command without PTY allocation
+     Exec(String),
++    /// Start a sync session for file operations
+     Sync,
++    /// Reboot the device
+     Reboot(RebootType),
++    /// Set up port forwarding (remote, local)
+     Forward(String, String),
++    /// Remove a specific port forward
+     ForwardRemove(String),
++    /// Remove all port forwards
+     ForwardRemoveAll,
++    /// Set up reverse port forwarding (remote, local)
+     Reverse(String, String),
++    /// Remove a specific reverse forward
+     ReverseRemove(String),
++    /// Remove all reverse forwards
+     ReverseRemoveAll,
++    /// Reconnect to the device
+     Reconnect,
++    /// Remount the filesystem as read-write
+     Remount,
++    /// Disable dm-verity checking on userdebug builds
+     DisableVerity,
++    /// Re-enable dm-verity checking on userdebug builds
+     EnableVerity,
++    /// Uninstall a package, optionally for a specific user
+     Uninstall(String, Option<String>),
++    /// Install a package with the given size, optionally for a specific user
+     Install(u64, Option<String>),
++    /// Switch the device to TCP/IP mode on the given port
+     TcpIp(u16),
++    /// Switch the device back to USB mode
+     Usb,
++    /// Restart adbd with root permissions
+     Root,
+-
++    /// Capture the device framebuffer
+     #[cfg(feature = "framebuffer")]
+     FrameBuffer,
++    /// Open a TCP connection to a port on the device (formats to "tcp:<port>")
++    TcpConnect(u16),
+ }
+ 
+ impl Display for ADBLocalCommand {
+@@ -84,9 +107,9 @@ impl Display for ADBLocalCommand {
+             }
+             Self::Usb => write!(f, "usb:"),
+             Self::Root => write!(f, "root:"),
+-
+             #[cfg(feature = "framebuffer")]
+             Self::FrameBuffer => write!(f, "framebuffer:"),
++            Self::TcpConnect(port) => write!(f, "tcp:{port}"),
+         }
+     }
+ }
+diff --git a/examples/tcp_forward/Cargo.toml b/examples/tcp_forward/Cargo.toml
+new file mode 100644
+index 0000000..3f26898
+--- /dev/null
++++ b/examples/tcp_forward/Cargo.toml
+@@ -0,0 +1,22 @@
++[package]
++name = "tcp_forward"
++authors.workspace = true
++edition.workspace = true
++homepage.workspace = true
++keywords.workspace = true
++license.workspace = true
++repository.workspace = true
++version.workspace = true
++rust-version.workspace = true
++
++[lints]
++workspace = true
++
++[[bin]]
++name = "tcp_forward"
++path = "main.rs"
++
++[dependencies]
++adb_client = { path = "../../adb_client", default-features = false, features = [
++    "usb",
++] }
+diff --git a/examples/tcp_forward/main.rs b/examples/tcp_forward/main.rs
+new file mode 100644
+index 0000000..992565b
+--- /dev/null
++++ b/examples/tcp_forward/main.rs
+@@ -0,0 +1,37 @@
++//! Example: open a raw TCP session to a device port via USB transport.
++//!
++//! This demonstrates how to use `open_session` with `ADBLocalCommand::TcpConnect`
++//! to establish a bidirectional stream to a TCP port on the device — the building
++//! block for implementing `adb forward` semantics without an intermediate adb server.
++//!
++//! Usage:
++//!   cargo run -p tcp_forward
++//!
++//! Make sure a service is listening on port 8080 on the device before running.
++//! For example, run `nc -l -p 8080` on the device via `adb shell`.
++
++use adb_client::{ADBLocalCommand, usb::ADBUSBDevice};
++
++fn main() -> adb_client::Result<()> {
++    let mut device = ADBUSBDevice::autodetect()?;
++
++    // Open a TCP session to port 8080 on the device.
++    // This is equivalent to the service string "tcp:8080" in the ADB protocol.
++    let session = device
++        .inner_mut()
++        .open_session(&ADBLocalCommand::TcpConnect(8080))?;
++
++    println!("Session opened successfully!");
++    println!("  local_id:  {}", session.local_id());
++    println!("  remote_id: {}", session.remote_id());
++
++    // At this point you have a live ADB session connected to tcp:8080 on the device.
++    // Use `session.get_transport_mut()` to read/write ADB protocol messages
++    // via `read_message()` and `write_message()`.
++
++    // The session is automatically closed (CLSE) when dropped.
++    drop(session);
++
++    println!("Session closed.");
++    Ok(())
++}

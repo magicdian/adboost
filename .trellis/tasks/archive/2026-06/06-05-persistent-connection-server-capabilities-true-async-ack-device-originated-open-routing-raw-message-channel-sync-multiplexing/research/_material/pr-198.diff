@@ -1,0 +1,1444 @@
+diff --git a/adb_cli/Cargo.toml b/adb_cli/Cargo.toml
+index bf371a4..d7ab732 100644
+--- a/adb_cli/Cargo.toml
++++ b/adb_cli/Cargo.toml
+@@ -17,6 +17,7 @@ workspace = true
+ adb_client = { version = "^3.2.0", features = ["mdns", "usb"] }
+ clap = { version = "4.6.1", features = ["derive"] }
+ env_logger = { version = "0.11.10" }
++image = { version = "0.25.10", default-features = false, features = ["png"] }
+ log = { version = "0.4.29" }
+ tabwriter = { version = "1.4.1" }
+ 
+diff --git a/adb_cli/src/main.rs b/adb_cli/src/main.rs
+index de219cd..96d1fb2 100644
+--- a/adb_cli/src/main.rs
++++ b/adb_cli/src/main.rs
+@@ -28,9 +28,9 @@ use std::process::ExitCode;
+ use tabwriter::TabWriter;
+ use utils::setup_logger;
+ 
+-use crate::models::{ADBCliError, ADBCliResult};
++use crate::models::{ADBCliError, ADBCliResult, ADBDevice};
+ 
+-fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) -> ADBCliResult<()> {
++fn run_command(mut device: ADBDevice, command: DeviceCommands) -> ADBCliResult<()> {
+     match command {
+         DeviceCommands::Shell { commands } => {
+             if commands.is_empty() {
+@@ -145,7 +145,9 @@ fn inner_main() -> ADBCliResult<()> {
+             };
+ 
+             match server_command.command {
+-                LocalCommand::DeviceCommands(device_commands) => (device.boxed(), device_commands),
++                LocalCommand::DeviceCommands(device_commands) => {
++                    (ADBDevice::Server(device), device_commands)
++                }
+                 LocalCommand::LocalDeviceCommand(local_device_command) => {
+                     return handle_local_commands(device, local_device_command);
+                 }
+@@ -197,7 +199,7 @@ fn inner_main() -> ADBCliResult<()> {
+             };
+ 
+             if let Some(command) = usb_command.commands {
+-                (device.boxed(), command)
++                (ADBDevice::Usb(device), command)
+             } else {
+                 return Err(ADBCliError::Standard("no command specified".into()));
+             }
+@@ -207,7 +209,7 @@ fn inner_main() -> ADBCliResult<()> {
+                 Some(pk) => ADBTcpDevice::new_with_custom_private_key(tcp_command.address, pk)?,
+                 None => ADBTcpDevice::new(tcp_command.address)?,
+             };
+-            (device.boxed(), tcp_command.commands)
++            (ADBDevice::Tcp(device), tcp_command.commands)
+         }
+         MainCommand::Mdns => {
+             let mut service = MDNSDiscoveryService::new()?;
+diff --git a/adb_cli/src/models/adb_device.rs b/adb_cli/src/models/adb_device.rs
+new file mode 100644
+index 0000000..eb23bcd
+--- /dev/null
++++ b/adb_cli/src/models/adb_device.rs
+@@ -0,0 +1,167 @@
++use adb_client::{
++    ADBDeviceExt, server_device::ADBServerDevice, tcp::ADBTcpDevice, usb::ADBUSBDevice,
++};
++use image::{ImageBuffer, Rgba};
++
++/// Wrapper around the various ADB device types.
++/// Implements [`ADBDeviceExt`] to provide common device operations.
++/// Truly missing a macro to automatically forward calls to the inner device.
++pub enum ADBDevice {
++    Server(ADBServerDevice),
++    Usb(ADBUSBDevice),
++    Tcp(ADBTcpDevice),
++}
++
++impl ADBDeviceExt for ADBDevice {
++    fn shell_command<W: std::io::Write>(
++        &mut self,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
++    ) -> adb_client::Result<Option<u8>> {
++        match self {
++            Self::Server(device) => device.shell_command(command, stdout, stderr),
++            Self::Usb(device) => device.shell_command(command, stdout, stderr),
++            Self::Tcp(device) => device.shell_command(command, stdout, stderr),
++        }
++    }
++
++    fn shell<R: std::io::Read, W: std::io::Write + Send>(
++        &mut self,
++        reader: &mut R,
++        writer: W,
++    ) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.shell(reader, writer),
++            Self::Usb(device) => device.shell(reader, writer),
++            Self::Tcp(device) => device.shell(reader, writer),
++        }
++    }
++
++    fn exec<R: std::io::Read, W: std::io::Write + Send>(
++        &mut self,
++        command: &str,
++        reader: &mut R,
++        writer: W,
++    ) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.exec(command, reader, writer),
++            Self::Usb(device) => device.exec(command, reader, writer),
++            Self::Tcp(device) => device.exec(command, reader, writer),
++        }
++    }
++
++    fn stat<P: AsRef<std::path::Path>>(
++        &mut self,
++        remote_path: P,
++    ) -> adb_client::Result<adb_client::AdbStatResponse> {
++        match self {
++            Self::Server(device) => device.stat(remote_path),
++            Self::Usb(device) => device.stat(remote_path),
++            Self::Tcp(device) => device.stat(remote_path),
++        }
++    }
++
++    fn pull<P: AsRef<std::path::Path>, W: std::io::Write>(
++        &mut self,
++        source: P,
++        output: &mut W,
++    ) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.pull(source, output),
++            Self::Usb(device) => device.pull(source, output),
++            Self::Tcp(device) => device.pull(source, output),
++        }
++    }
++
++    fn push<R: std::io::Read, P: AsRef<std::path::Path>>(
++        &mut self,
++        stream: &mut R,
++        path: P,
++    ) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.push(stream, path),
++            Self::Usb(device) => device.push(stream, path),
++            Self::Tcp(device) => device.push(stream, path),
++        }
++    }
++
++    fn list<P: AsRef<std::path::Path>>(
++        &mut self,
++        path: P,
++    ) -> adb_client::Result<Vec<adb_client::ADBListItemType>> {
++        match self {
++            Self::Server(device) => device.list(path),
++            Self::Usb(device) => device.list(path),
++            Self::Tcp(device) => device.list(path),
++        }
++    }
++
++    fn reboot(&mut self, reboot_type: adb_client::RebootType) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.reboot(reboot_type),
++            Self::Usb(device) => device.reboot(reboot_type),
++            Self::Tcp(device) => device.reboot(reboot_type),
++        }
++    }
++
++    fn remount(&mut self) -> adb_client::Result<Vec<adb_client::RemountInfo>> {
++        match self {
++            Self::Server(device) => device.remount(),
++            Self::Usb(device) => device.remount(),
++            Self::Tcp(device) => device.remount(),
++        }
++    }
++
++    fn root(&mut self) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.root(),
++            Self::Usb(device) => device.root(),
++            Self::Tcp(device) => device.root(),
++        }
++    }
++
++    fn install<P: AsRef<std::path::Path>>(
++        &mut self,
++        apk_path: P,
++        user: Option<&str>,
++    ) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.install(apk_path, user),
++            Self::Usb(device) => device.install(apk_path, user),
++            Self::Tcp(device) => device.install(apk_path, user),
++        }
++    }
++
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.uninstall(package, user),
++            Self::Usb(device) => device.uninstall(package, user),
++            Self::Tcp(device) => device.uninstall(package, user),
++        }
++    }
++
++    fn enable_verity(&mut self) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.enable_verity(),
++            Self::Usb(device) => device.enable_verity(),
++            Self::Tcp(device) => device.enable_verity(),
++        }
++    }
++
++    fn disable_verity(&mut self) -> adb_client::Result<()> {
++        match self {
++            Self::Server(device) => device.disable_verity(),
++            Self::Usb(device) => device.disable_verity(),
++            Self::Tcp(device) => device.disable_verity(),
++        }
++    }
++
++    fn framebuffer_inner(&mut self) -> adb_client::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
++        match self {
++            Self::Server(device) => device.framebuffer_inner(),
++            Self::Usb(device) => device.framebuffer_inner(),
++            Self::Tcp(device) => device.framebuffer_inner(),
++        }
++    }
++}
+diff --git a/adb_cli/src/models/mod.rs b/adb_cli/src/models/mod.rs
+index d64d020..f08b05a 100644
+--- a/adb_cli/src/models/mod.rs
++++ b/adb_cli/src/models/mod.rs
+@@ -1,4 +1,5 @@
+ mod adb_cli_error;
++mod adb_device;
+ mod device;
+ mod emu;
+ mod host;
+@@ -9,6 +10,7 @@ mod tcp;
+ mod usb;
+ 
+ pub use adb_cli_error::{ADBCliError, ADBCliResult};
++pub use adb_device::ADBDevice;
+ pub use device::DeviceCommands;
+ pub use emu::{EmuCommand, EmulatorCommand};
+ pub use host::{HostCommand, MdnsCommand};
+diff --git a/adb_client/src/adb_device_ext.rs b/adb_client/src/adb_device_ext.rs
+index 531a8d8..5307e7a 100644
+--- a/adb_client/src/adb_device_ext.rs
++++ b/adb_client/src/adb_device_ext.rs
+@@ -9,39 +9,39 @@ use crate::{ADBStatExtendedResponse, RebootType, Result};
+ /// Trait representing all features available on ADB devices.
+ pub trait ADBDeviceExt {
+     /// Runs command in a shell on the device, and write its output and error streams into output.
+-    fn shell_command(
++    fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        stdout: Option<&mut dyn Write>,
+-        stderr: Option<&mut dyn Write>,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
+     ) -> Result<Option<u8>>;
+ 
+     /// Starts an interactive shell session on the device.
+     /// Input data is read from reader and write to writer.
+-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()>;
++    fn shell<R: Read, W: Write + Send>(&mut self, reader: &mut R, writer: W) -> Result<()>;
+ 
+     /// Runs command on the device.
+     /// Input data is read from reader and write to writer.
+-    fn exec(
++    fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()>;
+ 
+     /// Display the stat information for a remote file using STAT protocol command.
+-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse>;
++    fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<AdbStatResponse>;
+ 
+     /// Display the stat information for a remote file using `stat` shell command.
+     /// This is an extended version of `stat` that returns more detailed information.
+     /// Returns `Ok(None)` if the file does not exist on the device.
+-    fn stat_extended(
++    fn stat_extended<P: AsRef<Path>>(
+         &mut self,
+-        remote_path: &dyn AsRef<str>,
++        remote_path: P,
+     ) -> Result<Option<ADBStatExtendedResponse>> {
+         let mut stdout = Vec::new();
+         self.shell_command(
+-            &format!("stat {}", remote_path.as_ref()),
++            &format!("stat {}", remote_path.as_ref().display()),
+             Some(&mut stdout),
+             None,
+         )?;
+@@ -51,13 +51,13 @@ pub trait ADBDeviceExt {
+     }
+ 
+     /// Pull the remote file pointed to by `source` and write its contents into `output`
+-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()>;
++    fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, output: &mut W) -> Result<()>;
+ 
+     /// Push `stream` to `path` on the device.
+-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()>;
++    fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()>;
+ 
+     /// List the items in a directory on the device
+-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>>;
++    fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>>;
+ 
+     /// Reboot the device using given reboot type
+     fn reboot(&mut self, reboot_type: RebootType) -> Result<()>;
+@@ -69,19 +69,10 @@ pub trait ADBDeviceExt {
+     fn root(&mut self) -> Result<()>;
+ 
+     /// Run `activity` from `package` on device. Return the command output.
+-    fn run_activity(
+-        &mut self,
+-        package: &dyn AsRef<str>,
+-        activity: &dyn AsRef<str>,
+-    ) -> Result<Vec<u8>> {
++    fn run_activity(&mut self, package: &str, activity: &str) -> Result<Vec<u8>> {
+         let mut output = Vec::new();
+         let _status = self.shell_command(
+-            &format!(
+-                "am start {}/{}.{}",
+-                package.as_ref(),
+-                package.as_ref(),
+-                activity.as_ref()
+-            ),
++            &format!("am start {package}/{package}.{activity}"),
+             Some(&mut output),
+             None,
+         )?;
+@@ -90,10 +81,10 @@ pub trait ADBDeviceExt {
+     }
+ 
+     /// Install an APK pointed to by `apk_path` on device.
+-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()>;
++    fn install<P: AsRef<Path>>(&mut self, apk_path: P, user: Option<&str>) -> Result<()>;
+ 
+     /// Uninstall the package `package` from device.
+-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()>;
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()>;
+ 
+     /// Enable dm-verity on the device
+     fn enable_verity(&mut self) -> Result<()>;
+@@ -107,7 +98,7 @@ pub trait ADBDeviceExt {
+     /// Dump framebuffer of this device into given path.
+     ///
+     /// Output data format is currently only `PNG`.
+-    fn framebuffer(&mut self, path: &dyn AsRef<Path>) -> Result<()> {
++    fn framebuffer<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+         // Big help from AOSP source code (<https://android.googlesource.com/platform/system/adb/+/refs/heads/main/framebuffer_service.cpp>)
+         let img = self.framebuffer_inner()?;
+         Ok(img.save(path.as_ref())?)
+@@ -123,12 +114,4 @@ pub trait ADBDeviceExt {
+ 
+         Ok(vec.into_inner())
+     }
+-
+-    /// Return a boxed instance representing this trait
+-    fn boxed(self) -> Box<dyn ADBDeviceExt>
+-    where
+-        Self: Sized + 'static,
+-    {
+-        Box::new(self)
+-    }
+ }
+diff --git a/adb_client/src/lib.rs b/adb_client/src/lib.rs
+index 71a22b8..2892999 100644
+--- a/adb_client/src/lib.rs
++++ b/adb_client/src/lib.rs
+@@ -35,5 +35,5 @@ pub use error::{Result, RustADBError};
+ pub use message_devices::*;
+ pub use models::{
+     ADBListItem, ADBListItemType, ADBStatExtendedResponse, ADBStatMapping, AdbStatResponse,
+-    HostFeatures, RebootType,
++    HostFeatures, RebootType, RemountInfo,
+ };
+diff --git a/adb_client/src/message_devices/adb_message_device_commands.rs b/adb_client/src/message_devices/adb_message_device_commands.rs
+index de6b1a9..e36684d 100644
+--- a/adb_client/src/message_devices/adb_message_device_commands.rs
++++ b/adb_client/src/message_devices/adb_message_device_commands.rs
+@@ -12,42 +12,42 @@ use std::{
+ 
+ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
+     #[inline]
+-    fn shell_command(
++    fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        stdout: Option<&mut dyn Write>,
+-        stderr: Option<&mut dyn Write>,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         self.shell_command(command, stdout, stderr)
+     }
+ 
+     #[inline]
+-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
++    fn shell<R: Read, W: Write + Send>(&mut self, reader: &mut R, writer: W) -> Result<()> {
+         self.shell(reader, writer)
+     }
+ 
+     #[inline]
+-    fn exec(
++    fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()> {
+         self.exec(command, reader, writer)
+     }
+ 
+     #[inline]
+-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
++    fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<AdbStatResponse> {
+         self.stat(remote_path)
+     }
+ 
+     #[inline]
+-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()> {
++    fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, output: &mut W) -> Result<()> {
+         self.pull(source, output)
+     }
+ 
+     #[inline]
+-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
++    fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()> {
+         self.push(stream, path)
+     }
+ 
+@@ -67,12 +67,12 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
+     }
+ 
+     #[inline]
+-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
++    fn install<P: AsRef<Path>>(&mut self, apk_path: P, user: Option<&str>) -> Result<()> {
+         self.install(apk_path, user)
+     }
+ 
+     #[inline]
+-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+         self.uninstall(package, user)
+     }
+ 
+@@ -92,7 +92,7 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
+     }
+ 
+     #[inline]
+-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
++    fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         self.list(path)
+     }
+ }
+diff --git a/adb_client/src/message_devices/commands/install.rs b/adb_client/src/message_devices/commands/install.rs
+index 0ab57c4..e86bb18 100644
+--- a/adb_client/src/message_devices/commands/install.rs
++++ b/adb_client/src/message_devices/commands/install.rs
+@@ -11,10 +11,14 @@ use crate::{
+ };
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+-    pub(crate) fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
+-        let mut apk_file = File::open(apk_path)?;
+-
+-        check_extension_is_apk(apk_path)?;
++    pub(crate) fn install<P: AsRef<Path>>(
++        &mut self,
++        apk_path: P,
++        user: Option<&str>,
++    ) -> Result<()> {
++        let mut apk_file = File::open(&apk_path)?;
++
++        check_extension_is_apk(&apk_path)?;
+ 
+         let file_size = apk_file.metadata()?.len();
+ 
+diff --git a/adb_client/src/message_devices/commands/list.rs b/adb_client/src/message_devices/commands/list.rs
+index 555d7b2..630fac2 100644
+--- a/adb_client/src/message_devices/commands/list.rs
++++ b/adb_client/src/message_devices/commands/list.rs
+@@ -1,5 +1,6 @@
+ use byteorder::ByteOrder;
+ use byteorder::LittleEndian;
++use std::path::Path;
+ use std::str;
+ 
+ use crate::Result;
+@@ -15,7 +16,7 @@ use crate::models::{ADBListItem, ADBListItemType};
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     /// List the entries in the given directory on the device.
+     /// note: path uses internal file paths, so Documents is at /storage/emulated/0/Documents
+-    pub(crate) fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
++    pub(crate) fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         let mut session = self.open_synchronization_session()?;
+ 
+         let output = self.handle_list(&mut session, path);
+@@ -80,14 +81,15 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         }
+     }
+ 
+-    fn handle_list<A: AsRef<str>>(
++    fn handle_list<P: AsRef<Path>>(
+         &mut self,
+         session: &mut ADBSession<T>,
+-        path: A,
++        path: P,
+     ) -> Result<Vec<ADBListItemType>> {
+         // TODO: use LIS2 to support files over 2.14 GB in size.
+         // SEE: https://github.com/cstyan/adbDocumentation?tab=readme-ov-file#adb-list
+         {
++            let path = path.as_ref().to_string_lossy();
+             let mut len_buf = Vec::from([0_u8; 4]);
+             LittleEndian::write_u32(&mut len_buf, u32::try_from(path.as_ref().len())?);
+ 
+diff --git a/adb_client/src/message_devices/commands/pull.rs b/adb_client/src/message_devices/commands/pull.rs
+index 056b2a8..9fcf4cd 100644
+--- a/adb_client/src/message_devices/commands/pull.rs
++++ b/adb_client/src/message_devices/commands/pull.rs
+@@ -1,4 +1,4 @@
+-use std::io::Write;
++use std::{io::Write, path::Path};
+ 
+ use crate::{
+     Result, RustADBError,
+@@ -12,11 +12,11 @@ use crate::{
+ };
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+-    pub(crate) fn pull<A: AsRef<str>, W: Write>(&mut self, source: A, output: W) -> Result<()> {
++    pub(crate) fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, output: W) -> Result<()> {
+         let mut session = self.open_synchronization_session()?;
+-        let source = source.as_ref();
++        let source = source.as_ref().display().to_string();
+ 
+-        let adb_stat_response = session.stat_with_explicit_ids(source)?;
++        let adb_stat_response = session.stat_with_explicit_ids(&source)?;
+ 
+         if adb_stat_response.file_perm == 0 {
+             return Err(RustADBError::UnknownResponseType(
+diff --git a/adb_client/src/message_devices/commands/push.rs b/adb_client/src/message_devices/commands/push.rs
+index d149c40..58fadbd 100644
+--- a/adb_client/src/message_devices/commands/push.rs
++++ b/adb_client/src/message_devices/commands/push.rs
+@@ -1,4 +1,4 @@
+-use std::io::Read;
++use std::{io::Read, path::Path};
+ 
+ use crate::{
+     Result,
+@@ -12,10 +12,11 @@ use crate::{
+ };
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+-    pub(crate) fn push<R: Read, A: AsRef<str>>(&mut self, stream: R, path: A) -> Result<()> {
++    pub(crate) fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()> {
+         let mut session = self.open_synchronization_session()?;
++        let path = path.as_ref();
+ 
+-        let path_header = format!("{},0777", path.as_ref());
++        let path_header = format!("{},0777", path.display());
+ 
+         let send_buffer = MessageSubcommand::Send.with_arg(u32::try_from(path_header.len())?);
+         let mut send_buffer = send_buffer.encode();
+diff --git a/adb_client/src/message_devices/commands/shell.rs b/adb_client/src/message_devices/commands/shell.rs
+index 7a34a7c..9fa4546 100644
+--- a/adb_client/src/message_devices/commands/shell.rs
++++ b/adb_client/src/message_devices/commands/shell.rs
+@@ -12,14 +12,14 @@ use crate::{
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     /// Runs 'command' in a shell on the device, and write its output and error streams into output.
+-    pub(crate) fn shell_command(
++    pub(crate) fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        mut stdout: Option<&mut dyn Write>,
+-        _stderr: Option<&mut dyn Write>,
++        command: &str,
++        mut stdout: Option<&mut W>,
++        _stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         let mut session = self.open_session(&ADBLocalCommand::ShellCommand(
+-            command.as_ref().to_string(),
++            command.to_string(),
+             Vec::new(),
+         ))?;
+ 
+@@ -39,31 +39,27 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ 
+     /// Starts an interactive shell session on the device.
+     /// Input data is read from [reader] and write to [writer].
+-    pub(crate) fn shell(
+-        &mut self,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
+-    ) -> Result<()> {
++    pub(crate) fn shell<R: Read, W: Write + Send>(&mut self, reader: R, writer: W) -> Result<()> {
+         self.bidirectional_session(&ADBLocalCommand::Shell, reader, writer)
+     }
+ 
+     /// Runs `command` on the device.
+     /// Input data is read from [reader] and write to [writer].
+-    pub(crate) fn exec(
++    pub(crate) fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()> {
+         self.bidirectional_session(&ADBLocalCommand::Exec(command.to_string()), reader, writer)
+     }
+ 
+     /// Starts an bidirectional(interactive) session. This can be a shell or an exec session.
+-    fn bidirectional_session(
++    fn bidirectional_session<R: Read, W: Write + Send>(
+         &mut self,
+         local_command: &ADBLocalCommand,
+-        mut reader: &mut dyn Read,
+-        mut writer: Box<dyn Write + Send>,
++        mut reader: R,
++        mut writer: W,
+     ) -> Result<()> {
+         let session = self.open_session(local_command)?;
+ 
+@@ -72,38 +68,44 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ 
+         let mut transport = self.get_transport_mut().clone();
+ 
+-        // Reading thread, reads response from adbd
+-        std::thread::spawn(move || -> Result<()> {
+-            loop {
+-                let message = transport.read_message()?;
++        std::thread::scope(|scope| {
++            // Reading thread, reads response from adbd
++            scope.spawn(move || -> Result<()> {
++                loop {
++                    let message = transport.read_message()?;
+ 
+-                // Acknowledge for more data
+-                let response =
+-                    ADBTransportMessage::try_new(MessageCommand::Okay, local_id, remote_id, &[])?;
+-                transport.write_message(response)?;
++                    // Acknowledge for more data
++                    let response = ADBTransportMessage::try_new(
++                        MessageCommand::Okay,
++                        local_id,
++                        remote_id,
++                        &[],
++                    )?;
++                    transport.write_message(response)?;
+ 
+-                match message.header().command() {
+-                    MessageCommand::Write => {
+-                        writer.write_all(&message.into_payload())?;
+-                        writer.flush()?;
++                    match message.header().command() {
++                        MessageCommand::Write => {
++                            writer.write_all(&message.into_payload())?;
++                            writer.flush()?;
++                        }
++                        MessageCommand::Okay => {}
++                        _ => return Err(RustADBError::ADBShellNotSupported),
+                     }
+-                    MessageCommand::Okay => {}
+-                    _ => return Err(RustADBError::ADBShellNotSupported),
+                 }
+-            }
+-        });
++            });
+ 
+-        let transport = self.get_transport_mut().clone();
+-        let mut shell_writer = ShellMessageWriter::new(transport, local_id, remote_id);
++            let transport = self.get_transport_mut().clone();
++            let mut shell_writer = ShellMessageWriter::new(transport, local_id, remote_id);
+ 
+-        // Read from given reader (that could be stdin e.g), and write content to device adbd
+-        if let Err(e) = std::io::copy(&mut reader, &mut shell_writer) {
+-            match e.kind() {
+-                ErrorKind::BrokenPipe => return Ok(()),
+-                _ => return Err(RustADBError::IOError(e)),
++            // Read from given reader (that could be stdin e.g), and write content to device adbd
++            if let Err(e) = std::io::copy(&mut reader, &mut shell_writer) {
++                match e.kind() {
++                    ErrorKind::BrokenPipe => return Ok(()),
++                    _ => return Err(RustADBError::IOError(e)),
++                }
+             }
+-        }
+ 
+-        Ok(())
++            Ok(())
++        })
+     }
+ }
+diff --git a/adb_client/src/message_devices/commands/stat.rs b/adb_client/src/message_devices/commands/stat.rs
+index 3fb0dfc..89a6c61 100644
+--- a/adb_client/src/message_devices/commands/stat.rs
++++ b/adb_client/src/message_devices/commands/stat.rs
+@@ -4,11 +4,13 @@ use crate::{
+         adb_message_device::ADBMessageDevice, adb_message_transport::ADBMessageTransport,
+     },
+ };
++use std::path::Path;
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+-    pub(crate) fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
++    pub(crate) fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<AdbStatResponse> {
+         let mut session = self.open_synchronization_session()?;
+-        let adb_stat_response = session.stat_with_explicit_ids(remote_path.as_ref())?;
++        let adb_stat_response =
++            session.stat_with_explicit_ids(&remote_path.as_ref().display().to_string())?;
+         self.end_transaction(&mut session)?;
+         Ok(adb_stat_response)
+     }
+diff --git a/adb_client/src/message_devices/commands/uninstall.rs b/adb_client/src/message_devices/commands/uninstall.rs
+index 00c9eb8..575246a 100644
+--- a/adb_client/src/message_devices/commands/uninstall.rs
++++ b/adb_client/src/message_devices/commands/uninstall.rs
+@@ -7,13 +7,9 @@ use crate::{
+ };
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+-    pub(crate) fn uninstall(
+-        &mut self,
+-        package_name: &dyn AsRef<str>,
+-        user: Option<&str>,
+-    ) -> Result<()> {
++    pub(crate) fn uninstall(&mut self, package_name: &str, user: Option<&str>) -> Result<()> {
+         self.open_session(&ADBLocalCommand::Uninstall(
+-            package_name.as_ref().to_string(),
++            package_name.to_string(),
+             user.map(ToString::to_string),
+         ))?;
+ 
+@@ -21,7 +17,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ 
+         match final_status.into_payload().as_slice() {
+             b"Success\n" => {
+-                log::info!("Package {} successfully uninstalled", package_name.as_ref());
++                log::info!("Package {package_name} successfully uninstalled");
+                 Ok(())
+             }
+             d => Err(crate::RustADBError::ADBRequestFailed(String::from_utf8(
+diff --git a/adb_client/src/message_devices/tcp/README.md b/adb_client/src/message_devices/tcp/README.md
+index e7ff2b7..31750fb 100644
+--- a/adb_client/src/message_devices/tcp/README.md
++++ b/adb_client/src/message_devices/tcp/README.md
+@@ -7,5 +7,5 @@ use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+ use adb_client::{tcp::ADBTcpDevice, ADBDeviceExt};
+ 
+ let mut device = ADBTcpDevice::new((IpAddr::from([192, 168, 0, 10]), 43210)).expect("cannot find device");
+-device.shell(&mut std::io::stdin(), Box::new(std::io::stdout()));
++device.shell(&mut std::io::stdin(), std::io::stdout());
+ ```
+diff --git a/adb_client/src/message_devices/tcp/adb_tcp_device.rs b/adb_client/src/message_devices/tcp/adb_tcp_device.rs
+index b161295..f5d15a0 100644
+--- a/adb_client/src/message_devices/tcp/adb_tcp_device.rs
++++ b/adb_client/src/message_devices/tcp/adb_tcp_device.rs
+@@ -33,32 +33,32 @@ impl ADBTcpDevice {
+ 
+ impl ADBDeviceExt for ADBTcpDevice {
+     #[inline]
+-    fn shell_command(
++    fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        stdout: Option<&mut dyn Write>,
+-        stderr: Option<&mut dyn Write>,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         self.inner.shell_command(command, stdout, stderr)
+     }
+ 
+     #[inline]
+-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
++    fn shell<R: Read, W: Write + Send>(&mut self, reader: &mut R, writer: W) -> Result<()> {
+         self.inner.shell(reader, writer)
+     }
+ 
+     #[inline]
+-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<crate::AdbStatResponse> {
++    fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<crate::AdbStatResponse> {
+         self.inner.stat(remote_path)
+     }
+ 
+     #[inline]
+-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()> {
++    fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, output: &mut W) -> Result<()> {
+         self.inner.pull(source, output)
+     }
+ 
+     #[inline]
+-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
++    fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()> {
+         self.inner.push(stream, path)
+     }
+ 
+@@ -78,12 +78,12 @@ impl ADBDeviceExt for ADBTcpDevice {
+     }
+ 
+     #[inline]
+-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
++    fn install<P: AsRef<Path>>(&mut self, apk_path: P, user: Option<&str>) -> Result<()> {
+         self.inner.install(apk_path, user)
+     }
+ 
+     #[inline]
+-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+         self.inner.uninstall(package, user)
+     }
+ 
+@@ -103,16 +103,16 @@ impl ADBDeviceExt for ADBTcpDevice {
+     }
+ 
+     #[inline]
+-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
++    fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         self.inner.list(path)
+     }
+ 
+     #[inline]
+-    fn exec(
++    fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()> {
+         self.inner.exec(command, reader, writer)
+     }
+diff --git a/adb_client/src/message_devices/usb/README.md b/adb_client/src/message_devices/usb/README.md
+index a7d857a..3d5f7da 100644
+--- a/adb_client/src/message_devices/usb/README.md
++++ b/adb_client/src/message_devices/usb/README.md
+@@ -8,7 +8,7 @@ use adb_client::{usb::ADBUSBDevice, ADBDeviceExt};
+ let vendor_id = 0x04e8;
+ let product_id = 0x6860;
+ let mut device = ADBUSBDevice::new(vendor_id, product_id).expect("cannot find device");
+-device.shell_command(&"df -h", Some(&mut std::io::stdout()), None);
++device.shell_command("df -h", Some(&mut std::io::stdout()), None);
+ ```
+ 
+ ## Push a file to the device
+@@ -22,5 +22,5 @@ let vendor_id = 0x04e8;
+ let product_id = 0x6860;
+ let mut device = ADBUSBDevice::new(vendor_id, product_id).expect("cannot find device");
+ let mut input = File::open(Path::new("/tmp/file.txt")).expect("Cannot open file");
+-device.push(&mut input, &"/data/local/tmp");
++device.push(&mut input, "/data/local/tmp");
+ ```
+diff --git a/adb_client/src/message_devices/usb/adb_usb_device.rs b/adb_client/src/message_devices/usb/adb_usb_device.rs
+index a2790c0..99b5355 100644
+--- a/adb_client/src/message_devices/usb/adb_usb_device.rs
++++ b/adb_client/src/message_devices/usb/adb_usb_device.rs
+@@ -97,32 +97,32 @@ impl ADBUSBDevice {
+ 
+ impl ADBDeviceExt for ADBUSBDevice {
+     #[inline]
+-    fn shell_command(
++    fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        stdout: Option<&mut dyn Write>,
+-        stderr: Option<&mut dyn Write>,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         self.inner.shell_command(command, stdout, stderr)
+     }
+ 
+     #[inline]
+-    fn shell<'a>(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
++    fn shell<R: Read, W: Write + Send>(&mut self, reader: &mut R, writer: W) -> Result<()> {
+         self.inner.shell(reader, writer)
+     }
+ 
+     #[inline]
+-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<crate::AdbStatResponse> {
++    fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<crate::AdbStatResponse> {
+         self.inner.stat(remote_path)
+     }
+ 
+     #[inline]
+-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()> {
++    fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, output: &mut W) -> Result<()> {
+         self.inner.pull(source, output)
+     }
+ 
+     #[inline]
+-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
++    fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()> {
+         self.inner.push(stream, path)
+     }
+ 
+@@ -142,12 +142,12 @@ impl ADBDeviceExt for ADBUSBDevice {
+     }
+ 
+     #[inline]
+-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
++    fn install<P: AsRef<Path>>(&mut self, apk_path: P, user: Option<&str>) -> Result<()> {
+         self.inner.install(apk_path, user)
+     }
+ 
+     #[inline]
+-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+         self.inner.uninstall(package, user)
+     }
+ 
+@@ -167,16 +167,16 @@ impl ADBDeviceExt for ADBUSBDevice {
+     }
+ 
+     #[inline]
+-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
++    fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         self.inner.list(path)
+     }
+ 
+     #[inline]
+-    fn exec(
++    fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()> {
+         self.inner.exec(command, reader, writer)
+     }
+diff --git a/adb_client/src/server_device/README.md b/adb_client/src/server_device/README.md
+index cd17530..929faec 100644
+--- a/adb_client/src/server_device/README.md
++++ b/adb_client/src/server_device/README.md
+@@ -7,7 +7,7 @@ use adb_client::{server::ADBServer, ADBDeviceExt};
+ 
+ let mut server = ADBServer::default();
+ let mut device = server.get_device().expect("cannot get device");
+-device.shell_command(&"df -h", Some(&mut std::io::stdout()), None);
++device.shell_command("df -h", Some(&mut std::io::stdout()), None);
+ ```
+ 
+ ## Push a file to the device
+diff --git a/adb_client/src/server_device/adb_server_device_commands.rs b/adb_client/src/server_device/adb_server_device_commands.rs
+index 97b73a4..bbabed6 100644
+--- a/adb_client/src/server_device/adb_server_device_commands.rs
++++ b/adb_client/src/server_device/adb_server_device_commands.rs
+@@ -38,11 +38,11 @@ impl TryFrom<u8> for ShellChannel {
+ }
+ 
+ impl ADBDeviceExt for ADBServerDevice {
+-    fn shell_command(
++    fn shell_command<W: Write>(
+         &mut self,
+-        command: &dyn AsRef<str>,
+-        stdout: Option<&mut dyn Write>,
+-        stderr: Option<&mut dyn Write>,
++        command: &str,
++        stdout: Option<&mut W>,
++        stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         let supported_features = self.host_features();
+         let use_shell_v2 = supported_features.is_ok_and(|features| {
+@@ -59,15 +59,15 @@ impl ADBDeviceExt for ADBServerDevice {
+     }
+ 
+     #[inline]
+-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
+-        self.stat(remote_path.as_ref())
++    fn stat<P: AsRef<Path>>(&mut self, remote_path: P) -> Result<AdbStatResponse> {
++        self.stat(remote_path)
+     }
+ 
+-    fn exec(
++    fn exec<R: Read, W: Write + Send>(
+         &mut self,
+         command: &str,
+-        reader: &mut dyn Read,
+-        writer: Box<dyn Write + Send>,
++        reader: &mut R,
++        writer: W,
+     ) -> Result<()> {
+         self.bidirectional_session(
+             &ADBCommand::Local(ADBLocalCommand::Exec(command.to_owned())),
+@@ -76,11 +76,11 @@ impl ADBDeviceExt for ADBServerDevice {
+         )
+     }
+ 
+-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
++    fn shell<R: Read, W: Write + Send>(&mut self, reader: &mut R, writer: W) -> Result<()> {
+         self.bidirectional_session(&ADBCommand::Local(ADBLocalCommand::Shell), reader, writer)
+     }
+ 
+-    fn pull(&mut self, source: &dyn AsRef<str>, mut output: &mut dyn Write) -> Result<()> {
++    fn pull<P: AsRef<Path>, W: Write>(&mut self, source: P, mut output: &mut W) -> Result<()> {
+         self.pull(source, &mut output)
+     }
+ 
+@@ -92,15 +92,15 @@ impl ADBDeviceExt for ADBServerDevice {
+         self.root()
+     }
+ 
+-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
++    fn push<R: Read, P: AsRef<Path>>(&mut self, stream: &mut R, path: P) -> Result<()> {
+         self.push(stream, path)
+     }
+ 
+-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
++    fn install<P: AsRef<Path>>(&mut self, apk_path: P, user: Option<&str>) -> Result<()> {
+         self.install(apk_path, user)
+     }
+ 
+-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
++    fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+         self.uninstall(package.as_ref(), user)
+     }
+ 
+@@ -108,7 +108,7 @@ impl ADBDeviceExt for ADBServerDevice {
+         self.framebuffer_inner()
+     }
+ 
+-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
++    fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         self.list(path)
+     }
+ 
+@@ -127,14 +127,14 @@ impl ADBDeviceExt for ADBServerDevice {
+ 
+ impl ADBServerDevice {
+     /// Shell v1: simple shell without protocol (for older ADB versions)
+-    fn shell_command_v1(
++    fn shell_command_v1<W: Write>(
+         &self,
+-        command: &dyn AsRef<str>,
+-        mut stdout: Option<&mut dyn Write>,
++        command: &str,
++        mut stdout: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         self.transport
+             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
+-                command.as_ref().to_string(),
++                command.to_string(),
+                 vec![],
+             )))?;
+ 
+@@ -160,11 +160,11 @@ impl ADBServerDevice {
+     }
+ 
+     /// Shell v2: with protocol packets (for newer ADB versions)
+-    fn shell_command_v2(
++    fn shell_command_v2<W: Write>(
+         &self,
+-        command: &dyn AsRef<str>,
+-        mut stdout: Option<&mut dyn Write>,
+-        mut stderr: Option<&mut dyn Write>,
++        command: &str,
++        mut stdout: Option<&mut W>,
++        mut stderr: Option<&mut W>,
+     ) -> Result<Option<u8>> {
+         let mut args = vec!["v2".to_string()];
+ 
+@@ -175,7 +175,7 @@ impl ADBServerDevice {
+         // Send the request
+         self.transport
+             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
+-                command.as_ref().to_string(),
++                command.to_string(),
+                 args,
+             )))?;
+ 
+@@ -264,11 +264,11 @@ impl ADBServerDevice {
+         }
+     }
+ 
+-    fn bidirectional_session(
++    fn bidirectional_session<R: Read, W: Write + Send>(
+         &mut self,
+         server_cmd: &ADBCommand,
+-        mut reader: &mut dyn Read,
+-        mut writer: Box<dyn Write + Send>,
++        mut reader: &mut R,
++        mut writer: W,
+     ) -> Result<()> {
+         // For bidirectional session, we still need shell features
+         // But we can try without checking features first
+@@ -279,34 +279,38 @@ impl ADBServerDevice {
+ 
+         let mut write_stream = read_stream.try_clone()?;
+ 
+-        // Reading thread, reads response from adb-server
+-        std::thread::spawn(move || -> Result<()> {
+-            let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
++        std::thread::scope(|scope| {
++            // Reading thread, reads response from adb-server
++            scope.spawn(move || -> Result<()> {
++                let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
+ 
+-            loop {
+-                match read_stream.read(&mut buffer) {
+-                    Ok(0) => {
+-                        read_stream.shutdown(std::net::Shutdown::Both)?;
+-                        return Ok(());
+-                    }
+-                    Ok(size) => {
+-                        writer.write_all(&buffer[..size])?;
+-                        writer.flush()?;
+-                    }
+-                    Err(e) => {
+-                        return Err(RustADBError::IOError(e));
++                loop {
++                    match read_stream.read(&mut buffer) {
++                        Ok(0) => {
++                            read_stream.shutdown(std::net::Shutdown::Both)?;
++                            return Ok(());
++                        }
++                        Ok(size) => {
++                            writer.write_all(&buffer[..size])?;
++                            writer.flush()?;
++                        }
++                        Err(e) => {
++                            return Err(RustADBError::IOError(e));
++                        }
+                     }
+                 }
+-            }
+-        });
++            });
+ 
+-        // Read from given reader (that could be stdin e.g), and write content to server socket
+-        if let Err(e) = std::io::copy(&mut reader, &mut write_stream) {
+-            match e.kind() {
+-                ErrorKind::BrokenPipe => return Ok(()),
+-                _ => return Err(RustADBError::IOError(e)),
++            // Read from given reader (that could be stdin e.g), and write content to server socket
++            if let Err(e) = std::io::copy(&mut reader, &mut write_stream) {
++                match e.kind() {
++                    ErrorKind::BrokenPipe => return Ok(()),
++                    _ => return Err(RustADBError::IOError(e)),
++                }
+             }
+-        }
++
++            Ok(())
++        })?;
+ 
+         Ok(())
+     }
+diff --git a/adb_client/src/server_device/commands/list.rs b/adb_client/src/server_device/commands/list.rs
+index a311f31..c5ce618 100644
+--- a/adb_client/src/server_device/commands/list.rs
++++ b/adb_client/src/server_device/commands/list.rs
+@@ -6,13 +6,14 @@ use crate::{
+ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+ use std::{
+     io::{Read, Write},
++    path::Path,
+     str,
+ };
+ 
+ impl ADBServerDevice {
+     /// Lists files in path on the device.
+     /// note: path uses internal file paths, so Documents is at /storage/emulated/0/Documents
+-    pub fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
++    pub fn list<P: AsRef<Path>>(&mut self, path: P) -> Result<Vec<ADBListItemType>> {
+         self.set_serial_transport()?;
+ 
+         // Set device in SYNC mode
+@@ -25,11 +26,12 @@ impl ADBServerDevice {
+         self.handle_list_command(path)
+     }
+ 
+-    fn handle_list_command<A: AsRef<str>>(&self, path: A) -> Result<Vec<ADBListItemType>> {
++    fn handle_list_command<P: AsRef<Path>>(&self, path: P) -> Result<Vec<ADBListItemType>> {
+         // TODO: use LIS2 to support files over 2.14 GB in size.
+         // SEE: https://github.com/cstyan/adbDocumentation?tab=readme-ov-file#adb-list
++        let path = path.as_ref().to_string_lossy();
+         let mut len_buf = [0_u8; 4];
+-        LittleEndian::write_u32(&mut len_buf, u32::try_from(path.as_ref().len())?);
++        LittleEndian::write_u32(&mut len_buf, u32::try_from(path.len())?);
+ 
+         // 4 bytes of command name is already sent by send_sync_request
+         self.transport.get_raw_connection()?.write_all(&len_buf)?;
+diff --git a/adb_client/src/server_device/commands/logcat.rs b/adb_client/src/server_device/commands/logcat.rs
+index 914308b..e7defed 100644
+--- a/adb_client/src/server_device/commands/logcat.rs
++++ b/adb_client/src/server_device/commands/logcat.rs
+@@ -49,7 +49,7 @@ impl<W: Write> Write for LogFilter<W> {
+ impl ADBServerDevice {
+     /// Get logs from device
+     pub fn get_logs<W: Write>(&mut self, output: W) -> Result<()> {
+-        let _status = self.shell_command(&"exec logcat", Some(&mut LogFilter::new(output)), None);
++        let _status = self.shell_command("exec logcat", Some(&mut LogFilter::new(output)), None);
+         Ok(())
+     }
+ }
+diff --git a/adb_client/src/server_device/commands/recv.rs b/adb_client/src/server_device/commands/recv.rs
+index 1f31adf..1dd8b4f 100644
+--- a/adb_client/src/server_device/commands/recv.rs
++++ b/adb_client/src/server_device/commands/recv.rs
+@@ -4,7 +4,10 @@ use crate::{
+     server_device::ADBServerDevice,
+ };
+ use byteorder::{LittleEndian, ReadBytesExt};
+-use std::io::{BufReader, BufWriter, Read, Write};
++use std::{
++    io::{BufReader, BufWriter, Read, Write},
++    path::Path,
++};
+ 
+ /// Internal structure wrapping a [`std::io::Read`] and hiding underlying protocol logic.
+ struct ADBRecvCommandReader<R: Read> {
+@@ -70,7 +73,7 @@ const BUFFER_SIZE: usize = 65535;
+ 
+ impl ADBServerDevice {
+     /// Receives path to stream from the device.
+-    pub fn pull(&mut self, path: &dyn AsRef<str>, stream: &mut dyn Write) -> Result<()> {
++    pub fn pull<P: AsRef<Path>, W: Write>(&mut self, path: P, stream: &mut W) -> Result<()> {
+         self.set_serial_transport()?;
+ 
+         // Set device in SYNC mode
+@@ -80,7 +83,7 @@ impl ADBServerDevice {
+         // Send a recv command
+         self.transport.send_sync_request(&SyncCommand::Recv)?;
+ 
+-        self.handle_recv_command(path, stream)
++        self.handle_recv_command(path.as_ref().to_string_lossy(), stream)
+     }
+ 
+     fn handle_recv_command<S: AsRef<str>>(&self, from: S, output: &mut dyn Write) -> Result<()> {
+diff --git a/adb_client/src/server_device/commands/send.rs b/adb_client/src/server_device/commands/send.rs
+index bd50979..c094b2e 100644
+--- a/adb_client/src/server_device/commands/send.rs
++++ b/adb_client/src/server_device/commands/send.rs
+@@ -6,6 +6,7 @@ use crate::{
+ use std::{
+     convert::TryInto,
+     io::{self, BufReader, BufWriter, Read, Write},
++    path::Path,
+     str::{self, FromStr},
+     time::SystemTime,
+ };
+@@ -45,8 +46,9 @@ const BUFFER_SIZE: usize = 65535;
+ 
+ impl ADBServerDevice {
+     /// Send stream to path on the device.
+-    pub fn push<R: Read, A: AsRef<str>>(&mut self, stream: R, path: A) -> Result<()> {
+-        log::info!("Sending data to {}", path.as_ref());
++    pub fn push<R: Read, P: AsRef<Path>>(&mut self, stream: R, path: P) -> Result<()> {
++        let path = path.as_ref();
++        log::info!("Sending data to {}", path.display());
+         self.set_serial_transport()?;
+ 
+         // Set device in SYNC mode
+@@ -56,7 +58,7 @@ impl ADBServerDevice {
+         // Send a send command
+         self.transport.send_sync_request(&SyncCommand::Send)?;
+ 
+-        self.handle_send_command(stream, path)
++        self.handle_send_command(stream, path.to_string_lossy())
+     }
+ 
+     fn handle_send_command<R: Read, S: AsRef<str>>(&self, input: R, to: S) -> Result<()> {
+diff --git a/adb_client/src/server_device/commands/stat.rs b/adb_client/src/server_device/commands/stat.rs
+index 6e18f50..bdac455 100644
+--- a/adb_client/src/server_device/commands/stat.rs
++++ b/adb_client/src/server_device/commands/stat.rs
+@@ -1,4 +1,7 @@
+-use std::io::{Read, Write};
++use std::{
++    io::{Read, Write},
++    path::Path,
++};
+ 
+ use byteorder::{ByteOrder, LittleEndian};
+ 
+@@ -9,15 +12,16 @@ use crate::{
+ };
+ 
+ impl ADBServerDevice {
+-    fn handle_stat_command<S: AsRef<str>>(&self, path: S) -> Result<AdbStatResponse> {
++    fn handle_stat_command<P: AsRef<Path>>(&self, path: P) -> Result<AdbStatResponse> {
++        let path = path.as_ref().to_string_lossy();
+         let mut len_buf = [0_u8; 4];
+-        LittleEndian::write_u32(&mut len_buf, u32::try_from(path.as_ref().len())?);
++        LittleEndian::write_u32(&mut len_buf, u32::try_from(path.len())?);
+ 
+         // 4 bytes of command name is already sent by send_sync_request
+         self.transport.get_raw_connection()?.write_all(&len_buf)?;
+         self.transport
+             .get_raw_connection()?
+-            .write_all(path.as_ref().to_string().as_bytes())?;
++            .write_all(path.as_bytes())?;
+ 
+         // Reads returned status code from ADB server
+         let mut response = [0_u8; 4];
+@@ -38,7 +42,7 @@ impl ADBServerDevice {
+     }
+ 
+     /// Stat file given as path on the device.
+-    pub fn stat<A: AsRef<str>>(&mut self, path: A) -> Result<AdbStatResponse> {
++    pub fn stat<P: AsRef<Path>>(&mut self, path: P) -> Result<AdbStatResponse> {
+         self.set_serial_transport()?;
+ 
+         // Set device in SYNC mode
+diff --git a/pyadb_client/src/adb_server_device.rs b/pyadb_client/src/adb_server_device.rs
+index d35c1b5..32f7059 100644
+--- a/pyadb_client/src/adb_server_device.rs
++++ b/pyadb_client/src/adb_server_device.rs
+@@ -26,22 +26,20 @@ impl PyADBServerDevice {
+         command: &str,
+     ) -> Result<Bound<'py, PyBytes>> {
+         let mut output = Vec::new();
+-        self.0.shell_command(&command, Some(&mut output), None)?;
++        self.0.shell_command(command, Some(&mut output), None)?;
+         Ok(PyBytes::new(py, &output))
+     }
+ 
+     /// Push a local file from input to dest
+-    #[expect(clippy::needless_pass_by_value)]
+     pub fn push(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut reader = File::open(input)?;
+-        Ok(self.0.push(&mut reader, dest.to_string_lossy())?)
++        Ok(self.0.push(&mut reader, dest)?)
+     }
+ 
+     /// Pull a file from device located at input, and drop it to dest
+-    #[expect(clippy::needless_pass_by_value)]
+     pub fn pull(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut writer = File::create(dest)?;
+-        Ok(self.0.pull(&input.to_string_lossy(), &mut writer)?)
++        Ok(self.0.pull(input, &mut writer)?)
+     }
+ 
+     /// Install a package installed on the device
+diff --git a/pyadb_client/src/adb_tcp_device.rs b/pyadb_client/src/adb_tcp_device.rs
+index a0d3072..2844ed7 100644
+--- a/pyadb_client/src/adb_tcp_device.rs
++++ b/pyadb_client/src/adb_tcp_device.rs
+@@ -34,7 +34,7 @@ impl PyADBTcpDevice {
+         command: &str,
+     ) -> Result<Bound<'py, PyBytes>> {
+         let mut output = Vec::new();
+-        self.0.shell_command(&command, Some(&mut output), None)?;
++        self.0.shell_command(command, Some(&mut output), None)?;
+         Ok(PyBytes::new(py, &output))
+     }
+ 
+@@ -42,14 +42,14 @@ impl PyADBTcpDevice {
+     #[expect(clippy::needless_pass_by_value)]
+     pub fn push(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut reader = File::open(input)?;
+-        Ok(self.0.push(&mut reader, &dest.to_string_lossy())?)
++        Ok(self.0.push(&mut reader, &dest)?)
+     }
+ 
+     /// Pull a file from device located at input, and drop it to dest
+     #[expect(clippy::needless_pass_by_value)]
+     pub fn pull(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut writer = File::create(dest)?;
+-        Ok(self.0.pull(&input.to_string_lossy(), &mut writer)?)
++        Ok(self.0.pull(&input, &mut writer)?)
+     }
+ 
+     /// Install a package (APK) onto the device from the given local path
+@@ -62,7 +62,7 @@ impl PyADBTcpDevice {
+     /// Uninstall a package installed on the device
+     #[pyo3(signature = (package, user=None))]
+     pub fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+-        Ok(self.0.uninstall(&package, user)?)
++        Ok(self.0.uninstall(package, user)?)
+     }
+ 
+     /// Restart adb daemon with root permissions
+diff --git a/pyadb_client/src/adb_usb_device.rs b/pyadb_client/src/adb_usb_device.rs
+index 65a21f0..a936603 100644
+--- a/pyadb_client/src/adb_usb_device.rs
++++ b/pyadb_client/src/adb_usb_device.rs
+@@ -65,7 +65,7 @@ impl PyADBUSBDevice {
+         command: &str,
+     ) -> Result<Bound<'py, PyBytes>> {
+         let mut output = Vec::new();
+-        self.0.shell_command(&command, Some(&mut output), None)?;
++        self.0.shell_command(command, Some(&mut output), None)?;
+         Ok(PyBytes::new(py, &output))
+     }
+ 
+@@ -73,27 +73,25 @@ impl PyADBUSBDevice {
+     #[expect(clippy::needless_pass_by_value)]
+     pub fn push(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut reader = File::open(input)?;
+-        Ok(self.0.push(&mut reader, &dest.to_string_lossy())?)
++        Ok(self.0.push(&mut reader, &dest)?)
+     }
+ 
+     /// Pull a file from device located at input, and drop it to dest
+-    #[expect(clippy::needless_pass_by_value)]
+     pub fn pull(&mut self, input: PathBuf, dest: PathBuf) -> Result<()> {
+         let mut writer = File::create(dest)?;
+-        Ok(self.0.pull(&input.to_string_lossy(), &mut writer)?)
++        Ok(self.0.pull(input, &mut writer)?)
+     }
+ 
+     /// Install a package installed on the device
+-    #[expect(clippy::needless_pass_by_value)]
+     #[pyo3(signature = (apk_path, user=None))]
+     pub fn install(&mut self, apk_path: PathBuf, user: Option<&str>) -> Result<()> {
+-        Ok(self.0.install(&apk_path, user)?)
++        Ok(self.0.install(apk_path, user)?)
+     }
+ 
+     /// Uninstall a package installed on the device
+     #[pyo3(signature = (package, user=None))]
+     pub fn uninstall(&mut self, package: &str, user: Option<&str>) -> Result<()> {
+-        Ok(self.0.uninstall(&package, user)?)
++        Ok(self.0.uninstall(package, user)?)
+     }
+ 
+     /// Restart adb daemon with root permissions

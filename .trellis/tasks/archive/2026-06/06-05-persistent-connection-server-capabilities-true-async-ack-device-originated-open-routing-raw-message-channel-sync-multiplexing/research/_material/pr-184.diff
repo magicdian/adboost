@@ -1,0 +1,884 @@
+diff --git a/adb_cli/Cargo.toml b/adb_cli/Cargo.toml
+index 1135e67..2df2456 100644
+--- a/adb_cli/Cargo.toml
++++ b/adb_cli/Cargo.toml
+@@ -14,9 +14,9 @@ version.workspace = true
+ workspace = true
+ 
+ [dependencies]
+-adb_client = { version = "^3.0.1", features = ["mdns", "usb"] }
+-clap = { version = "4.5.54", features = ["derive"] }
+-env_logger = { version = "0.11.8" }
++adb_client = { version = "^3.1.1", features = ["mdns", "usb"] }
++clap = { version = "4.5.60", features = ["derive"] }
++env_logger = { version = "0.11.9" }
+ log = { version = "0.4.29" }
+ tabwriter = { version = "1.4.1" }
+ 
+diff --git a/adb_cli/src/models/adb_cli_error.rs b/adb_cli/src/models/adb_cli_error.rs
+index 09aee9c..5403873 100644
+--- a/adb_cli/src/models/adb_cli_error.rs
++++ b/adb_cli/src/models/adb_cli_error.rs
+@@ -79,7 +79,8 @@ impl From<adb_client::RustADBError> for ADBCliError {
+             | RustADBError::USBDeviceNotFound(_, _)
+             | RustADBError::WrongFileExtension(_)
+             | RustADBError::AddrParseError(_)
+-            | RustADBError::DeviceBusy => Self::Standard(value),
++            | RustADBError::DeviceBusy
++            | RustADBError::Timeout => Self::Standard(value),
+         }
+     }
+ }
+diff --git a/adb_client/Cargo.toml b/adb_client/Cargo.toml
+index 409723c..9b9d37d 100644
+--- a/adb_client/Cargo.toml
++++ b/adb_client/Cargo.toml
+@@ -25,20 +25,20 @@ usb = ["dep:rusb"]
+ [dependencies]
+ base64 = { version = "0.22.1" }
+ byteorder = { version = "1.5.0" }
+-chrono = { version = "0.4.43", default-features = false, features = ["std"] }
++chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+ image = { version = "0.25.9", default-features = false, features = ["png"] }
+ log = { version = "0.4.29" }
+ num-bigint = { version = "0.8.6", package = "num-bigint-dig" }
+ num-traits = { version = "0.2.19" }
+ quick-protobuf = { version = "0.8.1" }
+ rand = { version = "0.10.0" }
+-rcgen = { version = "0.14.6", default-features = false, features = [
++rcgen = { version = "0.14.7", default-features = false, features = [
+     "ring",
+     "pem",
+ ] }
+-regex = { version = "1.12.2", features = ["perf", "std", "unicode"] }
++regex = { version = "1.12.3", features = ["perf", "std", "unicode"] }
+ rsa = { version = "0.9.10" }
+-rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12", "logging"] }
++rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+ rustls-pki-types = { version = "1.14.0" }
+ sha1 = { version = "0.10.6", features = ["oid"] }
+ thiserror = { version = "2.0.18" }
+@@ -56,8 +56,8 @@ num_enum = { version = "0.7.5" }
+ #########
+ 
+ [dev-dependencies]
+-anyhow = { version = "1.0.100" }
+-criterion = { version = "0.8.1" } # Used for benchmarks
++anyhow = { version = "1.0.102" }
++criterion = { version = "0.8.2" } # Used for benchmarks
+ 
+ [[bench]]
+ harness = false
+diff --git a/adb_client/src/error.rs b/adb_client/src/error.rs
+index c315967..c803218 100644
+--- a/adb_client/src/error.rs
++++ b/adb_client/src/error.rs
+@@ -138,6 +138,9 @@ pub enum RustADBError {
+     /// An unknown file mode was encountered in list
+     #[error("Unknown file mode {0}")]
+     UnknownFileMode(u32),
++    /// Timeout while waiting for response
++    #[error("timeout while waiting for response")]
++    Timeout,
+ }
+ 
+ impl<T> From<std::sync::PoisonError<T>> for RustADBError {
+diff --git a/adb_client/src/message_devices/adb_message_device.rs b/adb_client/src/message_devices/adb_message_device.rs
+index ba8ebae..5bd2c3d 100644
+--- a/adb_client/src/message_devices/adb_message_device.rs
++++ b/adb_client/src/message_devices/adb_message_device.rs
+@@ -1,10 +1,12 @@
+ use rand::RngExt;
+-use std::{path::Path, time::Duration};
++use std::path::Path;
+ 
+ use crate::{
+     Result, RustADBError,
++    adb_transport::ADBTransport,
+     message_devices::{
+         adb_message_transport::ADBMessageTransport,
++        adb_multiplexer::ADBMessageMultiplexer,
+         adb_session::ADBSession,
+         adb_transport_message::{
+             ADBTransportMessage, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
+@@ -20,7 +22,7 @@ use crate::{
+ /// Structure is totally agnostic over which transport is truly used.
+ #[derive(Debug)]
+ pub(crate) struct ADBMessageDevice<T: ADBMessageTransport> {
+-    transport: T,
++    multiplexer: ADBMessageMultiplexer<T>,
+ }
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+@@ -36,19 +38,17 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             ADBRsaKey::new_random()?
+         };
+ 
+-        let mut message_device = Self { transport };
++        let mut message_device = Self {
++            multiplexer: ADBMessageMultiplexer::new(transport),
++        };
+         message_device.connect(&private_key)?;
+ 
+         Ok(message_device)
+     }
+ 
+-    pub(crate) fn get_transport_mut(&mut self) -> &mut T {
+-        &mut self.transport
+-    }
+-
+     /// Send initial connect
+     fn connect(&mut self, private_key: &ADBRsaKey) -> Result<()> {
+-        self.get_transport_mut().connect()?;
++        self.multiplexer.connect()?;
+ 
+         let message = ADBTransportMessage::try_new(
+             MessageCommand::Cnxn,
+@@ -57,21 +57,21 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             format!("host::{}\0", env!("CARGO_PKG_NAME")).as_bytes(),
+         )?;
+ 
+-        self.get_transport_mut().write_message(message)?;
++        self.multiplexer.write_message(message)?;
+ 
+-        let message = self.get_transport_mut().read_message()?;
++        let message = self.multiplexer.read_authentication_message()?;
+ 
+         // Check if a client is requesting a secure connection and upgrade it if necessary
+         match message.header().command() {
+             MessageCommand::Stls => {
+-                self.get_transport_mut()
++                self.multiplexer
+                     .write_message(ADBTransportMessage::try_new(
+                         MessageCommand::Stls,
+                         1,
+                         0,
+                         &[],
+                     )?)?;
+-                self.get_transport_mut().upgrade_connection()?;
++                self.multiplexer.upgrade_connection()?;
+                 log::debug!("Connection successfully upgraded from TCP to TLS");
+                 Ok(())
+             }
+@@ -116,15 +116,17 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ 
+         let message = ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign)?;
+ 
+-        self.transport.write_message(message)?;
++        self.multiplexer.write_message(message)?;
+ 
+-        let received_response = self.transport.read_message()?;
++        let received_response = self.multiplexer.read_authentication_message()?;
+ 
+         if received_response.header().command() == MessageCommand::Cnxn {
+             log::info!(
+                 "Authentication OK, device info {}",
+                 String::from_utf8(received_response.into_payload())?
+             );
++            // Authentication is OK, we can now consider sessions
++            self.multiplexer.set_authenticated();
+             return Ok(());
+         }
+ 
+@@ -134,11 +136,11 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         let message =
+             ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey)?;
+ 
+-        self.transport.write_message(message)?;
++        self.multiplexer.write_message(message)?;
+ 
+         let response = self
+-            .transport
+-            .read_message_with_timeout(Duration::from_secs(10))
++            .multiplexer
++            .read_authentication_message()
+             .and_then(|message| {
+                 message.assert_command(MessageCommand::Cnxn)?;
+                 Ok(message)
+@@ -148,6 +150,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             "Authentication OK, device info {}",
+             String::from_utf8(response.into_payload())?
+         );
++        // Authentication is OK, we can now consider sessions
++        self.multiplexer.set_authenticated();
++
+         Ok(())
+     }
+ 
+@@ -165,9 +170,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             0,
+             cmd.to_string().as_bytes(),
+         )?;
+-        self.transport.write_message(message)?;
++        log::debug!("here");
++        self.multiplexer.write_message(message)?;
++        log::debug!("after");
+ 
+-        let response = self.transport.read_message()?;
++        let response = self.multiplexer.read_message(local_id)?;
++        log::debug!("got message from multiplexer");
+ 
+         if response.header().command() != MessageCommand::Okay {
+             return Err(RustADBError::ADBRequestFailed(format!(
+@@ -184,13 +192,13 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         }
+ 
+         Ok(ADBSession::new(
+-            self.transport.clone(),
++            self.multiplexer.clone(),
+             local_id,
+             response.header().arg0(),
+         ))
+     }
+ 
+-    pub(crate) fn end_transaction(&mut self, session: &mut ADBSession<T>) -> Result<()> {
++    pub(crate) fn end_transaction(session: &mut ADBSession<T>) -> Result<()> {
+         let quit_buffer = MessageSubcommand::Quit.with_arg(0u32);
+         session.send_and_expect_okay(ADBTransportMessage::try_new(
+             MessageCommand::Write,
+@@ -199,7 +207,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             &quit_buffer.encode(),
+         )?)?;
+ 
+-        let _discard_close = self.transport.read_message()?;
++        let _discard_close = session.read_message()?;
+         Ok(())
+     }
+ }
+@@ -207,6 +215,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ impl<T: ADBMessageTransport> Drop for ADBMessageDevice<T> {
+     fn drop(&mut self) {
+         // Best effort here
+-        let _ = self.get_transport_mut().disconnect();
++        let _ = self.multiplexer.disconnect();
+     }
+ }
+diff --git a/adb_client/src/message_devices/adb_multiplexer.rs b/adb_client/src/message_devices/adb_multiplexer.rs
+new file mode 100644
+index 0000000..5339b71
+--- /dev/null
++++ b/adb_client/src/message_devices/adb_multiplexer.rs
+@@ -0,0 +1,168 @@
++use std::{
++    collections::{HashMap, VecDeque},
++    sync::{
++        Arc, RwLock,
++        atomic::{AtomicBool, Ordering},
++    },
++    thread::JoinHandle,
++    time::{Duration, Instant},
++};
++
++use crate::{
++    Result, RustADBError,
++    adb_transport::ADBTransport,
++    message_devices::{
++        adb_message_transport::ADBMessageTransport, adb_transport_message::ADBTransportMessage,
++    },
++};
++
++/// Internal structure handling multiplexing of messages over various sessions.
++///
++/// It spawns a thread reading the transport, and implements [`ADBMessageTransport`] to read / write messages..
++#[derive(Clone, Debug)]
++pub(crate) struct ADBMessageMultiplexer<T: ADBMessageTransport> {
++    transport: T,
++    authenticated_data: Arc<RwLock<HashMap<u32, VecDeque<ADBTransportMessage>>>>,
++    unauthenticated_data: Arc<RwLock<VecDeque<ADBTransportMessage>>>,
++    handle: Option<Arc<JoinHandle<Result<()>>>>,
++    authenticated: Arc<AtomicBool>,
++}
++
++impl<T: ADBMessageTransport> ADBMessageMultiplexer<T> {
++    pub fn new(transport: T) -> Self {
++        Self {
++            transport,
++            authenticated_data: Arc::default(),
++            unauthenticated_data: Arc::default(),
++            handle: None,
++            authenticated: Arc::new(AtomicBool::new(false)),
++        }
++    }
++
++    pub fn upgrade_connection(&mut self) -> Result<()> {
++        self.transport.upgrade_connection()
++    }
++
++    pub fn set_authenticated(&mut self) {
++        log::debug!("multiplexer: authenticated");
++        self.authenticated.store(true, Ordering::Relaxed);
++    }
++
++    pub(crate) fn read_authentication_message(&mut self) -> Result<ADBTransportMessage> {
++        self.read_message_with_timeout(None, Duration::from_secs(u64::MAX))
++    }
++
++    pub(crate) fn read_message(&mut self, local_id: u32) -> Result<ADBTransportMessage> {
++        self.read_message_with_timeout(Some(local_id), Duration::from_secs(u64::MAX))
++    }
++
++    pub(crate) fn write_message(&mut self, message: ADBTransportMessage) -> Result<()> {
++        self.write_message_with_timeout(message, Duration::from_secs(2))
++    }
++
++    pub fn read_message_with_timeout(
++        &mut self,
++        local_id: Option<u32>,
++        read_timeout: Duration,
++    ) -> Result<ADBTransportMessage> {
++        let now = Instant::now();
++        loop {
++            if let Some(local_id) = local_id {
++                let mut rw_data = self.authenticated_data.write()?;
++
++                if let Some(d) = rw_data.get_mut(&local_id)
++                    && let Some(v) = d.pop_front()
++                {
++                    return Ok(v);
++                }
++            } else {
++                let mut rw_data = self.unauthenticated_data.write()?;
++                if let Some(v) = rw_data.pop_front() {
++                    return Ok(v);
++                }
++            }
++
++            if now.elapsed() >= read_timeout {
++                return Err(RustADBError::Timeout);
++            }
++
++            std::thread::sleep(Duration::from_millis(50));
++        }
++    }
++
++    pub fn write_message_with_timeout(
++        &mut self,
++        message: ADBTransportMessage,
++        write_timeout: std::time::Duration,
++    ) -> Result<()> {
++        self.transport
++            .write_message_with_timeout(message, write_timeout)
++    }
++}
++
++impl<T: ADBMessageTransport> ADBTransport for ADBMessageMultiplexer<T> {
++    fn connect(&mut self) -> crate::Result<()> {
++        self.transport.connect()?;
++
++        let data = self.authenticated_data.clone();
++        let unauth_data = self.unauthenticated_data.clone();
++        let mut transport = self.transport.clone();
++        let authenticated = self.authenticated.clone();
++
++        // Spawn a thread responsible of continously reading the underlying transport
++        // and pushing messages to the internal data structure
++        let handle = std::thread::spawn(move || {
++            loop {
++                log::trace!("waiting for incoming message");
++                let message = transport.read_message()?;
++
++                let remote_id = message.header().arg1();
++
++                if authenticated.load(Ordering::Relaxed) {
++                    log::trace!("got new authenticated message for {remote_id} session");
++
++                    let mut rw_data = data.write()?;
++                    let new_value = if let Some(mut d) = rw_data.remove(&remote_id) {
++                        d.push_back(message);
++                        d
++                    } else {
++                        let mut v = VecDeque::new();
++                        v.push_back(message);
++                        v
++                    };
++                    rw_data.insert(remote_id, new_value);
++                } else {
++                    log::trace!("got new pre-authenticated message");
++                    let mut rw_unauth_data = unauth_data.write()?;
++                    rw_unauth_data.push_back(message);
++                }
++            }
++        });
++
++        self.handle = Some(Arc::new(handle));
++
++        Ok(())
++    }
++
++    fn disconnect(&mut self) -> crate::Result<()> {
++        // Empty both internal data storage structures
++        {
++            let mut rw_data = self.authenticated_data.write()?;
++            *rw_data = HashMap::default();
++        }
++
++        {
++            let mut rw_unauth_data = self.unauthenticated_data.write()?;
++            *rw_unauth_data = VecDeque::default();
++        }
++
++        if let Some(handle) = self.handle.take()
++            && let Some(handle) = Arc::into_inner(handle)
++            && let Err(e) = handle.join()
++        {
++            log::error!("Error joining multiplexer thread: {e:?}");
++        }
++
++        Ok(())
++    }
++}
+diff --git a/adb_client/src/message_devices/adb_session.rs b/adb_client/src/message_devices/adb_session.rs
+index 24badd8..042fc54 100644
+--- a/adb_client/src/message_devices/adb_session.rs
++++ b/adb_client/src/message_devices/adb_session.rs
+@@ -7,8 +7,10 @@ use byteorder::ReadBytesExt;
+ 
+ use crate::{
+     AdbStatResponse, BinaryDecodable, Result, RustADBError,
++    adb_transport::ADBTransport,
+     message_devices::{
+         adb_message_transport::ADBMessageTransport,
++        adb_multiplexer::ADBMessageMultiplexer,
+         adb_transport_message::ADBTransportMessage,
+         message_commands::{MessageCommand, MessageSubcommand},
+         utils::BinaryEncodable,
+@@ -18,26 +20,22 @@ use crate::{
+ const BUFFER_SIZE: usize = 65535;
+ 
+ /// Represent a session between an `ADBDevice` and remote `adbd`.
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub struct ADBSession<T: ADBMessageTransport> {
+-    transport: T,
++    multiplexer: ADBMessageMultiplexer<T>,
+     local_id: u32,
+     remote_id: u32,
+ }
+ 
+ impl<T: ADBMessageTransport> ADBSession<T> {
+-    pub fn new(transport: T, local_id: u32, remote_id: u32) -> Self {
++    pub fn new(multiplexer: ADBMessageMultiplexer<T>, local_id: u32, remote_id: u32) -> Self {
+         Self {
+-            transport,
++            multiplexer,
+             local_id,
+             remote_id,
+         }
+     }
+ 
+-    pub const fn get_transport_mut(&mut self) -> &mut T {
+-        &mut self.transport
+-    }
+-
+     pub const fn local_id(&self) -> u32 {
+         self.local_id
+     }
+@@ -48,13 +46,14 @@ impl<T: ADBMessageTransport> ADBSession<T> {
+ 
+     /// Receive a message and acknowledge it by replying with an `OKAY` command
+     pub(crate) fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
+-        let message = self.transport.read_message()?;
+-        self.transport.write_message(ADBTransportMessage::try_new(
+-            MessageCommand::Okay,
+-            self.local_id,
+-            self.remote_id,
+-            &[],
+-        )?)?;
++        let message = self.multiplexer.read_message(self.local_id())?;
++        self.multiplexer
++            .write_message(ADBTransportMessage::try_new(
++                MessageCommand::Okay,
++                self.local_id,
++                self.remote_id,
++                &[],
++            )?)?;
+         Ok(message)
+     }
+ 
+@@ -63,12 +62,14 @@ impl<T: ADBMessageTransport> ADBSession<T> {
+         &mut self,
+         message: ADBTransportMessage,
+     ) -> Result<ADBTransportMessage> {
+-        self.transport.write_message(message)?;
+-
+-        self.transport.read_message().and_then(|message| {
+-            message.assert_command(MessageCommand::Okay)?;
+-            Ok(message)
+-        })
++        self.multiplexer.write_message(message)?;
++
++        self.multiplexer
++            .read_message(self.local_id())
++            .and_then(|message| {
++                message.assert_command(MessageCommand::Okay)?;
++                Ok(message)
++            })
+     }
+ 
+     pub(crate) fn recv_file<W: std::io::Write>(
+@@ -143,7 +144,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
+                     self.send_and_expect_okay(message)?;
+ 
+                     // Command should end with a Write => Okay
+-                    let received = self.transport.read_message()?;
++                    let received = self.multiplexer.read_message(self.local_id)?;
+                     match received.header().command() {
+                         MessageCommand::Write => return Ok(()),
+                         c => {
+@@ -191,7 +192,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
+             remote_path.as_bytes(),
+         )?)?;
+ 
+-        let response = self.transport.read_message()?;
++        let response = self.multiplexer.read_message(self.local_id())?;
+         // Skip first 4 bytes as this is the literal "STAT".
+         // Interesting part starts right after
+ 
+@@ -204,8 +205,34 @@ impl<T: ADBMessageTransport> Drop for ADBSession<T> {
+         // some devices will repeat the trailing CLSE command to ensure
+         // the client has acknowledged it. Read them quickly if present.
+         while let Ok(_discard_close_message) = self
+-            .transport
+-            .read_message_with_timeout(Duration::from_millis(20))
++            .multiplexer
++            .read_message_with_timeout(Some(self.local_id()), Duration::from_millis(20))
+         {}
+     }
+ }
++
++impl<T: ADBMessageTransport> ADBTransport for ADBSession<T> {
++    fn connect(&mut self) -> Result<()> {
++        Ok(())
++    }
++
++    fn disconnect(&mut self) -> Result<()> {
++        Ok(())
++    }
++}
++
++impl<T: ADBMessageTransport> ADBMessageTransport for ADBSession<T> {
++    fn read_message_with_timeout(&mut self, read_timeout: Duration) -> Result<ADBTransportMessage> {
++        self.multiplexer
++            .read_message_with_timeout(Some(self.local_id()), read_timeout)
++    }
++
++    fn write_message_with_timeout(
++        &mut self,
++        message: ADBTransportMessage,
++        write_timeout: Duration,
++    ) -> Result<()> {
++        self.multiplexer
++            .write_message_with_timeout(message, write_timeout)
++    }
++}
+diff --git a/adb_client/src/message_devices/commands/framebuffer.rs b/adb_client/src/message_devices/commands/framebuffer.rs
+index 889134b..67fe93e 100644
+--- a/adb_client/src/message_devices/commands/framebuffer.rs
++++ b/adb_client/src/message_devices/commands/framebuffer.rs
+@@ -93,7 +93,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         };
+ 
+         session
+-            .get_transport_mut()
+             .read_message()
+             .and_then(|message| message.assert_command(MessageCommand::Clse))?;
+ 
+diff --git a/adb_client/src/message_devices/commands/install.rs b/adb_client/src/message_devices/commands/install.rs
+index 0ab57c4..4f67cfa 100644
+--- a/adb_client/src/message_devices/commands/install.rs
++++ b/adb_client/src/message_devices/commands/install.rs
+@@ -29,7 +29,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             std::io::copy(&mut apk_file, &mut writer)?;
+         }
+ 
+-        let final_status = session.get_transport_mut().read_message()?;
++        let final_status = session.read_message()?;
+ 
+         match final_status.into_payload().as_slice() {
+             b"Success\n" => {
+@@ -37,7 +37,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+                     "APK file {} successfully installed",
+                     apk_path.as_ref().display()
+                 );
+-                self.get_transport_mut()
++                session
+                     .read_message()?
+                     .assert_command(MessageCommand::Clse)?;
+                 Ok(())
+diff --git a/adb_client/src/message_devices/commands/list.rs b/adb_client/src/message_devices/commands/list.rs
+index 7d99095..53cbe45 100644
+--- a/adb_client/src/message_devices/commands/list.rs
++++ b/adb_client/src/message_devices/commands/list.rs
+@@ -19,9 +19,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
+         let mut session = self.open_synchronization_session()?;
+ 
+-        let output = self.handle_list(&mut session, path);
++        let output = Self::handle_list(&mut session, path);
+ 
+-        self.end_transaction(&mut session)?;
++        Self::end_transaction(&mut session)?;
+         output
+     }
+ 
+@@ -63,16 +63,14 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             let remote_id = session.remote_id();
+ 
+             // Request the next message
+-            session
+-                .get_transport_mut()
+-                .write_message(ADBTransportMessage::try_new(
+-                    MessageCommand::Okay,
+-                    local_id,
+-                    remote_id,
+-                    &[],
+-                )?)?;
++            session.write_message(ADBTransportMessage::try_new(
++                MessageCommand::Okay,
++                local_id,
++                remote_id,
++                &[],
++            )?)?;
+ 
+-            *payload = session.get_transport_mut().read_message()?.into_payload();
++            *payload = session.read_message()?.into_payload();
+ 
+             let bytes_read_from_new_payload = requested_bytes - bytes_read_from_existing_payload;
+             slice.extend_from_slice(&payload[..bytes_read_from_new_payload]);
+@@ -82,7 +80,6 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     }
+ 
+     fn handle_list<A: AsRef<str>>(
+-        &mut self,
+         session: &mut ADBSession<T>,
+         path: A,
+     ) -> Result<Vec<ADBListItemType>> {
+@@ -110,8 +107,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+ 
+         let mut list_items = Vec::new();
+ 
+-        let transport = self.get_transport_mut();
+-        let mut payload = transport.read_message()?.into_payload();
++        let mut payload = session.read_message()?.into_payload();
+         let mut current_index = 0;
+         loop {
+             // Loop though the response for all the entries
+diff --git a/adb_client/src/message_devices/commands/pull.rs b/adb_client/src/message_devices/commands/pull.rs
+index 056b2a8..636b957 100644
+--- a/adb_client/src/message_devices/commands/pull.rs
++++ b/adb_client/src/message_devices/commands/pull.rs
+@@ -24,7 +24,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             ));
+         }
+ 
+-        self.get_transport_mut().write_message_with_timeout(
++        session.write_message_with_timeout(
+             ADBTransportMessage::try_new(
+                 MessageCommand::Okay,
+                 session.local_id(),
+@@ -49,7 +49,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         )?)?;
+ 
+         session.recv_file(output)?;
+-        self.end_transaction(&mut session)?;
++        Self::end_transaction(&mut session)?;
+         Ok(())
+     }
+ }
+diff --git a/adb_client/src/message_devices/commands/push.rs b/adb_client/src/message_devices/commands/push.rs
+index d149c40..02a1ff6 100644
+--- a/adb_client/src/message_devices/commands/push.rs
++++ b/adb_client/src/message_devices/commands/push.rs
+@@ -29,7 +29,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         )?)?;
+ 
+         session.push_file(stream)?;
+-        self.end_transaction(&mut session)?;
++        Self::end_transaction(&mut session)?;
+ 
+         Ok(())
+     }
+diff --git a/adb_client/src/message_devices/commands/reboot.rs b/adb_client/src/message_devices/commands/reboot.rs
+index 1a75c63..fea5425 100644
+--- a/adb_client/src/message_devices/commands/reboot.rs
++++ b/adb_client/src/message_devices/commands/reboot.rs
+@@ -9,9 +9,9 @@ use crate::{
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn reboot(&mut self, reboot_type: RebootType) -> Result<()> {
+-        self.open_session(&ADBLocalCommand::Reboot(reboot_type))?;
++        let mut session = self.open_session(&ADBLocalCommand::Reboot(reboot_type))?;
+ 
+-        self.get_transport_mut()
++        session
+             .read_message()
+             .and_then(|message| message.assert_command(MessageCommand::Okay))
+     }
+diff --git a/adb_client/src/message_devices/commands/remount.rs b/adb_client/src/message_devices/commands/remount.rs
+index f4d70fa..14a9cce 100644
+--- a/adb_client/src/message_devices/commands/remount.rs
++++ b/adb_client/src/message_devices/commands/remount.rs
+@@ -9,15 +9,15 @@ use crate::{
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn remount(&mut self) -> Result<Vec<RemountInfo>> {
+-        self.open_session(&ADBLocalCommand::Remount)?;
++        let mut session = self.open_session(&ADBLocalCommand::Remount)?;
+ 
+-        let response = self.get_transport_mut().read_message()?;
++        let response = session.read_message()?;
+ 
+         response.assert_command(MessageCommand::Okay)?;
+ 
+         let mut response_str: Vec<String> = Vec::new();
+         loop {
+-            let response = self.get_transport_mut().read_message()?;
++            let response = session.read_message()?;
+ 
+             if response.header().command() != MessageCommand::Write {
+                 break;
+diff --git a/adb_client/src/message_devices/commands/root.rs b/adb_client/src/message_devices/commands/root.rs
+index 424912f..0a08fc1 100644
+--- a/adb_client/src/message_devices/commands/root.rs
++++ b/adb_client/src/message_devices/commands/root.rs
+@@ -9,9 +9,9 @@ use crate::{
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn root(&mut self) -> Result<()> {
+-        self.open_session(&ADBLocalCommand::Root)?;
++        let mut session = self.open_session(&ADBLocalCommand::Root)?;
+ 
+-        self.get_transport_mut()
++        session
+             .read_message()
+             .and_then(|message| message.assert_command(MessageCommand::Okay))
+     }
+diff --git a/adb_client/src/message_devices/commands/shell.rs b/adb_client/src/message_devices/commands/shell.rs
+index 7a34a7c..a559191 100644
+--- a/adb_client/src/message_devices/commands/shell.rs
++++ b/adb_client/src/message_devices/commands/shell.rs
+@@ -70,7 +70,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         let local_id = session.local_id();
+         let remote_id = session.remote_id();
+ 
+-        let mut transport = self.get_transport_mut().clone();
++        let mut transport = session.clone();
+ 
+         // Reading thread, reads response from adbd
+         std::thread::spawn(move || -> Result<()> {
+@@ -93,7 +93,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+             }
+         });
+ 
+-        let transport = self.get_transport_mut().clone();
++        let transport = session.clone();
+         let mut shell_writer = ShellMessageWriter::new(transport, local_id, remote_id);
+ 
+         // Read from given reader (that could be stdin e.g), and write content to device adbd
+diff --git a/adb_client/src/message_devices/commands/stat.rs b/adb_client/src/message_devices/commands/stat.rs
+index 3fb0dfc..305dfe6 100644
+--- a/adb_client/src/message_devices/commands/stat.rs
++++ b/adb_client/src/message_devices/commands/stat.rs
+@@ -9,7 +9,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
+         let mut session = self.open_synchronization_session()?;
+         let adb_stat_response = session.stat_with_explicit_ids(remote_path.as_ref())?;
+-        self.end_transaction(&mut session)?;
++        Self::end_transaction(&mut session)?;
+         Ok(adb_stat_response)
+     }
+ }
+diff --git a/adb_client/src/message_devices/commands/uninstall.rs b/adb_client/src/message_devices/commands/uninstall.rs
+index 00c9eb8..5e00a5b 100644
+--- a/adb_client/src/message_devices/commands/uninstall.rs
++++ b/adb_client/src/message_devices/commands/uninstall.rs
+@@ -12,12 +12,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+         package_name: &dyn AsRef<str>,
+         user: Option<&str>,
+     ) -> Result<()> {
+-        self.open_session(&ADBLocalCommand::Uninstall(
++        let mut session = self.open_session(&ADBLocalCommand::Uninstall(
+             package_name.as_ref().to_string(),
+             user.map(ToString::to_string),
+         ))?;
+ 
+-        let final_status = self.get_transport_mut().read_message()?;
++        let final_status = session.read_message()?;
+ 
+         match final_status.into_payload().as_slice() {
+             b"Success\n" => {
+diff --git a/adb_client/src/message_devices/commands/verity.rs b/adb_client/src/message_devices/commands/verity.rs
+index 0bd5a7f..1c3f89e 100644
+--- a/adb_client/src/message_devices/commands/verity.rs
++++ b/adb_client/src/message_devices/commands/verity.rs
+@@ -9,17 +9,17 @@ use crate::{
+ 
+ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
+     pub(crate) fn enable_verity(&mut self) -> Result<()> {
+-        self.open_session(&ADBLocalCommand::EnableVerity)?;
++        let mut session = self.open_session(&ADBLocalCommand::EnableVerity)?;
+ 
+-        self.get_transport_mut()
++        session
+             .read_message()
+             .and_then(|message| message.assert_command(MessageCommand::Okay))
+     }
+ 
+     pub(crate) fn disable_verity(&mut self) -> Result<()> {
+-        self.open_session(&ADBLocalCommand::DisableVerity)?;
++        let mut session = self.open_session(&ADBLocalCommand::DisableVerity)?;
+ 
+-        self.get_transport_mut()
++        session
+             .read_message()
+             .and_then(|message| message.assert_command(MessageCommand::Okay))
+     }
+diff --git a/adb_client/src/message_devices/mod.rs b/adb_client/src/message_devices/mod.rs
+index eb41e22..bd8a258 100644
+--- a/adb_client/src/message_devices/mod.rs
++++ b/adb_client/src/message_devices/mod.rs
+@@ -9,6 +9,7 @@ pub mod tcp;
+ mod adb_message_device;
+ mod adb_message_device_commands;
+ mod adb_message_transport;
++mod adb_multiplexer;
+ mod adb_session;
+ mod adb_transport_message;
+ mod commands;
+diff --git a/adb_client/src/message_devices/tcp/README.md b/adb_client/src/message_devices/tcp/README.md
+index cc24b1f..f868c32 100644
+--- a/adb_client/src/message_devices/tcp/README.md
++++ b/adb_client/src/message_devices/tcp/README.md
+@@ -1,5 +1,7 @@
+ # Examples
+ 
++> TCP-connected devices related examples
++
+ ## Get a shell from device
+ 
+ ```rust no_run
+diff --git a/adb_client/src/message_devices/usb/README.md b/adb_client/src/message_devices/usb/README.md
+index a7d857a..7b71727 100644
+--- a/adb_client/src/message_devices/usb/README.md
++++ b/adb_client/src/message_devices/usb/README.md
+@@ -1,5 +1,7 @@
+ # Examples
+ 
++> USB-connected devices related examples
++
+ ## Launch a command on device
+ 
+ ```rust no_run
+diff --git a/pyadb_client/Cargo.toml b/pyadb_client/Cargo.toml
+index 845b24a..be490b6 100644
+--- a/pyadb_client/Cargo.toml
++++ b/pyadb_client/Cargo.toml
+@@ -24,7 +24,7 @@ name = "stub_gen"
+ 
+ [dependencies]
+ adb_client = { path = "../adb_client", features = ["usb"] }
+-anyhow = { version = "1.0.100" }
++anyhow = { version = "1.0.102" }
+ pyo3 = { version = "0.27.2", features = ["abi3-py310", "anyhow"] }
+ pyo3-stub-gen = { version = "0.17.2" }
+ pyo3-stub-gen-derive = { version = "0.17.2" }

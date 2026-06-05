@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/prd.md", "reason": "验收标准 + DoD + Out of Scope + 测试策略(sans-io 无硬件单测)"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/01-asks-verification.md", "reason": "逐 Ask 验收点 + try_send 静默丢包须验证已修"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/07-aosp-delayed-ack-wire-semantics.md", "reason": "delayed_ack 正确性核对: payload int32 delta/32MiB窗口/overflow不关流"}
+{"file": ".trellis/tasks/06-05-persistent-connection-server-capabilities-true-async-ack-device-originated-open-routing-raw-message-channel-sync-multiplexing/research/08-implementation-file-map.md", "reason": "跨PR共享编辑点 + 重复读写逻辑两处都改到了吗"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门: clippy pedantic -D warnings + features usb 复验 + inline test + MSRV"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "无新 lock().unwrap()/新变体有 adb_cli 分类arm/USB超时结构化匹配"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "窗口/帧逻辑是否抽共享而非两处重复"}
