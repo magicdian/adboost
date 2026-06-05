@@ -106,3 +106,37 @@ Migrated adb_client USB layer from rusb (libusb/vendored-C) to pure-Rust nusb. T
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: persistent.rs server capabilities: 6 Asks (delayed_ack, device-OPEN, raw channel, SYNC mux, shell-v2, honest banner)
+
+**Date**: 2026-06-05
+**Task**: persistent.rs server capabilities: 6 Asks (delayed_ack, device-OPEN, raw channel, SYNC mux, shell-v2, honest banner)
+**Branch**: `feat/persistent-server-capabilities`
+
+### Summary
+
+Two-round read-only research (16 agents) verified all 6 capability Asks against source + AOSP wire protocol, mapped fork-vs-upstream topology (persistent.rs is XPENG-only = zero merge cost) and async strategy (sync core now, sans-io async later). Implemented all 6 Asks in persistent.rs via 5 trellis-implement/trellis-check rounds: honest DeviceFeatureSet banner, device-OPEN routing + raw subscribe_raw/send_raw (one reader_loop redesign), delayed_ack windowed FlowControl (32MiB, OKAY-payload i32-LE delta, opener starts at 0), SYNC v1 open_sync_session, shell-v2 exit code. lock().unwrap() 9->0, 55+4 tests, clippy pedantic clean. Spec updated with delayed_ack contract + sans-io pattern + single-reader constraint.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8e91437` | (see git log) |
+| `c55edad` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
