@@ -161,6 +161,12 @@ pub enum RustADBError {
     /// An error occurred while parsing a stat extended response
     #[error("stat response error: {0}")]
     StatResponseError(String),
+    /// A spawned async task panicked or was aborted.
+    #[error(transparent)]
+    TaskJoinError(#[from] tokio::task::JoinError),
+    /// An async operation was cancelled (e.g. its future was dropped mid-flight).
+    #[error("operation cancelled: {0}")]
+    TaskCancelled(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for RustADBError {

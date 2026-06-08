@@ -1,5 +1,9 @@
 [workspace]
-members = ["adb_cli", "adb_client", "examples/mdns", "pyadb_client"]
+# Async rewrite (phase 0): temporarily narrowed to `adb_client` only.
+# `adb_cli`, `pyadb_client`, and `examples/mdns` depend on the old sync API and
+# will not compile until they are migrated in a later, separate task. They stay
+# on disk but are excluded from this round's build/CI.
+members = ["adb_client"]
 resolver = "2"
 
 [workspace.package]

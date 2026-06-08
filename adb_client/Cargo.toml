@@ -43,6 +43,18 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "s
 rustls-pki-types = { version = "1.14.1" }
 sha1 = { version = "0.10.6", features = ["oid"] }
 thiserror = { version = "2.0.18" }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+tokio-util = { version = "0.7.18", features = ["compat"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+trait-variant = { version = "0.1.2" }
 
 #########
 # `mdns` feature-specific dependencies
@@ -59,6 +71,7 @@ num_enum = { version = "0.7.6" }
 [dev-dependencies]
 anyhow = { version = "1.0.102" }
 criterion = { version = "0.8.2" } # Used for benchmarks
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 
 [[bench]]
 harness = false
