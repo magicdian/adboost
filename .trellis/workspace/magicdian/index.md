@@ -1,4 +1,4 @@
-# Workspace Index - jingd2
+# Workspace Index - magicdian
 
 > Journal tracking for AI development sessions.
 
