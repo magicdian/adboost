@@ -140,3 +140,36 @@ Two-round read-only research (16 agents) verified all 6 capability Asks against 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Relicense fork to Apache-2.0 with upstream MIT attribution
+
+**Date**: 2026-06-08
+**Task**: Relicense fork to Apache-2.0 with upstream MIT attribution
+**Branch**: `main`
+
+### Summary
+
+Courteous relicensing of the adb_client v3.2.2 fork. Replaced LICENSE with Apache-2.0 full text; added NOTICE embedding the upstream MIT text verbatim (c) 2023-2024 Corentin LIAUD plus acknowledgements and nusb-migration note. Set workspace SPDX to 'Apache-2.0 AND MIT', added jdjingdian as author, pointed repository/homepage to the fork, aligned adb_cli RPM metadata license. Rewrote README as a grateful placeholder and fixed broken LICENSE-MIT badge links in subcrate READMEs. Verified MIT 2 compliance and that cargo metadata --no-deps accepts the SPDX expression. Deliberately did NOT rename crates to adboost (deferred to the planned refactor task).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `64d7186` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
