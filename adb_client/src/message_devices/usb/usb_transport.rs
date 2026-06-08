@@ -1,13 +1,11 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use nusb::{
-    DeviceInfo, Interface, MaybeFuture,
+    DeviceInfo, Interface,
     descriptors::TransferType,
-    transfer::{Buffer, Bulk, Direction, In, Out, TransferError},
+    transfer::{Buffer, Bulk, Completion, Direction, EndpointDirection, In, Out, TransferError},
 };
+use tokio::sync::Mutex;
 
 use crate::{
     Result, RustADBError,
@@ -34,17 +32,23 @@ struct EndpointInfo {
 /// Internal connection state shared between clones of a [`USBTransport`].
 ///
 /// `nusb` endpoints are `&mut self`-exclusive and not `Clone`, so the
-/// endpoints live behind shared `Mutex`es. Cloning a `USBTransport` shares the
-/// *same* underlying handle — this mirrors the previous `rusb` behavior where
-/// clones shared an `Arc<DeviceHandle>`, which the reader-thread / writer
-/// concurrency model in `ADBMessageDevice` and the persistent connection rely
-/// upon.
+/// endpoints live behind shared async `Mutex`es. Cloning a `USBTransport`
+/// shares the *same* underlying handle — this mirrors the previous `rusb`
+/// behavior where clones shared an `Arc<DeviceHandle>`, which the
+/// reader-task / writer concurrency model in `ADBMessageDevice` and the
+/// persistent connection rely upon.
 ///
 /// The IN (read) and OUT (write) endpoints use **separate** locks so a reader
-/// thread blocked in a long `transfer_blocking` on the IN endpoint never
-/// blocks a concurrent writer on the OUT endpoint. This preserves the
-/// independent reader/writer concurrency the previous `rusb` implementation
-/// had with two distinct endpoints sharing one handle.
+/// task awaiting a long IN transfer never blocks a concurrent writer on the OUT
+/// endpoint. This preserves the independent reader/writer concurrency the
+/// previous implementation had with two distinct endpoints sharing one handle.
+///
+/// These are [`tokio::sync::Mutex`]es (not `std::sync::Mutex`): a transfer holds
+/// the endpoint exclusively across its `submit` / `next_complete().await`, so
+/// the guard must be `Send` and live across `.await`. The async mutex is the
+/// exclusivity mechanism for the endpoint queue — only one transfer is ever
+/// pending per endpoint, which the queue model (`pending() == 0` between calls)
+/// requires.
 #[derive(Debug, Default)]
 struct Connection {
     interface: Option<Interface>,
@@ -69,8 +73,8 @@ pub struct USBTransport {
 impl USBTransport {
     /// Instantiate a new [`USBTransport`].
     /// Only the first device with given `vendor_id` and `product_id` is returned.
-    pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
-        for device_info in nusb::list_devices().wait()? {
+    pub async fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
+        for device_info in nusb::list_devices().await? {
             if device_info.vendor_id() == vendor_id && device_info.product_id() == product_id {
                 return Ok(Self::new_from_device(device_info));
             }
@@ -101,24 +105,44 @@ impl USBTransport {
         self.device_info.product_id()
     }
 
-    fn read_info(&self) -> Result<EndpointInfo> {
-        self.connection
-            .lock()?
-            .read_info
-            .ok_or(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no read endpoint setup",
-            )))
-    }
-
-    fn write_info(&self) -> Result<EndpointInfo> {
-        self.write_connection
-            .lock()?
-            .write_info
+    async fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
+        let mut connection = self.write_connection.lock().await;
+        let max_packet_size =
+            connection
+                .write_info
+                .ok_or(RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no write endpoint setup",
+                )))?
+                .max_packet_size;
+        let endpoint = connection
+            .write_endpoint
+            .as_mut()
             .ok_or(RustADBError::IOError(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "no write endpoint setup",
-            )))
+            )))?;
+
+        let mut offset = 0;
+        let data_len = data.len();
+        while offset < data_len {
+            let end = (offset + max_packet_size).min(data_len);
+            let chunk = Buffer::from(&data[offset..end]);
+            let completion = transfer_with_timeout(endpoint, chunk, timeout).await;
+            map_transfer_status(completion.status)?;
+            let write_amount = completion.actual_len;
+            offset += write_amount;
+
+            log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
+        }
+
+        if offset % max_packet_size == 0 {
+            log::trace!("must send final zero-length packet");
+            let completion = transfer_with_timeout(endpoint, Buffer::from(&[][..]), timeout).await;
+            map_transfer_status(completion.status)?;
+        }
+
+        Ok(())
     }
 
     /// Discover the ADB bulk IN / OUT endpoints exposed by the device.
@@ -173,47 +197,55 @@ impl USBTransport {
 
         Err(RustADBError::USBNoDescriptorFound)
     }
+}
 
-    fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
-        let max_packet_size = self.write_info()?.max_packet_size;
-        let mut connection = self.write_connection.lock()?;
-        let endpoint = connection
-            .write_endpoint
-            .as_mut()
-            .ok_or(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no write endpoint setup",
-            )))?;
+/// Submit a single transfer on a bulk endpoint and await its completion under a
+/// timeout, using `nusb`'s queue model.
+///
+/// `nusb` 0.2 endpoints are a transfer *queue*: `submit(buf)` enqueues a
+/// transfer and `next_complete().await` (cancel-safe) yields the next
+/// completion. There is no built-in per-transfer timeout, so we wrap
+/// `next_complete()` in [`tokio::time::timeout`].
+///
+/// On timeout we replicate the synchronous `transfer_blocking` cleanup exactly:
+/// request cancellation of the still-pending transfer (`cancel_all`) and then
+/// drain it — a cancelled transfer is still returned from `next_complete`, so
+/// the endpoint queue returns to `pending() == 0` and is never left with a
+/// dangling transfer. We then force the status to `TransferError::Cancelled`,
+/// which [`map_transfer_status`] turns into [`RustADBError::UsbTimeout`],
+/// preserving the timeout-vs-disconnect distinction the persistent reader loop
+/// relies on (even in the rare race where the transfer completed during
+/// cancellation, a timeout must never surface as a successful transfer).
+async fn transfer_with_timeout<Dir>(
+    endpoint: &mut nusb::Endpoint<Bulk, Dir>,
+    buf: Buffer,
+    timeout: Duration,
+) -> Completion
+where
+    Dir: EndpointDirection,
+{
+    endpoint.submit(buf);
 
-        let mut offset = 0;
-        let data_len = data.len();
-        while offset < data_len {
-            let end = (offset + max_packet_size).min(data_len);
-            let chunk = Buffer::from(&data[offset..end]);
-            let completion = endpoint.transfer_blocking(chunk, timeout);
-            map_transfer_status(completion.status)?;
-            let write_amount = completion.actual_len;
-            offset += write_amount;
-
-            log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
+    match tokio::time::timeout(timeout, endpoint.next_complete()).await {
+        Ok(completion) => completion,
+        Err(_elapsed) => {
+            endpoint.cancel_all();
+            let completion = endpoint.next_complete().await;
+            Completion {
+                status: Err(TransferError::Cancelled),
+                ..completion
+            }
         }
-
-        if offset % max_packet_size == 0 {
-            log::trace!("must send final zero-length packet");
-            let completion = endpoint.transfer_blocking(Buffer::from(&[][..]), timeout);
-            map_transfer_status(completion.status)?;
-        }
-
-        Ok(())
     }
 }
 
 /// Map a `nusb` transfer status into the crate error type.
 ///
-/// `TransferError::Cancelled` is what `transfer_blocking` returns on timeout;
-/// it is translated to the dedicated [`RustADBError::UsbTimeout`] so callers
-/// (notably the persistent reader loop) can distinguish a normal timeout from
-/// a genuine disconnect via a structured match instead of string matching.
+/// `TransferError::Cancelled` is what a timed-out transfer surfaces (see
+/// [`transfer_with_timeout`]); it is translated to the dedicated
+/// [`RustADBError::UsbTimeout`] so callers (notably the persistent reader loop)
+/// can distinguish a normal timeout from a genuine disconnect via a structured
+/// match instead of string matching.
 fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result<()> {
     match status {
         Ok(()) => Ok(()),
@@ -223,13 +255,13 @@ fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result
 }
 
 impl ADBTransport for USBTransport {
-    fn connect(&mut self) -> crate::Result<()> {
-        let device = self.device_info.open().wait()?;
+    async fn connect(&mut self) -> crate::Result<()> {
+        let device = self.device_info.open().await?;
 
         let (read_endpoint, write_endpoint) = Self::find_endpoints(&device)?;
 
         // Both bulk endpoints belong to the same ADB interface; claim it once.
-        let interface = match device.claim_interface(read_endpoint.iface).wait() {
+        let interface = match device.claim_interface(read_endpoint.iface).await {
             Ok(interface) => interface,
             // busy state likely indicates an ADB server is running and has taken the lock over the device
             Err(e) if e.kind() == nusb::ErrorKind::Busy => return Err(RustADBError::DeviceBusy),
@@ -243,12 +275,12 @@ impl ADBTransport for USBTransport {
         log::debug!("got write endpoint: {write_endpoint:?}");
 
         {
-            let mut write_connection = self.write_connection.lock()?;
+            let mut write_connection = self.write_connection.lock().await;
             write_connection.write_info = Some(write_endpoint);
             write_connection.write_endpoint = Some(write_ep);
         }
 
-        let mut connection = self.connection.lock()?;
+        let mut connection = self.connection.lock().await;
         connection.read_info = Some(read_endpoint);
         connection.read_endpoint = Some(read_ep);
         connection.interface = Some(interface);
@@ -256,9 +288,9 @@ impl ADBTransport for USBTransport {
         Ok(())
     }
 
-    fn disconnect(&mut self) -> crate::Result<()> {
+    async fn disconnect(&mut self) -> crate::Result<()> {
         {
-            let connection = self.connection.lock()?;
+            let connection = self.connection.lock().await;
             if connection.interface.is_none() {
                 // device has not been initialized, nothing to do
                 return Ok(());
@@ -266,17 +298,17 @@ impl ADBTransport for USBTransport {
         }
 
         let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
-        if let Err(e) = self.write_message(message) {
+        if let Err(e) = self.write_message(message).await {
             log::error!("error while sending CLSE message: {e}");
         }
 
         // Dropping the endpoints and the interface releases the claim. This is
         // the `nusb` equivalent of the previous explicit `release_interface`.
         {
-            let mut write_connection = self.write_connection.lock()?;
+            let mut write_connection = self.write_connection.lock().await;
             write_connection.write_endpoint = None;
         }
-        let mut connection = self.connection.lock()?;
+        let mut connection = self.connection.lock().await;
         connection.read_endpoint = None;
         connection.interface = None;
         log::debug!("succesfully released interface");
@@ -286,28 +318,34 @@ impl ADBTransport for USBTransport {
 }
 
 impl ADBMessageTransport for USBTransport {
-    fn write_message_with_timeout(
+    async fn write_message_with_timeout(
         &mut self,
         message: ADBTransportMessage,
         timeout: Duration,
     ) -> Result<()> {
         let message_bytes = message.header().as_bytes();
-        self.write_bulk_data(&message_bytes, timeout)?;
+        self.write_bulk_data(&message_bytes, timeout).await?;
 
         log::trace!("successfully write header: {} bytes", message_bytes.len());
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            self.write_bulk_data(&payload, timeout)?;
+            self.write_bulk_data(&payload, timeout).await?;
             log::trace!("successfully write payload: {} bytes", payload.len());
         }
 
         Ok(())
     }
 
-    fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
-        let max_packet_size = self.read_info()?.max_packet_size;
-        let mut connection = self.connection.lock()?;
+    async fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+        let mut connection = self.connection.lock().await;
+        let max_packet_size = connection
+            .read_info
+            .ok_or(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no read endpoint setup",
+            )))?
+            .max_packet_size;
         let endpoint = connection
             .read_endpoint
             .as_mut()
@@ -317,14 +355,14 @@ impl ADBMessageTransport for USBTransport {
             )))?;
 
         let mut data = [0u8; 24];
-        read_exact(endpoint, &mut data, max_packet_size, timeout)?;
+        read_exact(endpoint, &mut data, max_packet_size, timeout).await?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
         log::trace!("received header {header:?}");
 
         if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
-            read_exact(endpoint, &mut msg_data, max_packet_size, timeout)?;
+            read_exact(endpoint, &mut msg_data, max_packet_size, timeout).await?;
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
@@ -350,7 +388,7 @@ impl ADBMessageTransport for USBTransport {
 /// We therefore request `max_packet_size`-aligned buffers and accumulate until
 /// `out` is filled, copying out only what was actually received per transfer —
 /// preserving the previous fill-loop semantics over `read_bulk`.
-fn read_exact(
+async fn read_exact(
     endpoint: &mut nusb::Endpoint<Bulk, In>,
     out: &mut [u8],
     max_packet_size: usize,
@@ -361,7 +399,7 @@ fn read_exact(
         let remaining = out.len() - offset;
         // Align the requested length up to a nonzero multiple of the max packet size.
         let request_len = aligned_request_len(remaining, max_packet_size);
-        let completion = endpoint.transfer_blocking(Buffer::new(request_len), timeout);
+        let completion = transfer_with_timeout(endpoint, Buffer::new(request_len), timeout).await;
         map_transfer_status(completion.status)?;
 
         let received = &completion.buffer[..completion.actual_len];
@@ -397,8 +435,8 @@ mod tests {
 
     #[test]
     fn cancelled_status_maps_to_usb_timeout() {
-        // The reader loop relies on this: a `transfer_blocking` timeout surfaces
-        // as `TransferError::Cancelled` and MUST become `RustADBError::UsbTimeout`
+        // The reader loop relies on this: a timed-out transfer surfaces as
+        // `TransferError::Cancelled` and MUST become `RustADBError::UsbTimeout`
         // so a normal poll timeout is not misclassified as a disconnect.
         let mapped = map_transfer_status(Err(TransferError::Cancelled));
         assert!(

@@ -1,7 +1,11 @@
 use std::{
-    fs::File,
-    io::{BufRead, BufReader, Error, ErrorKind, Read, Write},
-    net::{SocketAddrV4, TcpStream},
+    io::{Error, ErrorKind},
+    net::SocketAddrV4,
+};
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
 };
 
 use crate::{
@@ -9,14 +13,12 @@ use crate::{
 };
 
 /// Return authentication token stored in `$HOME/.emulator_console_auth_token`
-fn get_authentication_token() -> Result<String> {
+async fn get_authentication_token() -> Result<String> {
     let Some(home) = std::env::home_dir() else {
         return Err(RustADBError::NoHomeDirectory);
     };
 
-    let mut f = File::open(home.join(".emulator_console_auth_token"))?;
-    let mut token = String::new();
-    f.read_to_string(&mut token)?;
+    let token = tokio::fs::read_to_string(home.join(".emulator_console_auth_token")).await?;
 
     Ok(token)
 }
@@ -38,9 +40,9 @@ impl TCPEmulatorTransport {
         }
     }
 
-    pub(crate) fn get_raw_connection(&self) -> Result<&TcpStream> {
+    pub(crate) fn get_raw_connection(&mut self) -> Result<&mut TcpStream> {
         self.tcp_stream
-            .as_ref()
+            .as_mut()
             .ok_or(RustADBError::IOError(Error::new(
                 ErrorKind::NotConnected,
                 "not connected",
@@ -48,30 +50,34 @@ impl TCPEmulatorTransport {
     }
 
     /// Send an authenticate request to this emulator
-    pub fn authenticate(&self) -> Result<()> {
-        let token = get_authentication_token()?;
-        let _ = self.send_command(&ADBEmulatorCommand::Authenticate(token))?;
+    pub async fn authenticate(&mut self) -> Result<()> {
+        let token = get_authentication_token().await?;
+        let _ = self
+            .send_command(&ADBEmulatorCommand::Authenticate(token))
+            .await?;
         Ok(())
     }
 
     /// Send an [`ADBEmulatorCommand`] to this emulator
-    pub(crate) fn send_command(&self, command: &ADBEmulatorCommand) -> Result<String> {
-        let mut connection = self.get_raw_connection()?;
-
-        // Send command
-        connection.write_all(command.to_string().as_bytes())?;
+    pub(crate) async fn send_command(&mut self, command: &ADBEmulatorCommand) -> Result<String> {
+        let command_bytes = command.to_string();
+        {
+            let connection = self.get_raw_connection()?;
+            // Send command
+            connection.write_all(command_bytes.as_bytes()).await?;
+        }
 
         // Read response lines while checking for "OK" or "KO: " errors
-        self.read_response()
+        self.read_response().await
     }
 
-    fn read_response(&self) -> Result<String> {
+    async fn read_response(&mut self) -> Result<String> {
         let mut reader = BufReader::new(self.get_raw_connection()?);
         let mut response = String::new();
         let mut line = String::new();
         loop {
             line.clear();
-            reader.read_line(&mut line)?;
+            reader.read_line(&mut line).await?;
             if line.starts_with("KO:") {
                 return Err(RustADBError::ADBRequestFailed(line));
             }
@@ -86,36 +92,38 @@ impl TCPEmulatorTransport {
 }
 
 impl ADBTransport for TCPEmulatorTransport {
-    fn disconnect(&mut self) -> Result<()> {
+    async fn disconnect(&mut self) -> Result<()> {
         if let Some(conn) = &mut self.tcp_stream {
-            conn.shutdown(std::net::Shutdown::Both)?;
-            log::trace!("Disconnected from {}", conn.peer_addr()?);
+            let peer = conn.peer_addr()?;
+            conn.shutdown().await?;
+            log::trace!("Disconnected from {peer}");
         }
 
         Ok(())
     }
 
     /// Connect to current emulator and authenticate
-    fn connect(&mut self) -> Result<()> {
+    async fn connect(&mut self) -> Result<()> {
         if self.tcp_stream.is_none() {
-            let stream = TcpStream::connect(self.socket_addr)?;
+            let stream = TcpStream::connect(self.socket_addr).await?;
 
             log::trace!("Successfully connected to {}", self.socket_addr);
 
-            self.tcp_stream = Some(stream.try_clone()?);
-
-            let mut reader = BufReader::new(stream);
+            self.tcp_stream = Some(stream);
 
             // Android Console: Authentication required
             // Android Console: type 'auth <auth_token>' to authenticate
             // Android Console: you can find your <auth_token> in
             // '/home/xxx/.emulator_console_auth_token'
-            for _ in 0..=4 {
-                let mut line = String::new();
-                reader.read_line(&mut line)?;
+            {
+                let mut reader = BufReader::new(self.get_raw_connection()?);
+                for _ in 0..=4 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await?;
+                }
             }
 
-            self.authenticate()?;
+            self.authenticate().await?;
 
             log::trace!("Authentication successful");
         }

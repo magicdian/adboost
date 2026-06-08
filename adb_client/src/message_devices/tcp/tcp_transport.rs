@@ -1,9 +1,15 @@
 use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256};
 use rustls::{
-    ClientConfig, ClientConnection, KeyLogFile, SignatureScheme, StreamOwned,
+    ClientConfig, KeyLogFile, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject},
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::Mutex,
+};
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::{
     Result, RustADBError,
@@ -16,60 +22,70 @@ use crate::{
 };
 use std::{
     fs::read_to_string,
-    io::{Read, Write},
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
+/// Either a plain TCP stream or a TLS stream layered on top of one.
+///
+/// Both arms implement [`tokio::io::AsyncRead`] / [`tokio::io::AsyncWrite`], so
+/// the read/write helpers below are written once over `&mut CurrentConnection`.
+/// Unlike the previous synchronous `rustls::StreamOwned`, the TLS upgrade does
+/// not clone / swap the underlying socket: the async handshake consumes the
+/// `TcpStream` and produces a `TlsStream<TcpStream>` in place (see
+/// [`TcpTransport::upgrade_connection`]).
 #[derive(Debug)]
 enum CurrentConnection {
     Tcp(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl CurrentConnection {
-    fn set_read_timeout(&self, read_timeout: Duration) -> Result<()> {
-        match self {
-            Self::Tcp(tcp_stream) => Ok(tcp_stream.set_read_timeout(Some(read_timeout))?),
-            Self::Tls(stream_owned) => {
-                Ok(stream_owned.sock.set_read_timeout(Some(read_timeout))?)
+    /// Read exactly `buf.len()` bytes, failing with an `io::ErrorKind::TimedOut`
+    /// error if `timeout` elapses first.
+    async fn read_exact_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> Result<()> {
+        let fut = async {
+            match self {
+                Self::Tcp(s) => s.read_exact(buf).await,
+                Self::Tls(s) => s.read_exact(buf).await,
             }
-        }
-    }
-
-    fn set_write_timeout(&self, write_timeout: Duration) -> Result<()> {
-        match self {
-            Self::Tcp(tcp_stream) => Ok(tcp_stream.set_write_timeout(Some(write_timeout))?),
-            Self::Tls(stream_owned) => {
-                Ok(stream_owned.sock.set_write_timeout(Some(write_timeout))?)
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(res) => {
+                res?;
+                Ok(())
             }
-        }
-    }
-}
-
-impl Read for CurrentConnection {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(tcp_stream) => tcp_stream.read(buf),
-            Self::Tls(tls_conn) => tls_conn.read(buf),
-        }
-    }
-}
-
-impl Write for CurrentConnection {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Tcp(tcp_stream) => tcp_stream.write(buf),
-            Self::Tls(tls_conn) => tls_conn.write(buf),
+            Err(_elapsed) => Err(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP read timed out",
+            ))),
         }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Tcp(tcp_stream) => tcp_stream.flush(),
-            Self::Tls(tls_conn) => tls_conn.flush(),
+    async fn write_all_timeout(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
+        let fut = async {
+            match self {
+                Self::Tcp(s) => {
+                    s.write_all(data).await?;
+                    s.flush().await
+                }
+                Self::Tls(s) => {
+                    s.write_all(data).await?;
+                    s.flush().await
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(res) => {
+                res?;
+                Ok(())
+            }
+            Err(_elapsed) => Err(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP write timed out",
+            ))),
         }
     }
 }
@@ -78,7 +94,10 @@ impl Write for CurrentConnection {
 #[derive(Clone, Debug)]
 pub struct TcpTransport {
     address: SocketAddr,
-    current_connection: Option<Arc<Mutex<CurrentConnection>>>,
+    /// The live connection. Wrapped in `Option<_>` *inside* the async mutex so
+    /// the plain `TcpStream` can be moved out for the TLS handshake and the
+    /// upgraded `TlsStream` put back, without needing to clone the socket.
+    current_connection: Option<Arc<Mutex<Option<CurrentConnection>>>>,
     private_key_path: PathBuf,
 }
 
@@ -98,7 +117,7 @@ impl TcpTransport {
         }
     }
 
-    fn get_current_connection(&self) -> Result<Arc<Mutex<CurrentConnection>>> {
+    fn get_current_connection(&self) -> Result<Arc<Mutex<Option<CurrentConnection>>>> {
         self.current_connection
             .as_ref()
             .ok_or(RustADBError::IOError(std::io::Error::new(
@@ -109,25 +128,34 @@ impl TcpTransport {
     }
 }
 
+/// Pull the live connection out of the guard, mapping the "no connection" case
+/// to an `io::ErrorKind::NotConnected` error.
+fn connection_mut(conn: &mut Option<CurrentConnection>) -> Result<&mut CurrentConnection> {
+    conn.as_mut().ok_or(RustADBError::IOError(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "not connected",
+    )))
+}
+
 impl ADBTransport for TcpTransport {
-    fn connect(&mut self) -> Result<()> {
-        let stream = TcpStream::connect(self.address)?;
-        self.current_connection = Some(Arc::new(Mutex::new(CurrentConnection::Tcp(stream))));
+    async fn connect(&mut self) -> Result<()> {
+        let stream = TcpStream::connect(self.address).await?;
+        self.current_connection = Some(Arc::new(Mutex::new(Some(CurrentConnection::Tcp(stream)))));
         Ok(())
     }
 
-    fn disconnect(&mut self) -> Result<()> {
+    async fn disconnect(&mut self) -> Result<()> {
         log::debug!("disconnecting...");
         if let Some(current_connection) = &self.current_connection {
-            let mut lock = current_connection.lock()?;
-            match &mut *lock {
-                CurrentConnection::Tcp(tcp_stream) => {
-                    let _ = tcp_stream.shutdown(Shutdown::Both);
+            let mut lock = current_connection.lock().await;
+            match lock.as_mut() {
+                Some(CurrentConnection::Tcp(tcp_stream)) => {
+                    let _ = tcp_stream.shutdown().await;
                 }
-                CurrentConnection::Tls(tls_conn) => {
-                    tls_conn.conn.send_close_notify();
-                    let _ = tls_conn.sock.shutdown(Shutdown::Both);
+                Some(CurrentConnection::Tls(tls_conn)) => {
+                    let _ = tls_conn.shutdown().await;
                 }
+                None => {}
             }
         }
 
@@ -136,37 +164,28 @@ impl ADBTransport for TcpTransport {
 }
 
 impl ADBMessageTransport for TcpTransport {
-    fn read_message_with_timeout(
+    async fn read_message_with_timeout(
         &mut self,
-        read_timeout: std::time::Duration,
+        read_timeout: Duration,
     ) -> Result<ADBTransportMessage> {
         let raw_connection_lock = self.get_current_connection()?;
-        let mut raw_connection = raw_connection_lock.lock()?;
-
-        raw_connection.set_read_timeout(read_timeout)?;
+        let mut guard = raw_connection_lock.lock().await;
+        let raw_connection = connection_mut(&mut guard)?;
 
         let mut data = [0; 24];
-        let mut total_read = 0;
-        loop {
-            total_read += raw_connection.read(&mut data[total_read..])?;
-            if total_read == data.len() {
-                break;
-            }
-        }
+        raw_connection
+            .read_exact_timeout(&mut data, read_timeout)
+            .await?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
 
         if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
-            let mut total_read = 0;
-            loop {
-                total_read += raw_connection.read(&mut msg_data[total_read..])?;
-                if total_read == msg_data.capacity() {
-                    break;
-                }
-            }
-            // raw_connection is not used anymore, let's drop it
-            drop(raw_connection);
+            raw_connection
+                .read_exact_timeout(&mut msg_data, read_timeout)
+                .await?;
+            // raw_connection is not used anymore, let's drop the guard
+            drop(guard);
 
             let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
 
@@ -184,42 +203,31 @@ impl ADBMessageTransport for TcpTransport {
         Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
     }
 
-    fn write_message_with_timeout(
+    async fn write_message_with_timeout(
         &mut self,
         message: ADBTransportMessage,
         write_timeout: Duration,
     ) -> Result<()> {
         let message_bytes = message.header().as_bytes();
         let raw_connection_lock = self.get_current_connection()?;
-        let mut raw_connection = raw_connection_lock.lock()?;
-        raw_connection.set_write_timeout(write_timeout)?;
+        let mut guard = raw_connection_lock.lock().await;
+        let raw_connection = connection_mut(&mut guard)?;
 
-        let mut total_written = 0;
-        loop {
-            total_written += raw_connection.write(&message_bytes[total_written..])?;
-            if total_written == message_bytes.len() {
-                raw_connection.flush()?;
-                break;
-            }
-        }
+        raw_connection
+            .write_all_timeout(&message_bytes, write_timeout)
+            .await?;
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            let mut total_written = 0;
-            loop {
-                total_written += raw_connection.write(&payload[total_written..])?;
-                if total_written == payload.len() {
-                    raw_connection.flush()?;
-                    drop(raw_connection);
-                    break;
-                }
-            }
+            raw_connection
+                .write_all_timeout(&payload, write_timeout)
+                .await?;
         }
 
         Ok(())
     }
 
-    fn upgrade_connection(&mut self) -> Result<()> {
+    async fn upgrade_connection(&mut self) -> Result<()> {
         let Some(current_connection) = self.current_connection.clone() else {
             return Err(RustADBError::UpgradeError(
                 "cannot upgrade a non-existing connection...".into(),
@@ -227,44 +235,48 @@ impl ADBMessageTransport for TcpTransport {
         };
 
         {
-            let mut current_conn_locked = current_connection.lock()?;
-            match &*current_conn_locked {
-                CurrentConnection::Tcp(tcp_stream) => {
-                    // TODO: Check if we cannot be more precise
-                    let pk_content = read_to_string(&self.private_key_path)?;
+            let mut guard = current_connection.lock().await;
 
-                    let key_pair =
-                        KeyPair::from_pkcs8_pem_and_sign_algo(&pk_content, &PKCS_RSA_SHA256)?;
-
-                    let certificate = certificate_from_pk(&key_pair)?;
-                    let private_key = PrivatePkcs8KeyDer::from_pem_file(&self.private_key_path)?;
-
-                    let mut client_config = ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
-                        .with_client_auth_cert(certificate, private_key.into())?;
-
-                    client_config.key_log = Arc::new(KeyLogFile::new());
-
-                    let rc_config = Arc::new(client_config);
-                    let server_name = self.address.ip().into();
-                    let conn = ClientConnection::new(rc_config, server_name)?;
-                    let owned = tcp_stream.try_clone()?;
-                    let client = StreamOwned::new(conn, owned);
-
-                    // Update current connection state to now use TLS protocol
-                    *current_conn_locked = CurrentConnection::Tls(Box::new(client));
-                    drop(current_conn_locked);
-                }
-                CurrentConnection::Tls(_) => {
+            // Take ownership of the live connection so we can move the
+            // `TcpStream` into the TLS handshake; we put the upgraded stream
+            // back before unlocking.
+            let tcp_stream = match guard.take() {
+                Some(CurrentConnection::Tcp(tcp_stream)) => tcp_stream,
+                Some(other @ CurrentConnection::Tls(_)) => {
+                    // Put it back; cannot upgrade an already-TLS connection.
+                    *guard = Some(other);
                     return Err(RustADBError::UpgradeError(
                         "cannot upgrade a TLS connection...".into(),
                     ));
                 }
-            }
+                None => {
+                    return Err(RustADBError::UpgradeError(
+                        "cannot upgrade a non-existing connection...".into(),
+                    ));
+                }
+            };
+
+            // TODO: Check if we cannot be more precise
+            let pk_content = read_to_string(&self.private_key_path)?;
+            let key_pair = KeyPair::from_pkcs8_pem_and_sign_algo(&pk_content, &PKCS_RSA_SHA256)?;
+            let certificate = certificate_from_pk(&key_pair)?;
+            let private_key = PrivatePkcs8KeyDer::from_pem_file(&self.private_key_path)?;
+
+            let mut client_config = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
+                .with_client_auth_cert(certificate, private_key.into())?;
+            client_config.key_log = Arc::new(KeyLogFile::new());
+
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = self.address.ip().into();
+
+            // Async TLS handshake; consumes the TcpStream, no ownership swap.
+            let tls_stream = connector.connect(server_name, tcp_stream).await?;
+            *guard = Some(CurrentConnection::Tls(Box::new(tls_stream)));
         }
 
-        let message = self.read_message()?;
+        let message = self.read_message().await?;
         match message.header().command() {
             MessageCommand::Cnxn => {
                 let device_infos = String::from_utf8(message.into_payload())?;
