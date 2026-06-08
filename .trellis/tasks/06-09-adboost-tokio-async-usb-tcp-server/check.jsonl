@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/06-09-adboost-tokio-async-usb-tcp-server/prd.md", "reason": "验收标准 + Definition of Done + 范围边界，check 据此核对"}
+{"file": ".trellis/tasks/06-09-adboost-tokio-async-usb-tcp-server/research/async-rewrite-blueprint.md", "reason": "不可违背原则（sans-io 冻结、reader 不阻塞、不跨 await 持锁、取消安全）——check 重点核对项"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门：clippy pedantic -D warnings、MSRV 1.88、fmt、测试风格"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误处理一致性：RustADBError 变体、Result alias、无 unwrap/panic 滥用"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用检查：writer-task/染色不应复制粘贴 flow-control 逻辑，单一实现"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层数据流：transport→persistent→session→trait 的 async 传播一致性"}

@@ -1,0 +1,970 @@
+{
+  "summary": "Exhaustive recon of adb_client for the tokio async rewrite: sans-io core, blocking I/O points, trait染色 surface, consumer breakage, server/TCP path, MVP decisions",
+  "agentCount": 8,
+  "logs": [],
+  "result": {
+    "report": "Confirmed: edition 2024, MSRV 1.88.0, no existing tokio/async. AFIT is available. Now writing the report.\n\n---\n\n# Recon Report: `adb_client` → `adboost` Native Tokio Async Migration\n\n## 1. Executive Summary\n\n**Blast radius.** Async coloring originates at exactly one I/O leaf — `USBTransport`'s `nusb` `transfer_blocking` calls (`usb_transport.rs:193, 203, 364`) and `TcpStream` read/write (`tcp_transport.rs:139-220`, `tcp_server_transport.rs:98-145`) — and propagates upward through every layer with zero exceptions: the three transport traits (`ADBTransport`, `ADBMessageTransport`, `ADBDeviceExt`), the persistent USB reader-demux (`persistent.rs`), all session codecs (`sync_session.rs`, `shell_v2_session.rs`), and out through all three consumers (`adb_cli`, `pyadb_client`, `examples/mdns`). Roughly 16 `ADBDeviceExt` methods, 6 `ADBMessageTransport`/`ADBTransport` methods, and ~40 internal call sites become `async`. The protocol/codec core (message encode/decode, `classify_message`, the entire `flow_control.rs` state machine and its 16 tests) is sans-io and survives untouched — that is the safety net that makes this tractable.\n\n**The single hardest problem — CLSE/Drop teardown.** Three `Drop` impls must send protocol traffic or join a worker as they tear down: `PersistentUsbConnection` (`persistent.rs:809`, `handle.join()` at `812-814` + `writer.lock()` disconnect at `817-819`), `MultiplexedSession` (`persistent.rs:1362`), and `SessionCleanup` (`persistent.rs:948`, `writer.lock()` to send `CLSE` at `957-959`). Rust stable has **no async `Drop`**. You cannot `.await` a `CLSE` write or `.await` a task-join inside `Drop`. Every option is a compromise: (a) `tokio::spawn` a fire-and-forget `CLSE` (needs a captured runtime handle + clonable writer, ordering not guaranteed); (b) require an explicit `async close()`/`shutdown()` and make `Drop` best-effort/no-op; (c) a task-manager that owns cleanup outside `Drop`. Compounding this: cancellation hazards — if a task is cancelled between `data_rx.recv()` and the `OKAY`-emitting `lock_writer` in `read_with_ack` (`persistent.rs:1052` → `1070-1074`), a window credit is permanently lost. This teardown/cancellation gate, not the mechanical `.await` insertion, is what the design must solve first.\n\n**BIG question — refactor in place vs. new `adboost` workspace.** **Recommendation: refactor `adb_client` in place into an async-native core, on a branch in the existing repo, replacing sync rather than dual-gating it — and add a thin sync `block_on` facade for the consumers that need it.** Reasoning:\n\n- **Coexistence behind a feature gate is a trap here.** The `Read`/`Write` ↔ `AsyncRead`/`AsyncWrite` split runs through the trait signatures (`ADBDeviceExt::shell` takes `&mut dyn Read` + `Box<dyn Write + Send>`), the session `impl Read/Write` (`persistent.rs:1262-1310`), and the reader architecture (sync `mpsc::sync_channel` + `thread::spawn` vs. `tokio::sync::mpsc` + `tokio::spawn`). A `#[cfg(feature=\"async\")]` split would fork nearly every file and double the test burden — the `deps-build` reader explicitly flags this. MSRV 1.88 + edition 2024 gives you AFIT, making clean replacement viable.\n- **Sync consumers don't require a sync *core*.** `pyadb_client` (PyO3, inherently sync) and `adb_cli` (sync `main`) both need sync entry points, but those are satisfied by a `block_on` wrapper *on top of* the async core — exactly the plan's stated \"pyadb/adb_cli will later get a sync `block_on` wrapper.\" That keeps one codepath in the core and one thin adapter at the edge.\n- **Git history + upstream sync favor in-place.** Refactoring in place on a branch preserves blame/history on the protocol core and keeps the door open to cherry-pick upstream `adb_client` fixes via normal merges. Spinning up a *new* `adboost` crate that copies the code severs history and turns every upstream sync into a manual port. The repo is already the renamed fork (recent commit \"relicense fork… rewrite README\"), so the crate identity is settled; this is an internal architecture change, not a new project.\n- **Net:** one async core in the existing crate; consumers adapt via `block_on`; revisit a published crate rename only when the API stabilizes.\n\n---\n\n## 2. Sans-io Assets to Freeze (the safety net)\n\nThese are pure (no I/O), already unit-tested, and **must survive the rewrite byte-for-byte**. Freeze them and assert their tests still pass post-migration as the regression anchor.\n\n| Asset | Location | Nature |\n|---|---|---|\n| `flow_control.rs` (entire module) | `usb/flow_control.rs:1-399` | Delayed-ack window state machine: `new_windowed/new_classic/can_send/record_sent/on_okay_payload/apply_delta`, `encode_okay_payload`, + **16 tests** (`166-398`) |\n| `classify_message` | `persistent.rs:79-101` | Pure demux router (`RouteDecision`) — header inspect + session-map presence, no I/O |\n| `banner_advertises_delayed_ack` | `persistent.rs:109-116` | Pure string tokenization |\n| `apply_ack` | `persistent.rs:1234-1260` | Pure command dispatch to FlowControl/close-state |\n| `drain_acks` | `persistent.rs:1213-1230` | Mostly pure; `try_recv` stays non-blocking in async |\n| Pure state holders / tags | `persistent.rs` `ReadBuffer:1015-1018`, `SessionWire:1007-1011`, `CloseState:1122-1125`, `ReadOutcome:1098-1101`, `RouteDecision:59-70` | No I/O |\n| Persistent tests | `persistent.rs:1386-1549` | classify/banner/tee/classification tests — **must survive unchanged** (harness wraps with `#[tokio::test]` only if calling `new()`/`open_session()`) |\n| SYNC codec | `sync_session.rs` `encode_sync_header:249-254`, `SyncResponse::classify:236-244`, tests `256-319` | Pure serializer/dispatch |\n| shell-v2 codec | `shell_v2_session.rs` `decode_frame_header:95-102`, `ShellChannel::try_from:60-76`, 9 tests + helpers `251-477` | Pure frame parser |\n| USB helpers | `usb_transport.rs` `aligned_request_len:388-390`, `map_transfer_status:217-223`, `find_endpoints:130-175`, + tests `398-463` | Pure align/error-map/descriptor parse |\n| Protocol layer | `adb_transport_message.rs`, `message_commands.rs`, `models/*` (`ADBRsaKey` signing, `DeviceFeatureSet`, `RebootType`), `error.rs`, `utils.rs` | Pure encode/decode/crypto/parse |\n\n**Semi-pure (factor I/O out, keep logic):** `read_with_ack` (`persistent.rs:1028-1093`) and `windowed_write` (`persistent.rs:1128-1209`) — the payload-splitting / windowing / OKAY-emission logic is stateless and testable; only `data_rx.recv()`, `recv_timeout`, `try_recv`, and `lock_writer` are blocking. The `deps-build` reader recommends refactoring `windowed_write` into a state machine returning a next-action (`Send`/`Block`/`Error`) so the pure core stays testable.\n\n---\n\n## 3. Blocking-Point Inventory\n\n### 3a. USB transport — `usb/usb_transport.rs` (`nusb` leaf)\n| Location | Construct | Async target | Risk |\n|---|---|---|---|\n| `:73` | `nusb::list_devices().wait()?` | `nusb::list_devices()` (async-native; drop `.wait()`) | low |\n| `:227` | `device_info.open().wait()?` | `.open().await?` | medium |\n| `:232` | `claim_interface(...).wait()?` | `.claim_interface(...).await?` | medium |\n| `:193` | `endpoint.transfer_blocking(chunk, timeout)` | `endpoint.transfer(chunk).await` + `tokio::time::timeout` | high |\n| `:203` | `transfer_blocking(zero-length packet)` | `.transfer(...).await` | high |\n| `:364` | `transfer_blocking(Buffer::new(len), timeout)` | `.transfer(...).await` | high |\n\n### 3b. USB persistent reader-demux — `usb/persistent.rs`\n| Location | Construct | Async target | Risk |\n|---|---|---|---|\n| `:213` | `thread::spawn(reader_loop)` | `tokio::spawn(async reader_loop)`; own `tokio::task::JoinHandle` | high |\n| `:481` | `read_message_with_timeout(1s)` (reader loop) | `tokio::time::timeout(1s, read_message())` | high |\n| `:203` | `mpsc::sync_channel` pending-opens | `tokio::sync::mpsc::channel` | high |\n| `:624-625` | `mpsc::sync_channel(64)` data_tx/ack_tx | `tokio::sync::mpsc::channel` | high |\n| `:326` | `mpsc::sync_channel(64)` raw subscribers | `tokio::sync::mpsc::channel` | high |\n| `:541` | `data_tx.try_send` (reader, must not block) | keep `try_send` (never `.await` in reader) | medium |\n| `:555` | `pending_opens_tx.try_send` | keep `try_send` | medium |\n| `:589` | `sub.tx.try_send(clone)` (tee) | keep `try_send` | medium |\n| `:665` | `ack_rx.recv_timeout(10s)` (open_session) | `tokio::time::timeout(10s, recv())` | high |\n| `:1052` | `data_rx.recv()` (read_with_ack) | `data_rx.recv().await` | high |\n| `:1154` | `ack_rx.recv_timeout(10s)` (windowed_write backpressure) | `tokio::time::timeout` | high |\n| `:1193` | `ack_rx.recv_timeout(10s)` (classic stop-and-wait) | `tokio::time::timeout` | high |\n| `:1219` | `ack_rx.try_recv()` (drain) | stays non-blocking | low |\n| `:514-519` | `sessions.lock()` (reader classify) | `tokio::sync::RwLock` read/write | medium |\n| `:577` | `raw_subscribers.lock()` (tee) | `RwLock::write().await` | medium |\n| `:629-630` | `sessions.lock()?` (open_session) | `RwLock::write().await` | low |\n| `:660-661`, `:708-709` | `writer.lock()?` (open OPEN / initial OKAY) | `writer.write().await` / `Arc<tokio Mutex<USBTransport>>` | low |\n| `:1070-1074` | `lock_writer(...)` (read_with_ack OKAY) | `lock_writer_async().await` | medium |\n| `:1179-1182` | `lock_writer(...)` (windowed_write WRTE) | `lock_writer_async().await` | medium |\n| `:361-362`, `:362`, `:384` | `read_message_with_timeout(100ms)` drain loop + `read_message()` in `do_connect` | `tokio::time::timeout` / `.await` | medium |\n| `:406` | `std::thread::sleep(100ms)` (CNXN retry) | `tokio::time::sleep(...).await` | low |\n| `:812-814` | `handle.join()` in Drop | `handle.abort()` | high |\n| `:817-819` | `writer.lock()` in Drop disconnect | async cleanup / sync at drop boundary | low |\n| `:957-959` | `writer.lock()` send `CLSE` in `SessionCleanup` Drop | **needs async-drop or manual close** | high |\n\n### 3c. USB session codecs — `usb/sync_session.rs`, `usb/shell_v2_session.rs`\n| Location | Construct | Async target | Risk |\n|---|---|---|---|\n| `sync_session.rs:22` | `use std::io::{Read, Write}` | `tokio::io::{AsyncRead, AsyncWrite, ...Ext}` | low |\n| `sync_session.rs:71-106` | `push<R: Read>` | `async push<R: AsyncRead + Unpin>` | high |\n| `sync_session.rs:119-145` | `pull<W: Write>` | `async pull<W: AsyncWrite + Unpin>` | high |\n| `sync_session.rs:149-166` | `write_request` / `write_frame_header` | `async fn` + `.write_all().await` | medium |\n| `sync_session.rs:170-176, 208-221` | `read_frame_header` / `read_exact` | `async fn` + `.read().await` loop | medium |\n| `sync_session.rs:180-194` | `copy_payload<W: Write>` | `async` both paths | medium |\n| `sync_session.rs:198-202` | `read_exact_string` | `async fn` | low |\n| `shell_v2_session.rs:23` | `use std::io::Read` | `tokio::io::{AsyncRead, AsyncReadExt}` | low |\n| `shell_v2_session.rs:143-196` | `execute()` | `async fn execute()` | high |\n| `shell_v2_session.rs:200-219` | `drain_payload` | `async fn` | medium |\n| `shell_v2_session.rs:229-244` | `read_exact_or_eof` | `async fn` | medium |\n\n### 3d. Public traits + TCP message device — `adb_device_ext.rs`, `adb_message_transport.rs`, `adb_transport.rs`, `tcp/tcp_transport.rs`, session/device layer\n| Location | Construct | Async target | Risk |\n|---|---|---|---|\n| `adb_device_ext.rs:14-141` | `trait ADBDeviceExt` (16+ `&mut self` blocking methods) | AFIT async trait + `Send` bounds | high |\n| `adb_device_ext.rs:16-21` | `shell_command(.., dyn Write, dyn Write)` | async + `AsyncWrite` / concrete sink | high |\n| `adb_device_ext.rs:23-25, 29-34` | `shell`/`exec` (`&mut dyn Read`, `Box<dyn Write+Send>`) | async + `AsyncRead`/`AsyncWrite` (object-safety problem, §4) | high |\n| `adb_device_ext.rs:58-61` | `pull(.., dyn Write)` / `push(dyn Read, ..)` | async copy loops over `AsyncRead/Write` | high |\n| `adb_message_transport.rs:12, 29-33` | `read/write_message[_with_timeout]` | AFIT async; already `Send` foundation | high |\n| `adb_transport.rs:4-10` | `connect`/`disconnect` | async, keep dyn-erasable | medium |\n| `tcp_transport.rs:79-110` | `Arc<Mutex<CurrentConnection>>` (Tcp/Tls) | `tokio::sync::Mutex` + `tokio::net::TcpStream`; `tokio-rustls` | high |\n| `tcp_transport.rs:139-185, 187-220` | manual-buffer `read`/`write` loops | `AsyncReadExt::read_exact`/`write_all` + `timeout_at` | high |\n| `tcp_transport.rs:222-278` | `upgrade_connection` TLS (`StreamOwned` swap) | async handshake `tokio_rustls::TlsStream`, no swap | high |\n| `session_stream.rs:38-102, 104-147` | `impl Read/Write for ADBSessionStream<T>` (req/resp OKAY loop) | `AsyncRead/AsyncWrite` w/ `Pin<&mut self>` | medium–high |\n| `adb_message_device.rs:28-43` | `new()` calls `connect()` in ctor | remove blocking ctor → `async new_async()`/init step | high |\n| `adb_message_device.rs:50-91` | `connect()` handshake state machine | async, same structure, `.await` each msg | medium |\n| `adb_session.rs:54-76, 78-113, 115-180` | `recv_and_reply_okay`/`send_and_expect_okay`/`recv_file<W: Write>`/`push_file<R: Read>` | async; `AsyncWrite`/`AsyncRead`; byteorder reads stay sync | low–medium |\n| `commands/shell.rs:15-38`, `pull.rs:15-50+`, `push.rs` | session loops + `recv_file`/`push_file` | async, loop unchanged | low–medium |\n\n### 3e. Server / server-device TCP path — `server/*`, `server_device/*`\n| Location | Construct | Async target | Risk |\n|---|---|---|---|\n| `tcp_server_transport.rs:170` | `std::net::TcpStream::connect()` | `tokio::net::TcpStream::connect()` | low |\n| `tcp_server_transport.rs:98,122,131,145` | `read_exact/read/write_all/shutdown` | `tokio::io::Async*Ext` | medium |\n| `adb_server_device_commands.rs:284` | `std::thread::spawn` relay + `try_clone()` | `tokio::spawn` + `tokio::io::split()` | high |\n| `adb_server_device_commands.rs:279-281` | `TcpStream::try_clone()` (bidi) | `tokio::io::split()` (no clone) | medium |\n\n---\n\n## 4. Public API Coloring Decision\n\n**AFIT, not `#[async_trait]`.** MSRV is 1.88 + edition 2024 (`Cargo.toml:7,13`), so async-fn-in-trait is available. AFIT avoids the per-call `Box<dyn Future>` allocation `#[async_trait]` imposes on the hot read/write path (`ADBMessageTransport::read_message`, called in tight session loops) and keeps signatures honest. Use AFIT for the trait surface; reach for `#[async_trait]` only where a `dyn`-erased future is genuinely needed at an API boundary.\n\n**Send bounds.** `ADBMessageTransport` already requires `Send` (`adb_message_transport.rs:12`), a good foundation. To remain usable from a multi-threaded tokio runtime, the returned futures must be `Send`; the `traits-api` reader recommends adding `Unpin + Send` bounds on `ADBDeviceExt`. AFIT does not let you write `+ Send` on the returned future directly in stable without RTN/`trait-variant`; decide whether to adopt the `trait_variant::make` pattern (generates a `Send` variant) or pin to a single-threaded assumption.\n\n**The `&mut dyn Read` / `Box<dyn Write + Send>` object-safety problem.** This is the sharp edge. `ADBDeviceExt::shell`/`exec`/`pull`/`push` (`adb_device_ext.rs:23-34, 58-61`) take `&mut dyn Read` and `Box<dyn Write + Send>`. `std::io::Read/Write` are sync; `tokio::io::AsyncRead/AsyncWrite` require `Pin<&mut Self>` and are not drop-in. Three forks (from `traits-api`):\n1. **Break to async traits** — params become `&mut (dyn AsyncRead + Unpin + Send)` / `Pin<Box<dyn AsyncWrite + Send>>`. Cleanest, fully breaking; callers must supply tokio adapters (`tokio::fs::File`, `tokio_util::compat`).\n2. **Add async + keep sync overloads** — high complexity, defeats the single-codepath goal.\n3. **Wrap sync adapters** — cheap to write, runtime cost, leaks sync into the async core.\n\nRecommendation aligns with §1: take fork (1), break to `AsyncRead/AsyncWrite`, and let the `block_on` consumer facade bridge sync `File`/`Vec` where needed.\n\n**dyn dispatch / `boxed()`.** `ADBDeviceExt` is currently trait-object-friendly (`boxed()` helper). Under AFIT, async methods are **not** object-safe by default — `dyn ADBDeviceExt` with `async fn` needs the methods to return boxed futures (e.g., via `trait_variant`/manual `Box<dyn Future>`), or `boxed()` must change to return `Pin<Box<dyn ADBDeviceExt>>`. `adb_cli` relies on `Box<dyn ADBDeviceExt>` for `run_command` (`adb_cli/src/main.rs:33-112`), so this is load-bearing: either keep dyn-dispatch via a `trait_variant` Send-variant that boxes futures, or refactor `adb_cli` to use a concrete enum/generic instead of a trait object. **Decide before touching `adb_cli`.**\n\n---\n\n## 5. Server / TCP Path — Defer-ability\n\n**The server path is independent enough to defer, and the plan already sequences it after MVP** (MVP = USB/message-device feature parity; adb-server capabilities later). Evidence from `server-tcp`: `adb_server.rs` / `tcp_server_transport.rs` / `adb_server_device*.rs` form a **sync-only lightweight client that talks TO an external adb-server over TCP**, using `std::net::TcpStream` and one `std::thread` per bidirectional session. It **shares no code or state** with the USB/message-device protocol stack — they only share the sans-io `models/`, `error.rs`, and message layout. So the server path can stay sync while the USB core goes async.\n\n**Caveat:** `adb_cli`'s host commands (`handlers/host_commands.rs:9-88`, 13 call sites) and `pyadb_client/src/adb_server.rs` (5 methods) drive `ADBServer`. If `ADBServer` stays sync, those consumer call sites stay sync — good for incremental migration, but it means the consumer ends up half-sync (server) / half-async-via-block_on (device) until the server path is converted. That's acceptable for MVP.\n\n**What async-ifying it later looks like:** `TcpStream::connect` → `tokio::net::TcpStream::connect` (`:170`, low risk); `read_exact/write_all/shutdown` → `tokio::io::Async*Ext` (`:98-145`); the hard part is `bidirectional_session` (`adb_server_device_commands.rs:284`): replace `try_clone()` + `std::thread::spawn` (two stream clones per session) with `tokio::io::split()` into read/write halves, each its own `tokio::spawn` task — watch for double-cleanup / ownership. `send_adb_request(&self)` currently mutates through `&self`; async needs `&mut self` or `tokio::sync::Mutex` interior mutability. TLS, if used, goes through `tokio-rustls` (shared concern with the message-device TCP transport).\n\n---\n\n## 6. Consumer Migration Cost\n\n**`adb_cli` (sync binary) — HIGH but mechanical.** `run_command` is a `dyn ADBDeviceExt` dispatcher with ~13–14 device call sites (`main.rs:33-112`, enumerated at `:43-104`), plus host commands (`handlers/host_commands.rs`, 13 sites), local commands (`handlers/local_commands.rs:7-42`, 8 sites), emulator commands (`handlers/emulator_commands.rs:6-34`, 5 sites). Path: convert `main()` to `#[tokio::main]` (or keep sync `main` + `runtime.block_on` at the boundary), make handlers `async`, add `.await` at each site. The `Box<dyn ADBDeviceExt>` object-safety issue (§4) must be resolved first. Pure assets — CLI arg parsing (`adb_cli/src/models/*`), `utils.rs`, `adb_termios.rs` — are untouched.\n\n**`pyadb_client` (PyO3) — HIGHEST RISK, the runtime-ownership question.** PyO3 `#[pymethods]` are inherently sync and cannot be `async`. Wrapping async Rust requires a Tokio runtime owned by the module. Binding points: `adb_usb_device.rs:16-107` (6 async device methods + 4 ctors), `adb_tcp_device.rs:16-71` (6 + 2), `adb_server_device.rs:23-62` (6), `adb_server.rs:20-56` (5, low risk if server stays sync). Two CRITICAL hazards flagged:\n- **Runtime ownership:** module-level runtime (e.g., `OnceLock<tokio::runtime::Runtime>`) + `block_on` per method, vs. a dedicated executor thread. None ergonomic; all risk deadlock if a Python thread re-enters while blocked.\n- **GIL × `block_on`:** calling `block_on` while holding the GIL deadlocks if the future re-enters Python or `spawn_blocking`. Must release the GIL (`Python::allow_threads`) around `block_on`, then re-acquire — adds wrapping to ~18 binding points (6 methods × 3 device classes). **Open sub-question:** must pyadb support concurrent calls from multiple Python threads, or is single-threaded GIL operation acceptable? This dictates runtime strategy (single shared runtime vs. pool).\n\n**`examples/mdns` — LOW.** One sync discovery example; convert to `async` or wrap with `block_on`. Trivial.\n\n---\n\n## 7. Open Questions for the User (prioritized, decision-shaped)\n\nDeduplicated across all six readers. Each maps to a concrete fork in the plan.\n\n**P0 — must answer before brainstorm/PRD (block the architecture):**\n\n1. **In-place async refactor vs. new crate, and replace-sync vs. feature-gate-coexist?** (My rec: in-place, replace sync, `block_on` facade — §1.) This is the root decision; everything else hangs off it.\n2. **CLSE / `Drop` teardown strategy** (`persistent.rs:948, 957-959, 809-819, 1362`): (a) `tokio::spawn` fire-and-forget `CLSE`, (b) explicit async `close()`/`shutdown()` with best-effort `Drop`, or (c) external task-manager? This is the hardest gate and shapes the session API.\n3. **`nusb` async integration** (`usb_transport.rs:193,203,364`): use `nusb` 0.2's native async `transfer().await` + `tokio::time::timeout`, or wrap `transfer_blocking` in `spawn_blocking`? Readers disagree (transport reader says nusb is async-native; deps-build raises spawn_blocking). Confirm the actual `nusb` 0.2.3 API shape before committing.\n4. **`ADBDeviceExt` async trait shape:** AFIT (rec) vs `#[async_trait]`; and do we need `trait_variant` for `Send` futures + to keep `dyn ADBDeviceExt`/`boxed()` object-safe? (`adb_device_ext.rs:14-141`, `adb_cli/src/main.rs:33`.)\n5. **`Read`/`Write` params on `shell`/`exec`/`pull`/`push`** (`adb_device_ext.rs:23-34,58-61`): break to `AsyncRead`/`AsyncWrite` (rec), keep sync+async overloads, or wrap sync adapters?\n\n**P1 — needed for a complete plan, but downstream of P0:**\n\n6. **Reader backpressure policy** (`persistent.rs:541,555,589`): keep `try_send` (drop/log on full, preserving the \"reader never blocks\" HARD INVARIANT at line 461) or switch to unbounded (memory-leak risk)? Confirm `try_send` stays.\n7. **Writer sharing primitive** (`persistent.rs:228, 660-661, 1070-1074, 1179-1182`): `Arc<tokio::sync::Mutex<USBTransport>>` (simple, exclusive) vs `tokio::sync::RwLock` (concurrent OKAY writes, starvation risk)? Hot path — every WRTE/OKAY.\n8. **`pyadb_client` runtime model:** module-level shared `tokio::runtime::Runtime` + GIL-release `block_on`, dedicated executor thread, or pool? Must pyadb support concurrent multi-thread Python callers? (`adb_*_device.rs` ~18 binding points.)\n9. **Cancellation safety:** define behavior when a task is cancelled mid-`read_with_ack` (between `data_rx.recv()` and OKAY emission, `persistent.rs:1052→1070`) — lost window credit; and mid-frame in `sync_session::copy_payload` / `shell_v2::execute`. Roll back, or document partial-frame as acceptable?\n10. **Constructor blocking:** `ADBMessageDevice::new()` / `PersistentUsbConnection::new()` call `connect()`/handshake in the ctor (`adb_message_device.rs:28-43`, `persistent.rs` `do_connect`). Make `new()` async, add `new_async()` factory, or builder + separate `async init()`?\n\n**P2 — scope/sequencing confirmations:**\n\n11. **Server/TCP path:** defer to post-MVP and keep sync for now (rec, §5), or convert in lockstep with the USB core? Affects whether `adb_cli` host commands and `ADBServer` go async now.\n12. **Executor coupling:** mandate `tokio` as a hard dependency (rec, simpler) or keep executor-agnostic via a trait abstraction?\n13. **TLS:** adopt `tokio-rustls` for the message-device TCP transport (`tcp_transport.rs:222-278`) now or only when the TCP/server path is converted?\n14. **`error.rs`:** add `RustADBError` variants for `tokio::task::JoinError` (task panic) and timeout/cancellation? (Required once tasks are spawned.)\n15. **`ADBSessionStream<T>`** (`session_stream.rs:38-147`): re-implement as `AsyncRead`/`AsyncWrite`, or remove in favor of direct async transport usage?\n16. **Sync facade scope:** does the `block_on` wrapper live inside `adb_client` (a `sync` module) or only in each consumer? (Determines whether `adb_client` ships a public sync API at all.)\n\nRelevant files: `/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/{persistent.rs,usb_transport.rs,sync_session.rs,shell_v2_session.rs,flow_control.rs}`, `.../adb_device_ext.rs`, `.../message_devices/{adb_message_transport.rs,adb_message_device.rs,adb_session.rs,session_stream.rs}`, `.../message_devices/tcp/tcp_transport.rs`, `.../server/tcp_server_transport.rs`, `.../server_device/adb_server_device_commands.rs`, and consumers `adb_cli/src/main.rs` + `handlers/*`, `pyadb_client/src/adb_{usb,tcp,server}_device.rs`.",
+    "rawFindings": [
+      {
+        "area": "adb_client::message_devices::usb::persistent (reader-demux layer)",
+        "summary": "The persistent USB connection holds a single authenticated CNXN+AUTH endpoint and multiplexes concurrent ADB sessions (shell, tcp, sync) over one reader thread. The reader demultiplexes inbound messages by local_id using a pure-function classifier, routes them via three std::sync::mpsc channels (session data/ack, pending opens, raw subscribers), and is the single owner of the USB bulk-IN endpoint. All sends use try_send (never block the reader). Windowed flow control (optional delayed_ack) and classic stop-and-wait are implemented in shared helpers that both owned and split sessions use.",
+        "blocking_points": [
+          {
+            "location": "persistent.rs:213",
+            "construct": "thread::spawn(move || { reader_loop(...) })",
+            "async_target": "tokio::spawn(async { reader_loop(...).await })",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:481",
+            "construct": "transport.read_message_with_timeout(Duration::from_secs(1))",
+            "async_target": "tokio::time::timeout(Duration::from_secs(1), transport.read_message()).await",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:203",
+            "construct": "mpsc::sync_channel(PENDING_OPENS_CHANNEL_SIZE) [bounded, sync]",
+            "async_target": "tokio::sync::mpsc::channel(PENDING_OPENS_CHANNEL_SIZE) [bounded, async]",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:624-625",
+            "construct": "mpsc::sync_channel(SESSION_CHANNEL_SIZE) for data_tx/ack_tx [bounded, sync, 64]",
+            "async_target": "tokio::sync::mpsc::channel(SESSION_CHANNEL_SIZE) [bounded, async]",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:326",
+            "construct": "mpsc::sync_channel(RAW_SUBSCRIBER_CHANNEL_SIZE) [bounded, sync, 64]",
+            "async_target": "tokio::sync::mpsc::channel(RAW_SUBSCRIBER_CHANNEL_SIZE) [bounded, async]",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:541",
+            "construct": "channels.data_tx.try_send(msg) [non-blocking in reader loop]",
+            "async_target": "channels.data_tx.send(msg).await [never drop on full in async]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:555",
+            "construct": "pending_opens_tx.try_send(msg) [non-blocking in reader loop]",
+            "async_target": "pending_opens_tx.send(msg).await [never drop on full in async]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:589",
+            "construct": "sub.tx.try_send(msg.clone()) [tee: non-blocking in reader loop]",
+            "async_target": "sub.tx.send(msg.clone()).await [never drop on full in async]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:665",
+            "construct": "ack_rx.recv_timeout(Duration::from_secs(10)) [blocking on ack channel]",
+            "async_target": "tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:1052",
+            "construct": "data_rx.recv() [blocking on data channel in read_with_ack]",
+            "async_target": "data_rx.recv().await [async receive]",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:1154",
+            "construct": "ack_rx.recv_timeout(Duration::from_secs(10)) [windowed write backpressure loop]",
+            "async_target": "tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:1193",
+            "construct": "ack_rx.recv_timeout(Duration::from_secs(10)) [classic mode stop-and-wait]",
+            "async_target": "tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:1219",
+            "construct": "ack_rx.try_recv() [non-blocking drain loop in drain_acks]",
+            "async_target": "ack_rx.try_recv() [stays non-blocking in async]",
+            "risk": "low"
+          },
+          {
+            "location": "persistent.rs:514-519",
+            "construct": "sessions.lock() [mutex lock in reader loop classification]",
+            "async_target": "sessions.read().await or sessions.write().await [tokio::sync::RwLock]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:577",
+            "construct": "raw_subscribers.lock() [mutex lock in tee_raw]",
+            "async_target": "raw_subscribers.write().await [tokio::sync::RwLock]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:629-630",
+            "construct": "sessions.lock()? [mutex in open_session]",
+            "async_target": "sessions.write().await [tokio::sync::RwLock]",
+            "risk": "low"
+          },
+          {
+            "location": "persistent.rs:660-661",
+            "construct": "writer.lock()? [mutex in open_session write OPEN]",
+            "async_target": "writer.write().await [tokio::sync::RwLock or single-writer Arc<USBTransport>]",
+            "risk": "low"
+          },
+          {
+            "location": "persistent.rs:708-709",
+            "construct": "writer.lock()? [mutex in open_session write initial OKAY]",
+            "async_target": "writer.write().await",
+            "risk": "low"
+          },
+          {
+            "location": "persistent.rs:1070-1074",
+            "construct": "lock_writer(wire.writer)? [mutex in read_with_ack write OKAY]",
+            "async_target": "lock_writer_async().await",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:1179-1182",
+            "construct": "lock_writer(wire.writer)? [mutex in windowed_write send WRTE]",
+            "async_target": "lock_writer_async().await",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:812-814",
+            "construct": "handle.join() [blocking thread join in Drop]",
+            "async_target": "handle.abort() [tokio::task::JoinHandle::abort], or keep None if reader is already async",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:817-819",
+            "construct": "writer.lock()? [mutex in Drop disconnect]",
+            "async_target": "writer.write().await.disconnect() or handle sync at drop boundary",
+            "risk": "low"
+          },
+          {
+            "location": "persistent.rs:957-959",
+            "construct": "writer.lock() [mutex in SessionCleanup Drop send CLSE]",
+            "async_target": "Requires async Drop (nightly) or manual cleanup method",
+            "risk": "high"
+          },
+          {
+            "location": "persistent.rs:361-362",
+            "construct": "transport.read_message_with_timeout(Duration::from_millis(100)) [in do_connect drain loop]",
+            "async_target": "tokio::time::timeout(..., transport.read_message()).await",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:362",
+            "construct": "while loop with read_message_with_timeout [sync drain in do_connect]",
+            "async_target": "while loop with tokio::time::timeout().await [async drain]",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:384",
+            "construct": "transport.read_message() [blocking read in do_connect]",
+            "async_target": "transport.read_message().await",
+            "risk": "medium"
+          },
+          {
+            "location": "persistent.rs:406",
+            "construct": "std::thread::sleep(Duration::from_millis(100)) [CNXN retry backoff]",
+            "async_target": "tokio::time::sleep(Duration::from_millis(100)).await",
+            "risk": "low"
+          }
+        ],
+        "sans_io_assets": [
+          "persistent.rs:79-101 fn classify_message(...) -> RouteDecision [PURE: message header inspection + session map presence, no I/O]",
+          "persistent.rs:109-116 fn banner_advertises_delayed_ack(banner: &str) -> bool [PURE: string tokenization, no I/O]",
+          "persistent.rs:1213-1230 fn drain_acks(...) [MOSTLY PURE: applies messages to flow window via apply_ack, but wrapped around try_recv loop; the try_recv stays non-blocking in async]",
+          "persistent.rs:1234-1260 fn apply_ack(...) [PURE: command dispatch to FlowControl / close state, no I/O]",
+          "persistent.rs:1015-1018 struct ReadBuffer [pure state holder]",
+          "persistent.rs:1007-1011 struct SessionWire [pure state holder]",
+          "persistent.rs:1122-1125 struct CloseState [pure abstraction over close-state accessor closures]",
+          "persistent.rs:1098-1101 enum ReadOutcome [pure tag]",
+          "persistent.rs:1028-1093 fn read_with_ack(...) [SEMI-PURE: *except* the data_rx.recv() and lock_writer calls, the logic of payload splitting, windowing, and OKAY emission is stateless and testable; factor the recv/write into injected async points]",
+          "persistent.rs:1128-1209 fn windowed_write(...) [SEMI-PURE: *except* the recv_timeout / try_recv / lock_writer calls, the flow-control logic and pipelining invariants are pure and testable; factor blocking into injected async points]",
+          "persistent.rs:59-70 enum RouteDecision [pure tag]",
+          "persistent.rs:1386-1549 mod tests [all tests for classify_message, banner_advertises_delayed_ack, raw tee, and classification are PURE and *must* survive async rewrite unchanged]"
+        ],
+        "public_api_impact": [
+          "pub fn new(...) -> Result<Self> [becomes async: returns Result<Self> with .await on do_connect]",
+          "pub fn new_with_features(...) -> Result<Self> [becomes async: thread::spawn becomes tokio::spawn, reader_loop becomes async]",
+          "pub fn new_from_ids(...) -> Result<Self> [becomes async: delegates to new_with_features]",
+          "pub fn new_from_ids_with_features(...) -> Result<Self> [becomes async: delegates to new_with_features]",
+          "pub fn incoming_opens(&self) -> Result<Receiver<ADBTransportMessage>> [stays sync, but Receiver is now tokio::sync::mpsc::Receiver, receiver type changes]",
+          "pub fn subscribe_raw(...) -> Result<Receiver<...>> [stays sync-shaped but Receiver becomes async]",
+          "pub fn send_raw(&self, msg: ...) -> Result<()> [becomes async because writer.lock/write_message will be async]",
+          "pub fn open_session(&self, cmd: &ADBLocalCommand) -> Result<MultiplexedSession> [becomes async: ack_rx.recv_timeout becomes await]",
+          "pub fn open_sync_session(&self) -> Result<SyncSession> [becomes async: delegates to open_session]",
+          "pub fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> [becomes async: delegates to open_session]",
+          "pub fn shell_exec(&self, cmd: &str) -> Result<(String, Option<u8>)> [becomes async: session.read loop becomes .read().await]",
+          "pub fn is_alive(&self) -> bool [stays sync, introspects reader_handle.is_finished()]",
+          "impl Read for MultiplexedSession [becomes async: read_with_ack contains data_rx.recv() and lock_writer]",
+          "impl Write for MultiplexedSession [becomes async: windowed_write contains recv_timeout loops and lock_writer]",
+          "impl Read for SessionReadHalf [becomes async: read_with_ack is async]",
+          "impl Write for SessionWriteHalf [becomes async: windowed_write is async]",
+          "impl Drop for PersistentUsbConnection [cannot block in Drop; spawn async cleanup or make reader abort synchronously]",
+          "impl Drop for MultiplexedSession [cannot block in Drop; cannot send CLSE synchronously; requires async drop or manual cleanup]",
+          "impl Drop for SessionCleanup [cannot block in Drop; same issue]"
+        ],
+        "risks": [
+          "Reader thread spawn (line 213) is the root of concurrency. Conversion requires spawning a tokio task instead, which means PersistentUsbConnection must own a tokio::task::JoinHandle instead of thread::JoinHandle. Risk: any existing code that calls .is_finished() or .join() in Drop must adapt.",
+          "The reader loop (line 481) blocks on USB read with 1-second timeout. In async, this becomes a select! or tokio::time::timeout(). Risk: timeout semantics must be preserved; if the device goes silent for >1 sec, normal; if disconnect, Err branch must be robust.",
+          "All three sync_channel variants (session data/ack, pending opens, raw subscribers) must become tokio::sync::mpsc. Risk: enum change from std::sync::mpsc::{TryRecvError, TrySendError} to tokio::sync::mpsc::{error::TryRecvError, error::TrySendError}; error types differ.",
+          "try_send policy in reader loop (lines 541, 555, 589) must never block. In async, .send().await DOES block on full queue. Decision: keep try_send (panic on full) or make queues unbounded. Risk: if unbounded, memory leak on reader backlog.",
+          "recv_timeout calls (lines 665, 1154, 1193) in open_session and windowed_write. Conversion to tokio::time::timeout().await is straightforward, but risk: if timeout changes behavior or test assumes specific timing, brittle.",
+          "Mutex lock calls on sessions / raw_subscribers / writer (lines 514-519, 577, 660, 708, etc.) must become async-safe. Risk: RwLock is not 1:1 compatible with Mutex (split read/write); must audit all lock sites. Writer mutex is especially hot (every WRTE/OKAY); contention risk.",
+          "Drop impls for PersistentUsbConnection (line 809), MultiplexedSession (line 1362), and SessionCleanup (line 948) cannot block. Risk: sending CLSE in Drop requires async drop (unstable) or manual cleanup. Current .join() will hang if reader panics; must abort task instead.",
+          "Writer contention: every session write (windowed_write, line 1179) and read (read_with_ack, line 1070) locks writer to emit OKAY. In async, many tasks may await the same lock. Risk: starvation if reader thread gets starved waiting for writer lock.",
+          "Cancellation: if a task is cancelled mid-recv (e.g., tokio::select! timeout), the message is lost. If cancellation happens in read_with_ack between data_rx.recv() and lock_writer (OKAY emission), window credit is lost. Risk: classic async cancellation hazard.",
+          "Tests (lines 1386-1549) assume sync classify_message and pure functions. The test module must remain unchanged, but test harness must adapt to async main or use tokio::test macro. Risk: if tests call new() or open_session(), must become async.",
+          "The reader loop never blocking is a HARD INVARIANT (line 461 comment). Conversion must preserve this: never .recv().await in the reader (use try_recv); never lock-wait. Risk: high if async helpers accidentally introduce blocking on full queue.",
+          "Delayed_ack negotiation (line 191) happens before reader spawns. After async spawn, the reader task may not be ready immediately. Risk: race if caller tries to use connection before reader is runnable.",
+          "Flow control window state (send_flow, line 846) is owned by the session and written by the write path. Async write paths sharing send_flow require interior mutability. Risk: if multiple concurrent writes, race on send_flow state.",
+          "SessionReadHalf and SessionWriteHalf are split from MultiplexedSession (line 871). After drop, both halves must send CLSE. In async, both .drop() cannot block; requires async drop or refcount+manual cleanup. Current SessionCleanup approach (lines 939-965) uses Arc+Drop, but Drop is still sync. Risk: CLSE not guaranteed to send.",
+          "The pending_opens receiver (line 296) is taken by the caller, then reader tees into the sender. If reader outlives the receiver's consumer, backlog fills and reader drops OPENs. Async doesn't change this, but risk: visibility of drops changes if try_send switches to bounded send."
+        ],
+        "open_questions": [
+          "Should the writer mutex become tokio::sync::RwLock (with fine-grained read/write split) or stay Arc<Mutex<USBTransport>> (i.e., keep exclusive write semantics)? RwLock allows many concurrent reader-task OKAY writes; Mutex is simpler but higher contention.",
+          "If reader loop receives a message but all session queues are full, current code logs and drops. After async, should we keep try_send (panic on full) or switch to unbounded channels? Unbounded risks memory leak; try_send risks silent drops.",
+          "How do we handle Drop for MultiplexedSession / SessionCleanup sending CLSE? Rust stable does not support async drop. Options: (a) spawn a tokio::spawn task to send CLSE (fire-and-forget), (b) require explicit close() method, (c) move cleanup to a tokio task manager outside Drop.",
+          "The reader loop timeout is 1 second (line 481). After async, should we use tokio::time::interval for cleaner backoff, or keep the timeout pattern? If device goes quiet, do we want early detection?",
+          "Classification logic and pure functions must survive unchanged. After async, should we unit-test the reader loop's routing in an async test harness, or keep classify_message as standalone sync tests? Recommend standalone (already in place, lines 1408-1463).",
+          "SessionReadHalf::read() and MultiplexedSession::read() implement std::io::Read trait, which is sync. Conversion to async requires new traits (e.g., futures::AsyncRead or tokio::io::AsyncRead). Do we introduce a new async layer, or replace std::io::Read entirely?",
+          "Same for Write: std::io::Write is sync, but windowed_write is async. Must we introduce AsyncWrite or provide both sync and async APIs?",
+          "The reader thread is currently owned by PersistentUsbConnection and joined in Drop. After async, do we abort the task synchronously in Drop, or spawn cleanup as a nested task? How does this interact with the connection being used across await points?",
+          "Transport USBTransport has read_message() and write_message(). Must these become async (read_message().await, write_message().await)? If so, the entire chain of callers becomes async. Is USBTransport already async, or is it currently blocking?",
+          "The tests module (lines 1386-1549) must survive unchanged. After making new() async, can we still call it from sync tests, or must we use #[tokio::test]? How do we test PersistentUsbConnection without a real USB device?"
+        ],
+        "_key": "usb-persistent",
+        "_label": "usb/persistent.rs multiplexer"
+      },
+      {
+        "area": "USB Transport via nusb 0.2 - Async Migration Analysis",
+        "summary": "The USB transport layer wraps nusb 0.2 for Android Debug Bridge (ADB) device communication. It currently uses blocking operations (.wait(), transfer_blocking) in a synchronous trait interface (ADBMessageTransport, ADBTransport). The architecture features a persistent connection with a spawned reader thread that multiplexes multiple ADB sessions over a single USB pipe. Async migration requires lifting async all the way through the trait hierarchy and converting the reader thread to a tokio task.",
+        "blocking_points": [
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:73",
+            "construct": "nusb::list_devices().wait()?",
+            "async_target": "nusb::list_devices() (no .wait() needed; nusb 0.2 is async-native and returns a stream/future directly)",
+            "risk": "low"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:227",
+            "construct": "self.device_info.open().wait()?",
+            "async_target": "self.device_info.open().await?",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:232",
+            "construct": "device.claim_interface(read_endpoint.iface).wait()?",
+            "async_target": "device.claim_interface(read_endpoint.iface).await?",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:193",
+            "construct": "endpoint.transfer_blocking(chunk, timeout)",
+            "async_target": "endpoint.transfer(chunk).await (nusb 0.2 handles timeout via tokio; may need wrapper or context-local timeout management)",
+            "risk": "high"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:203",
+            "construct": "endpoint.transfer_blocking(Buffer::from(&[][..]), timeout) - zero-length packet",
+            "async_target": "endpoint.transfer(Buffer::from(&[][..])).await",
+            "risk": "high"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/usb_transport.rs:364",
+            "construct": "endpoint.transfer_blocking(Buffer::new(request_len), timeout)",
+            "async_target": "endpoint.transfer(Buffer::new(request_len)).await",
+            "risk": "high"
+          }
+        ],
+        "sans_io_assets": [
+          "aligned_request_len (line 388-390): Pure utility function computing max-packet-size alignment; no I/O; survives unchanged",
+          "map_transfer_status (line 217-223): Pure error mapping from nusb TransferError to RustADBError; survives unchanged",
+          "find_endpoints (line 130-175): Pure descriptor parsing (nusb::Device descriptors are cached data structures); no I/O; survives unchanged",
+          "classify_message (line 79-100 in persistent.rs): Pure demux logic for routing messages to sessions; no I/O; survives unchanged",
+          "banner_advertises_delayed_ack (line 109-116 in persistent.rs): Pure string parsing; no I/O; survives unchanged",
+          "aligned_request_len tests (line 438-463): Unit tests for alignment logic; no I/O; survive unchanged",
+          "map_transfer_status tests (line 398-435): Unit tests for error mapping; no I/O; survive unchanged",
+          "classify_message tests (line 600+ in persistent.rs): Unit tests for routing logic; no I/O; survive unchanged"
+        ],
+        "public_api_impact": [
+          "ADBTransport::connect() - must become async: `async fn connect(&mut self) -> Result<()>`",
+          "ADBTransport::disconnect() - must become async: `async fn disconnect(&mut self) -> Result<()>`",
+          "ADBMessageTransport::read_message_with_timeout() - must become async: `async fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage>`",
+          "ADBMessageTransport::read_message() - must become async: `async fn read_message(&mut self) -> Result<ADBTransportMessage>`",
+          "ADBMessageTransport::write_message_with_timeout() - must become async: `async fn write_message_with_timeout(&mut self, message: ADBTransportMessage, timeout: Duration) -> Result<()>`",
+          "ADBMessageTransport::write_message() - must become async: `async fn write_message(&mut self, message: ADBTransportMessage) -> Result<()>`",
+          "ADBMessageTransport::upgrade_connection() - must become async: `async fn upgrade_connection(&mut self) -> Result<()>`",
+          "PersistentUsbConnection::new() - must become async: `async fn new(transport: USBTransport, private_key_path: Option<PathBuf>) -> Result<Self>`",
+          "PersistentUsbConnection::new_with_features() - must become async",
+          "PersistentUsbConnection::new_from_ids() - must become async",
+          "PersistentUsbConnection::new_from_ids_with_features() - must become async",
+          "All session opening/read/write methods that call transport must become async or spawn tokio tasks"
+        ],
+        "risks": [
+          "Reader thread must convert to tokio task: The persistent.rs reader_loop currently spawns std::thread::spawn(). With async, this becomes tokio::spawn(), requiring a tokio runtime available at connection time. The loop blocks on transport.read_message_with_timeout() which will become async, needing .await instead of blocking.",
+          "Endpoint ownership and mutability: nusb endpoints require &mut self for operations. Currently wrapped in Arc<Mutex<T>> for shared access. Async doesn't change this, but the mutex-lock-await pattern must be carefully written to avoid holding locks across .await points (deadlock risk). The write_bulk_data and read_exact functions must be refactored to acquire lock, then .await on transfer, then release lock in the correct order.",
+          "Trait object vtables: Making ADBMessageTransport trait async requires all implementers to be refactored. If this crate exposes trait objects (dyn ADBMessageTransport), callers cannot mix sync and async implementations. Recommend adding an async marker trait or wrapping in an adapter.",
+          "Timeout handling: nusb 0.2 transfer() is fully async and does NOT have a timeout parameter. Current code passes Duration to transfer_blocking(). Must implement timeout via tokio::time::timeout(). This is correctness-critical because RustADBError::UsbTimeout must still be distinguished from other errors (persistent.rs reader_loop line 487).",
+          "Multi-transport impls: Any other ADBMessageTransport implementers (TCP, TLS) must also become async. Currently TCP transport in /adb_client/src/tcp_transport.rs or similar. Audit required.",
+          "Spawned reader thread lifecycle: PersistentUsbConnection currently holds Option<thread::JoinHandle<()>>. With tokio::spawn(), it becomes JoinHandle, which must be awaited or aborted. The Drop impl must properly cancel the task.",
+          "Channel/MPSC types: persistent.rs uses std::sync::mpsc for message routing (pending_opens_tx, session channels, raw_subscribers). These are sync and will block the reader task if they overflow or are slow. Should migrate to tokio::sync::mpsc or tokio::sync::broadcast. The try_send() calls should remain try_* to avoid blocking the reader, but tokio channels are non-blocking anyway.",
+          "AdbMessageDevice and session types: Any code that constructs ADBMessageDevice<T> where T: ADBMessageTransport must now be async. This affects all shell/sync/tcp session creation in /adb_client/src/message_devices/commands/. Likely cascades to user-facing API (e.g., anything that calls .connect() or opens a session).",
+          "Tests and examples: All tests and examples that use USBTransport must become async or use tokio::test macro. Likely broad impact.",
+          "Error type stability: RustADBError::UsbTimeout mapping depends on catching TransferError::Cancelled. With async, must ensure timeout wrapper still produces this error or map it correctly (line 213-214 comment and line 487 match both depend on this).",
+          "Endpoint lifetimes: In current code, endpoints are stored in Arc<Mutex<Option<Endpoint>>>. After opening the device and claiming interface, endpoints are valid for the device's lifetime. With async, must ensure the Arc<nusb::Device> or equivalent remains alive. nusb 0.2 manages this via futures; verify no premature drop during long-lived async operations."
+        ],
+        "open_questions": [
+          "Does this project use a tokio runtime already, or is std::thread the threading model elsewhere? If std::thread is the only model today, introducing tokio is a significant new dependency.",
+          "Are there other ADBTransport implementers (TCP, TLS, mock) that must also be converted to async simultaneously, or can they be migrated independently?",
+          "Should ADBMessageTransport remain an async trait, or should a separate async trait (e.g., AsyncADBMessageTransport) be introduced to allow gradual migration and coexistence of sync wrappers?",
+          "The nusb 0.2 transfer() API lacks a built-in timeout. Should the timeout handling be per-transport-layer-call via tokio::time::timeout(), or should it be exposed at a higher level (e.g., session read/write methods)? Currently every read_message_with_timeout and write_message_with_timeout call must wrap with tokio::time::timeout().",
+          "How should the reader loop be integrated with the rest of the codebase? Should PersistentUsbConnection own a tokio::runtime::Handle to spawn the reader task, or should the caller be responsible for providing runtime context?",
+          "The persistent connection is currently constructed in a blocking context (new() is sync, new_with_features() is sync). After async migration, when should PersistentUsbConnection::new() be called? During app startup with tokio::main? This cascades to all users of the connection.",
+          "Current code uses std::sync::mpsc. Should this migrate to tokio::sync::mpsc for consistency with the async model, or is the current sync-channel fine (it's a bounded queue and the reader uses try_send)?",
+          "What about the persistent.rs `do_connect` and `do_auth` functions (line 355+)? These call transport.read_message() and transport.write_message() repeatedly. After async, they become async functions, but PersistentUsbConnection::new() must call them. This is a bootstrapping problem: new() is sync but must call async handshake. Solution: make new() async (question above) or use block_on (not ideal in async context)."
+        ],
+        "_key": "usb-transport",
+        "_label": "usb/usb_transport.rs nusb layer"
+      },
+      {
+        "area": "adboost USB session codecs (flow_control, sync_session, shell_v2_session) — async migration readiness",
+        "summary": "flow_control.rs is a pure delayed-ack window state machine with 16 unit tests; it requires zero async changes and survives completely unchanged. sync_session.rs (SYNC v1 push/pull) has 2 pure codec functions (encode_sync_header, SyncResponse::classify) that survive unchanged, but 8 I/O methods calling MultiplexedSession::{read,write} must be染色 to async. shell_v2_session.rs (shell-v2 frame decode) has 2 pure codec functions (decode_frame_header, ShellChannel::try_from) plus 8 test helpers that survive, but 3 I/O methods calling MultiplexedSession::read must become async.",
+        "blocking_points": [
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:22",
+            "construct": "use std::io::{Read, Write}",
+            "async_target": "Replace with tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}",
+            "risk": "low"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:71-106",
+            "construct": "pub fn push<R: Read>(...) — calls write_request + read_frame_header",
+            "async_target": "pub async fn push<R: AsyncRead + Unpin>(...) — await write_request, await read_frame_header",
+            "risk": "high"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:119-145",
+            "construct": "pub fn pull<W: Write>(...) — calls write_request + loop(read_frame_header, copy_payload)",
+            "async_target": "pub async fn pull<W: AsyncWrite + Unpin>(...) — await all I/O",
+            "risk": "high"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:149-159",
+            "construct": "fn write_request(...) — calls write_frame_header + inner.write_all",
+            "async_target": "async fn write_request(...) — await write_frame_header, await inner.write_all",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:162-166",
+            "construct": "fn write_frame_header(...) — inner.write_all(&header)",
+            "async_target": "async fn write_frame_header(...) — self.inner.write_all(&header).await",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:170-176",
+            "construct": "fn read_frame_header() — calls read_exact (loops inner.read)",
+            "async_target": "async fn read_frame_header() — await read_exact",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:180-194",
+            "construct": "fn copy_payload<W: Write>(...) — loops inner.read, writer.write_all",
+            "async_target": "async fn copy_payload<W: AsyncWrite + Unpin>(...) — await both paths",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:198-202",
+            "construct": "fn read_exact_string(...) — calls read_exact",
+            "async_target": "async fn read_exact_string(...) — await read_exact",
+            "risk": "low"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:208-221",
+            "construct": "fn read_exact(buf) — loops inner.read until buf full or EOF",
+            "async_target": "async fn read_exact(buf) — loop with self.inner.read().await",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:23",
+            "construct": "use std::io::Read",
+            "async_target": "use tokio::io::{AsyncRead, AsyncReadExt}",
+            "risk": "low"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:143-196",
+            "construct": "pub fn execute(&mut self) -> Result<ShellV2Output> — loops read_exact_or_eof + drain_payload",
+            "async_target": "pub async fn execute(&mut self) -> Result<ShellV2Output> — await both",
+            "risk": "high"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:200-219",
+            "construct": "fn drain_payload(..., sink: impl FnMut(&[u8])) — loops inner.read, calls sink",
+            "async_target": "async fn drain_payload(..., sink: impl Fn(&[u8])) — await inner.read loop",
+            "risk": "medium"
+          },
+          {
+            "location": "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:229-244",
+            "construct": "fn read_exact_or_eof(buf) — loops inner.read until full or EOF",
+            "async_target": "async fn read_exact_or_eof(buf) — loop with self.inner.read().await",
+            "risk": "medium"
+          }
+        ],
+        "sans_io_assets": [
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/flow_control.rs:1-399 — Entire module is sans-io: FlowControl state machine, all 8 impl methods (new_windowed, new_classic, is_windowed, available_bytes, can_send, record_sent, on_okay_payload, apply_delta), encode_okay_payload serializer, and 16 unit tests",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:249-254 — encode_sync_header(sub, len) -> [u8; 8]: pure codec, serializes opcode id + LE length",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:236-244 — SyncResponse::classify(id: [u8; 4]) -> SyncResponse: pure enum dispatch, no I/O",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/sync_session.rs:256-319 — All 4 test functions (sync_header_encodes_id_and_le_length, sync_header_data_length_roundtrips, classify_data_done_fail_okay, classify_unknown_is_other) — pure, unchanged",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:95-102 — decode_frame_header(header: [u8; 5]) -> Result<FrameHeader>: pure codec, deserializes channel id + LE payload length",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:60-76 — ShellChannel::try_from(u8): pure enum dispatch, no I/O",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/shell_v2_session.rs:251-477 — All 9 test functions (decode_stdout_header, decode_stderr_header, decode_exit_status_header, decode_window_size_change_header, decode_invalid_channel_is_parse_error, routes_stdout_stderr_and_exit_code, window_size_change_is_consumed_and_ignored, handles_frame_split_across_reads, malformed_exit_status_length_is_parse_error) and helpers (decode_all, frame, ChunkedReader) — all pure, unchanged",
+          "/Users/magicdian/Documents/personal_project/adboost/adb_client/src/message_devices/usb/flow_control.rs:166-398 — 16 test functions: classic_mode_has_no_window, windowed_initial_window_is_32_mib_when_granted, opener_starts_at_zero_and_blocks_until_credited, record_sent_debits_window, window_exhaustion_blocks_then_recovers_after_okay, window_may_go_negative_via_oversend, negative_delta_is_applied_without_panic, classic_empty_payload_okay_is_noop, empty_payload_in_windowed_mode_is_noop_credit, malformed_okay_payload_is_rejected, i32_le_round_trip_through_okay_payload, encode_okay_payload_windowed_is_i32_le, encode_okay_payload_classic_is_empty, encode_okay_payload_clamps_huge_byte_count, overflow_accumulation_does_not_panic, max_payload_constants"
+        ],
+        "public_api_impact": [
+          "sync_session.rs:71 — pub fn push<R: Read>(...) signature changes to pub async fn push<R: AsyncRead + Unpin>(...) — callers must await and use AsyncRead types",
+          "sync_session.rs:119 — pub fn pull<W: Write>(...) signature changes to pub async fn pull<W: AsyncWrite + Unpin>(...) — callers must await and use AsyncWrite types",
+          "shell_v2_session.rs:143 — pub fn execute(&mut self) -> Result<ShellV2Output> signature changes to pub async fn execute(&mut self) -> Result<ShellV2Output> — callers must await",
+          "MultiplexedSession trait dependency on std::io::{Read, Write} must become tokio::io::{AsyncRead, AsyncWrite} — this is a prerequisite, likely upstream in persistent.rs"
+        ],
+        "risks": [
+          "MultiplexedSession must already implement AsyncRead/AsyncWrite or be converted — if MultiplexedSession still uses std::io::Read/Write, this codepath is BLOCKED and requires upstream changes",
+          "sync_session.rs generic type parameters push<R: Read> and pull<W: Write> — replacing with AsyncRead/AsyncWrite requires callers to adapt (File → tokio::fs::File, BufReader → tokio::io::BufReader, etc.); this is a breaking change at the public API level",
+          "shell_v2_session.rs execute() becoming async changes caller control flow — all call sites must be in an async context or spawn a task; cannot be called from sync code",
+          "Test helpers (decode_all, ChunkedReader) in shell_v2_session.rs use std::io::Read — these do NOT need to become async (they are pure unit test helpers), but callers testing the real execute() will need to bridge to tokio (use tokio_util::compat::TokioAsyncReadCompatExt or similar)",
+          "Cancellation semantics unclear — async reads/writes can be cancelled; flow_control.rs has no cancellation-safety story (this is OK, state machine is pure), but sync_session/shell_v2_session must decide whether partial reads mid-frame are cancellation-safe or need bundling into atomic I/O transactions"
+        ],
+        "open_questions": [
+          "Is MultiplexedSession already async, or is it still sync Read/Write? This is a critical blocker — both sync_session and shell_v2_session depend on it. If it is sync, what is the plan to make it async?",
+          "For sync_session.rs push<R: Read> and pull<W: Write> — do callers need to stay generic over any Reader/Writer trait, or can they be specialized to tokio types (Cursor, BufReader, File)? This affects the signature change scope.",
+          "For shell_v2_session.rs test helpers (decode_all, ChunkedReader) — should these remain std::io::Read for pure unit testing, or be migrated to work with async readers? Current approach (keeping them sync for tests, bridging in integration tests) is clean but needs explicit decision.",
+          "Cancellation semantics: if an async read/write is cancelled mid-frame (e.g., in sync_session::copy_payload after reading 10KB of a 65KB chunk), should the state machine roll back, or is it acceptable for the frame to remain incomplete on the MultiplexedSession stream? AOSP is synchronous, so this is a new concern.",
+          "flow_control.rs has no async story, but should it? If MultiplexedSession I/O calls are async, does a sender need to await on can_send() or should the window check remain synchronous (quick predicate before entering an async send)?"
+        ],
+        "_key": "usb-sessions",
+        "_label": "usb sync_session + shell_v2_session + flow_control"
+      },
+      {
+        "area": "adb_client: async migration assessment for public trait API surface",
+        "summary": "The adb_client crate exposes three primary public traits that form the consumer-facing async migration surface: ADBDeviceExt (high-level commands: shell, pull, push, stat, reboot, etc.), ADBMessageTransport (lower-level message read/write with timeouts), and ADBTransport (connect/disconnect). These are concretely implemented by TcpTransport (Mutex-wrapped TcpStream + optional Rustls TLS), USBTransport (nusb bulk endpoints with separate reader/writer Mutexes), and ADBMessageDevice (generic over T: ADBMessageTransport). The trait hierarchy has critical blocking IO (std::io::Read/Write on dyn pointers, Mutex::lock, socket read/write, USB transfer_blocking) and uses &mut self extensively, making AFIT (async-fn-in-trait) the correct choice over #[async_trait] for trait object safety and reduced allocations. The boxed() helper and dyn ADBDeviceExt users add significant染色 blast radius.",
+        "blocking_points": [
+          {
+            "location": "adb_device_ext.rs:14-141",
+            "construct": "trait ADBDeviceExt: all 16+ methods taking &mut self with blocking ops",
+            "async_target": "convert to async trait with async-fn-in-trait, Add: Unpin + Send bounds for runtime compatibility",
+            "risk": "high"
+          },
+          {
+            "location": "adb_device_ext.rs:16-21",
+            "construct": "fn shell_command(&mut self, command, stdout: Option<&mut dyn Write>, stderr: Option<&mut dyn Write>)",
+            "async_target": "async fn with BufWriter or AsyncWrite; dyn Write not async-safe, need trait object wrapping or concrete type",
+            "risk": "high"
+          },
+          {
+            "location": "adb_device_ext.rs:23-25",
+            "construct": "fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>)",
+            "async_target": "async fn with AsyncRead + AsyncWrite; need AsyncBidirectional wrapper, dyn dispatch becomes Pin<Box<>>",
+            "risk": "high"
+          },
+          {
+            "location": "adb_device_ext.rs:29-34",
+            "construct": "fn exec(&mut self, command: &str, reader: &mut dyn Read, writer: Box<dyn Write + Send>)",
+            "async_target": "async fn; same dyn Read/Write dispatch problems as shell()",
+            "risk": "high"
+          },
+          {
+            "location": "adb_device_ext.rs:58-61",
+            "construct": "fn pull(&mut self, source, output: &mut dyn Write) and fn push(&mut self, stream: &mut dyn Read, path)",
+            "async_target": "async fn with AsyncWrite/AsyncRead; recursive copy loops must become async loops",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/adb_message_transport.rs:12",
+            "construct": "trait ADBMessageTransport: ADBTransport + Clone + Send: read_message_with_timeout(&mut self, Duration) -> ADBTransportMessage",
+            "async_target": "async fn read_message_with_timeout with timeout_at or select!; already requires Send + 'static, good foundation",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/adb_message_transport.rs:29-33",
+            "construct": "fn write_message_with_timeout(&mut self, message, Duration) -> Result<()>",
+            "async_target": "async fn; no blocking semantics except Mutex lock and I/O",
+            "risk": "high"
+          },
+          {
+            "location": "adb_transport.rs:4-10",
+            "construct": "trait ADBTransport: fn connect(&mut self) -> Result<()>, fn disconnect(&mut self) -> Result<()>",
+            "async_target": "async fn connect/disconnect; keep trait object-compatible (erase to dyn ADBTransport where needed)",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/tcp/tcp_transport.rs:79-110",
+            "construct": "TcpTransport: Arc<Mutex<CurrentConnection>> where CurrentConnection = Tcp(TcpStream) | Tls(Box<StreamOwned<...>>)",
+            "async_target": "replace Mutex+sync IO with tokio::sync::Mutex + tokio::net::TcpStream; StreamOwned -> tokio-rustls async variant",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/tcp/tcp_transport.rs:139-185",
+            "construct": "fn read_message_with_timeout: loop { raw_connection.read(...) } manual buffering",
+            "async_target": "async fn with AsyncReadExt::read_exact, timeout_at(Instant::now() + duration)",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/tcp/tcp_transport.rs:187-220",
+            "construct": "fn write_message_with_timeout: loop { raw_connection.write(...) } manual buffering",
+            "async_target": "async fn with AsyncWriteExt::write_all, timeout_at",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/tcp/tcp_transport.rs:222-278",
+            "construct": "fn upgrade_connection: TLS negotiation with ClientConnection, StreamOwned ownership swap",
+            "async_target": "async fn; async TLS handshake with tokio_rustls::TlsStream, no ownership swap needed",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/usb/usb_transport.rs:63-95",
+            "construct": "USBTransport: Arc<Mutex<Connection>> + Arc<Mutex<WriteConnection>> with nusb Endpoint, transfer_blocking()",
+            "async_target": "keep Arc<Mutex> structure; replace transfer_blocking with nusb async when available, or spawn blocking tasks",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/usb/usb_transport.rs:177-208",
+            "construct": "fn write_bulk_data: loop { endpoint.transfer_blocking(chunk, timeout) }",
+            "async_target": "if nusb has async API: async fn; else: block_in_place or spawn_blocking wrapper around transfer_blocking",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/usb/usb_transport.rs:308-343",
+            "construct": "fn read_message_with_timeout: read_exact(endpoint, &mut data, ...) calling transfer_blocking",
+            "async_target": "async fn; wrap transfer_blocking in block_in_place if needed, or await nusb async equiv",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/session_stream.rs:38-102",
+            "construct": "impl Read for ADBSessionStream<T>: &mut self.session.get_transport_mut().read_message()",
+            "async_target": "AsyncRead impl with read_buf and buffering; dispatch becomes Pin<&mut self>",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/session_stream.rs:104-147",
+            "construct": "impl Write for ADBSessionStream<T>: encode message, write, read OKAY response (tight req/resp loop)",
+            "async_target": "AsyncWrite impl; request/response loop becomes select! or proper async sequencing",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/adb_session.rs:54-76",
+            "construct": "fn recv_and_reply_okay, fn send_and_expect_okay: self.transport.read_message() / write_message()",
+            "async_target": "async fn (internal use); no changes needed beyond propagating async from transport",
+            "risk": "low"
+          },
+          {
+            "location": "message_devices/adb_message_device.rs:28-43",
+            "construct": "fn new(.., private_key_path) -> Result<Self>: calls connect() in constructor",
+            "async_target": "remove blocking connect from ctor; add async fn new_async() or make new() return incomplete struct requiring async init",
+            "risk": "high"
+          },
+          {
+            "location": "message_devices/adb_message_device.rs:50-91",
+            "construct": "fn connect(.., private_key: &ADBRsaKey): handshake state machine with multiple read/write cycles",
+            "async_target": "async fn; state machine stays same structure but await each message I/O",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/commands/shell.rs:15-38",
+            "construct": "fn shell_command: loop { session.recv_and_reply_okay() } write to stdout Writer",
+            "async_target": "async fn; loop stays same, each recv_and_reply_okay becomes await",
+            "risk": "low"
+          },
+          {
+            "location": "message_devices/commands/pull.rs:15-50+",
+            "construct": "fn pull<A, W: Write>: session.recv_file(output) with Write sink",
+            "async_target": "async fn; session.recv_file becomes async, caller provides AsyncWrite",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/commands/push.rs",
+            "construct": "fn push: reader.read(...) loop, session.push_file(reader) with Read source",
+            "async_target": "async fn; reader must implement AsyncRead, push_file becomes async",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/adb_session.rs:78-113",
+            "construct": "fn recv_file<W: std::io::Write>: manual buffering, Cursor seeks, Read::read_u32",
+            "async_target": "async fn; W: AsyncWrite; buffer management becomes async loops, byteorder reads stay sync",
+            "risk": "medium"
+          },
+          {
+            "location": "message_devices/adb_session.rs:115-180",
+            "construct": "fn push_file<R: std::io::Read>: R::read(&mut buffer) loop",
+            "async_target": "async fn; R: AsyncRead; loop becomes async with AsyncReadExt::read",
+            "risk": "medium"
+          }
+        ],
+        "sans_io_assets": [
+          "message_devices/adb_transport_message.rs: ADBTransportMessage + ADBTransportMessageHeader - pure message structure, encoding/decoding (try_from/as_bytes) stays sync",
+          "message_devices/message_commands.rs: MessageCommand enum, MessageSubcommand enum with BinaryEncodable - pure protocol enum, can stay sync",
+          "models/: ADBRsaKey RSA signing (adb_private_key.rs/rsa_key.rs), DeviceFeatureSet parsing, RebootType, RemountInfo - pure crypto/parse logic stays sync",
+          "message_devices/adb_session.rs: ADBSession<T> struct definition, IDs, const fns (new, local_id, remote_id, get_transport_mut) - no IO",
+          "message_devices/adb_message_device.rs: ADBMessageDevice<T> struct definition - generic container, only calls to transport are async",
+          "utils.rs / models/: BinaryEncodable/BinaryDecodable traits for encoding/decoding - stays sync, lives in pure data layer",
+          "error.rs: RustADBError enum, Result type alias - no IO",
+          "tcp_transport.rs: CurrentConnection enum, NoCertificateVerification impl - pure enum (I/O moved to methods)",
+          "usb_transport.rs: EndpointInfo, read_exact(..), aligned_request_len(..) helper - pure logic can stay sync/non-async",
+          "session_stream.rs: ADBSessionStream<T> struct constructor/into_inner - trivial, stays sync"
+        ],
+        "public_api_impact": [
+          "trait ADBDeviceExt: all 16 public methods become async, trait object signature changes from &mut dyn ADBDeviceExt to Pin<&mut dyn ADBDeviceExt> if using AsyncRead/AsyncWrite traits; consumers must use dyn dispatch or concrete types, boxed() method signature changes",
+          "trait ADBMessageTransport: read_message_with_timeout, write_message_with_timeout, read_message, write_message all become async; consumers of ADBMessageDevice<T> must await these",
+          "trait ADBTransport: connect, disconnect become async; all implementors (TcpTransport, USBTransport) must impl async versions",
+          "struct ADBMessageDevice<T>: new() can no longer call connect() in constructor (blocking); must add async fn new_async() or separate init step; open_session, end_transaction methods become async",
+          "struct ADBSessionStream<T>: Read/Write impls become AsyncRead/AsyncWrite with Pin<&mut self>; users must use tokio::io adapters",
+          "struct ADBTcpDevice, ADBUSBDevice: wrappers remain, but impl ADBDeviceExt methods all become async",
+          "boxed() method on ADBDeviceExt: signature becomes fn boxed(self) -> Pin<Box<dyn ADBDeviceExt>> if using AFIT with async traits; existing code like device.boxed() breaks",
+          "pub use in lib.rs: ADBDeviceExt, ADBMessageDevice, ADBMessageTransport remain public, but with async signatures",
+          "Users calling shell(), exec(), pull(), push(), shell_command(), etc. must add .await and move calls into async context"
+        ],
+        "risks": [
+          "Dyn trait object dispatch explosion: ADBDeviceExt is trait object-friendly (boxed() helper in code), but async fn in traits + dyn pointers require either AFIT with Pin<Box<>> or #[async_trait] macro (which allocates per call). AFIT is correct here but new for consumers.",
+          "Constructor blocking: ADBMessageDevice::new() calls self.connect() synchronously; must break into new() returning incomplete struct + async connect(), OR add separate new_async() factory + deprecate new(). Breaking change either way.",
+          "Read/Write trait replacement: shell(), exec(), pull(), push() take &mut dyn Read / Box<dyn Write + Send>; these are NOT async-compatible traits. Must decide: (1) add AsyncRead/AsyncWrite overloads, (2) break API and require AsyncRead/AsyncWrite, (3) wrap sync adapters (expensive). High friction.",
+          "Timeout semantics: current read_message_with_timeout(Duration) becomes async; caller must use tokio::time::timeout() or create Duration-aware select!. Existing Duration API stays same but semantics change (no longer blocking).",
+          "USB transport blocking: nusb::transfer_blocking() is inherently blocking; must either (1) wrap in tokio::task::block_in_place() (risks starving runtime), (2) wait for nusb async API, (3) spawn std::thread for USB (adds complexity). USBTransport becomes async but internally still blocks.",
+          "Mutex contention: TcpTransport wraps CurrentConnection in Arc<Mutex<>>; under async this becomes tokio::sync::Mutex, requiring .lock().await everywhere. If caller is multi-threaded reader/writer (current design), contention increases; must verify rwlock patterns.",
+          "TCP TLS handshake: upgrade_connection() performs TLS with rusb ClientConnection, needs tokio-rustls or alternative async TLS. Adds new dependency.",
+          "Boxed trait object consumers: any code doing device.boxed() gets Pin<Box<>> under AFIT; must update or use type erasure wrapper.",
+          "Consumer code: all call sites calling shell_command(), pull(), etc. must be in async context. If library is used from sync code, need bridge (e.g., tokio::runtime::Handle::block_on or thread-local runtime).",
+          "Session lifetime: ADBSession drop impl does non-blocking read with short timeout to discard trailing CLSE; async version still must run during drop (use tokio::spawn + detach, or require explicit close before drop).",
+          "Framebuffer feature: framebuffer_inner() calls pull/push internally; becomes async, all framebuffer methods become async.",
+          "Error handling: RustADBError::IOError wraps std::io::Error; must map tokio I/O errors (which may differ) correctly.",
+          "Concrete type proliferation: static generics over T: ADBMessageTransport stay generic, but async trait methods can't use default impls easily; macros like #[async_trait] become tempting but defeat AFIT goals."
+        ],
+        "open_questions": [
+          "Will consumers use AFIT async traits directly, or prefer #[async_trait] despite cost? This determines boxed() and dyn dispatch ergonomics.",
+          "Should Read/Write parameters in shell(), exec(), pull(), push() be replaced with AsyncRead/AsyncWrite (breaking), or should async + sync overloads coexist (complex)?",
+          "How to handle ADBMessageDevice::new() which calls connect() in constructor? New factory pattern, Builder, or separate init step?",
+          "Does USB code require nusb async API upgrade, or is block_in_place() acceptable for non-critical path?",
+          "Should ADBSessionStream<T> implement AsyncRead/AsyncWrite, or be removed in favor of direct transport usage?",
+          "Multi-threaded reader/writer concurrency: is tokio::sync::RwLock better than Mutex for TcpTransport.current_connection?",
+          "What runtime(s) to support: tokio only, or also async-std or embassy? Affects timeout helpers and task spawning.",
+          "Should ADBTcpDevice/ADBUSBDevice stay in public API or be examples, letting users implement wrappers?",
+          "Deprecation path: how long to support sync API alongside async before removal?"
+        ],
+        "_key": "traits-api",
+        "_label": "public traits + ADBDeviceExt染色 surface"
+      },
+      {
+        "area": "TCP Server Path (Server-Side ADB)",
+        "summary": "The TCP server path (adb_server.rs, tcp_server_transport.rs, adb_server_device*.rs) is a sync-only, lightweight client that connects TO an external ADB server over TCP. It uses std::net::TcpStream for I/O and spawns one std::thread per bidirectional session (shell/exec). The server path and USB/message-device paths are architecturally independent: server talks to external adb-server via messages, while USB/TCP message devices implement the full ADB protocol locally. Both currently use std::thread spawning for session multiplexing but do NOT share code or state.",
+        "blocking_points": [
+          {
+            "location": "adb_client/src/server/tcp_server_transport.rs:170",
+            "construct": "std::net::TcpStream::connect()",
+            "async_target": "tokio::net::TcpStream::connect()",
+            "risk": "low"
+          },
+          {
+            "location": "adb_client/src/server/tcp_server_transport.rs:98, 122, 131, 145",
+            "construct": "TcpStream::read_exact(), read(), write_all(), shutdown()",
+            "async_target": "AsyncReadExt::read_exact(), tokio::io::{AsyncReadExt, AsyncWriteExt}, AsyncWriteExt::write_all(), shutdown()",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/server_device/adb_server_device_commands.rs:284",
+            "construct": "std::thread::spawn() relay with try_clone() TcpStream clones",
+            "async_target": "tokio::spawn() with Arc<RwLock<TcpStream>> or split stream halves; replace try_clone() with tokio split/reunite",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/server_device/adb_server_device_commands.rs:279-281",
+            "construct": "TcpStream::try_clone() for bidirectional multiplexing",
+            "async_target": "tokio::io::split() to get (AsyncReadHalf, AsyncWriteHalf); no try_clone() equivalent needed",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/message_devices/tcp/tcp_transport.rs:29",
+            "construct": "rustls::StreamOwned<ClientConnection, TcpStream> for TLS",
+            "async_target": "tokio_rustls::client::TlsStream<tokio::net::TcpStream>",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/message_devices/tcp/tcp_transport.rs:35-46",
+            "construct": "Explicit Arc<Mutex<CurrentConnection>> with lock() calls blocking in async context",
+            "async_target": "tokio::sync::RwLock or Mutex; replace .lock()? errors with await semantics",
+            "risk": "high"
+          }
+        ],
+        "sans_io_assets": [
+          "adb_client/src/models/: Protocol models, command enums (ADBCommand, ADBLocalCommand, etc.) — zero I/O, pure enums and serialization",
+          "adb_client/src/server/models/: ADB server response models (devices list, feature parsing)",
+          "adb_client/src/adb_transport.rs: Trait definition (connect/disconnect) — can remain sync or add async counterpart without breaking logic",
+          "adb_client/src/error.rs: Error types and conversions — completely pure",
+          "adb_client/src/utils.rs: Utility functions (key encoding, hex parsing, etc.)",
+          "adb_client/src/message_devices/adb_transport_message.rs: Message header layout, CRC32, serialization — zero I/O",
+          "adb_client/src/message_devices/usb/flow_control.rs: Flow control constants and serialization — zero I/O, reusable in async",
+          "classify_message() in adb_client/src/message_devices/usb/persistent.rs:79: Pure routing decision logic, candidate for test suite carve-out"
+        ],
+        "public_api_impact": [
+          "ADBTransport::connect(&mut self) → Result<()>: Adding async variant (e.g., connect_async()) is non-breaking; keeping sync allows dual-stack during transition",
+          "ADBTransport::disconnect(&mut self) → Result<()>: Same; low risk to add async_disconnect()",
+          "ADBServer::connect(&mut self) → Result<&mut TCPServerTransport>: Returns mutable ref to transport — becomes connect_async(&mut self) → Result<&mut TCPServerTransport> with async semantics",
+          "TCPServerTransport::send_adb_request(&self, cmd) / read_adb_response(&self): Currently take &self but internally use &TcpStream; becoming async will require &mut self or interior mutability",
+          "ADBServerDevice::shell/exec/bidirectional_session spawn threads — signatures must accept async args or return owned futures; or introduce async wrapper (e.g., shell_async)",
+          "Error type Result<T> = std::result::Result<T, RustADBError> — compatible with async/await, no change needed"
+        ],
+        "risks": [
+          "Thread spawning in bidirectional_session (line 284): try_clone() + std::thread::spawn creates TWO clones per session. Async version must NOT clone the stream; use split() to partition r/w halves, each spawned as tokio::spawn task. Risk: incorrect stream ownership or double-cleanup.",
+          "Mutable stream access pattern: TCPServerTransport::send_adb_request takes &self but calls read_exact/write_all on &self. Async version needs &mut or Arc<Mutex<>>. If Mutex is used, lock contention on every message.",
+          "Arc<Mutex<CurrentConnection>> in message_devices/tcp/tcp_transport.rs already wraps sync I/O; async ifying this will expose blocking mutex in tokio::spawn context — MUST switch to tokio::sync::Mutex or redesign.",
+          "TLS via rustls (sync StreamOwned<ClientConnection, TcpStream>): rustls is NOT async-aware. Must use tokio-rustls fork or manually manage handshake + read/write loops.",
+          "Trait object dyn Write + Send (shell output writers, exec reader/writer): Async Write is not object-safe the same way; writers callback pattern breaks with async. Mitigation: pass futures or use tokio channels instead.",
+          "Session lifetime: Spawned std::thread + try_clone outlives the original connection. Async tasks must NOT hold references into TCPServerTransport; use message channels or owned buffers."
+        ],
+        "open_questions": [
+          "Should the server path become fully async, or remain sync-only with an async wrapper layer? (Cost-benefit if adb-server is external and 'already fast' over TCP.)",
+          "Will async::Runtime be available at the call site (i.e., is the consumer already in tokio context)? If not, entry point needs block_on() or spawn a runtime.",
+          "For TcpServerTransport::send_adb_request(&self), should interior mutability use tokio::sync::Mutex (requires async context for lock) or parking_lot::Mutex (sync, can deadlock if misused)?",
+          "bidirectional_session currently returns Result<()> after spawning a thread. Async version should return a JoinHandle or future. Should callers await it?",
+          "TLS: Use tokio-rustls (mature, Tokio-endorsed) or create manual read/write loops around rustls::StreamOwned? tokio-rustls requires TcpStream → tokio::net::TcpStream refactor first.",
+          "Are there consumers of ADBServerDevice outside the adb_client crate (e.g., pyadb_client, adb_cli)? If so, must either dual-stack (sync + async methods) or mark as breaking change."
+        ],
+        "_key": "server-tcp",
+        "_label": "server + server_device TCP smartsocket path (future adb-server capability)"
+      },
+      {
+        "area": "Consumer Crate Breakage Analysis for adb_client Async Migration",
+        "summary": "Three consumer crates depend on adb_client: adb_cli (synchronous binary using ADBDeviceExt trait), pyadb_client (PyO3 bindings exposing sync methods), and examples/mdns (synchronous discovery example). Migration to async requires wrapping async methods in block_on calls in consumers, with pyadb_client facing runtime-ownership complexity since PyO3 methods are inherently sync.",
+        "blocking_points": [
+          {
+            "location": "adb_cli/src/main.rs:33-112",
+            "construct": "run_command() trait object of dyn ADBDeviceExt with 14 call sites",
+            "async_target": "async fn run_command(mut device: Box<dyn ADBDeviceExt>, command: DeviceCommands) with block_on wrapper in main()",
+            "risk": "high"
+          },
+          {
+            "location": "adb_cli/src/main.rs:43,48,51,59,63,67,76,80,84,88,93,97,100,104",
+            "construct": "device.shell(), device.shell_command(), device.pull(), device.stat(), device.stat_extended(), device.reboot(), device.push(), device.root(), device.run_activity(), device.install(), device.uninstall(), device.framebuffer(), device.list()",
+            "async_target": "all become async, require await or block_on at each call site (13 total call sites in run_command)",
+            "risk": "high"
+          },
+          {
+            "location": "adb_cli/src/handlers/host_commands.rs:9-88",
+            "construct": "adb_server object with 13 call sites: version(), kill(), devices(), devices_long(), track_devices(), pair(), connect_device(), disconnect_device(), mdns_check(), server_status(), mdns_services(), wait_for_device()",
+            "async_target": "async fn handle_host_commands() with block_on wrapper in main()",
+            "risk": "high"
+          },
+          {
+            "location": "adb_cli/src/handlers/local_commands.rs:7-42",
+            "construct": "device.host_features(), device.get_logs(), device.forward_remove_all(), device.forward_remove(), device.forward(), device.reverse_remove_all(), device.reverse_remove(), device.reverse()",
+            "async_target": "async fn handle_local_commands() with block_on wrapper",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_cli/src/handlers/emulator_commands.rs:6-34",
+            "construct": "emulator object with 5 call sites: send_sms(), rotate(), avd_discovery_path(), avd_grpc_port(), send_raw_command()",
+            "async_target": "async fn handle_emulator_commands() with block_on wrapper",
+            "risk": "medium"
+          },
+          {
+            "location": "pyadb_client/src/adb_server_device.rs:23-62",
+            "construct": "PyO3 pymethods wrapping ADBDeviceExt: shell_command(), push(), pull(), install(), uninstall(), root() (6 methods)",
+            "async_target": "Requires Tokio runtime owned by PyO3 module; each method must call tokio::task::block_in_place or spawn_blocking",
+            "risk": "high"
+          },
+          {
+            "location": "pyadb_client/src/adb_usb_device.rs:16-107",
+            "construct": "PyO3 pymethods wrapping ADBUSBDevice: autodetect(), autodetect_with_custom_private_key(), new(), new_with_custom_private_key(), vendor_id(), product_id(), shell_command(), push(), pull(), install(), uninstall(), root() (12 methods)",
+            "async_target": "Requires same runtime pattern; 6 async device methods, 4 constructors (probably sync-safe once transport is ready)",
+            "risk": "high"
+          },
+          {
+            "location": "pyadb_client/src/adb_tcp_device.rs:16-71",
+            "construct": "PyO3 pymethods wrapping ADBTcpDevice: new(), new_with_custom_private_key(), shell_command(), push(), pull(), install(), uninstall(), root() (8 methods)",
+            "async_target": "Same runtime pattern; 6 async device methods + 2 constructors",
+            "risk": "high"
+          },
+          {
+            "location": "pyadb_client/src/adb_server.rs:20-56",
+            "construct": "PyO3 pymethods wrapping ADBServer: devices(), get_device(), get_device_by_name(), connect_device(), disconnect_device() (5 methods)",
+            "async_target": "All 5 methods are currently sync host-side operations; low risk if server protocol stays sync",
+            "risk": "low"
+          },
+          {
+            "location": "adb_client/src/message_devices/tcp/tcp_transport.rs:20,29",
+            "construct": "TcpStream (std::net), StreamOwned<ClientConnection, TcpStream> (rustls); blocking Read/Write impls at lines 52-74",
+            "async_target": "tokio::net::TcpStream with async read/write, tokio-rustls or similar",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/usb_transport.rs:73,106,115",
+            "construct": "nusb::list_devices().wait(), Mutex lock guards, transfer_blocking calls implicit in nusb backend",
+            "async_target": "nusb provides MaybeFuture; must migrate to async-aware USB handling or use tokio::task::spawn_blocking for transfer_blocking",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/server/tcp_server_transport.rs:74,117,170",
+            "construct": "TcpStream in TCPServerTransport; blocking connect() at line 170, read_exact() at line 65",
+            "async_target": "tokio::net::TcpStream, async connect, async read_exact",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/adb_session.rs:55,56,70,72,90,106,117,135,150,198,212",
+            "construct": "transport.read_message(), transport.write_message() called in tight session loop (11 call sites)",
+            "async_target": "async read_message(), async write_message() with await in async session management",
+            "risk": "high"
+          }
+        ],
+        "sans_io_assets": [
+          "adb_client/src/models/* (all serialization/deserialization logic, error types, enums)",
+          "adb_client/src/error.rs (error definitions and conversions)",
+          "adb_client/src/adb_device_ext.rs trait definition (structure only; method bodies will become async)",
+          "pyadb_client/src/models/devices.rs (PyDeviceShort data wrappers)",
+          "adb_cli/src/models/* (CLI argument parsing, enums, CLI error types)",
+          "adb_cli/src/utils.rs (logger setup, version formatting)",
+          "adb_cli/src/adb_termios.rs (terminal I/O state management; uses std::io interfaces, not network blocking)"
+        ],
+        "public_api_impact": [
+          "ADBDeviceExt trait: all 14 core methods (shell_command, shell, exec, stat, stat_extended, pull, push, list, reboot, remount, root, run_activity, install, uninstall, enable_verity, disable_verity, framebuffer, framebuffer_inner, framebuffer_bytes) become async (return impl Future or dyn Future)",
+          "ADBServer: 8+ methods become async (devices, get_device, get_device_by_name, connect_device, disconnect_device, version, kill, track_devices, pair, wait_for_device, mdns_check, server_status, mdns_services) — propagates to adb_cli consumers",
+          "ADBServerDevice: all methods behind ADBDeviceExt become async (inherited from trait); also host_features, get_logs, forward*, reverse* methods",
+          "ADBUSBDevice: all impl ADBDeviceExt methods become async; constructors new(), autodetect() likely sync-safe",
+          "ADBTcpDevice: all impl ADBDeviceExt methods become async; constructors new() likely sync-safe",
+          "ADBEmulatorDevice: send_sms, rotate, avd_discovery_path, avd_grpc_port, send_raw_command become async",
+          "MDNSDiscoveryService: start() likely becomes async or requires runtime management",
+          "All consumer binary (adb_cli, examples) entry points must become async or use block_on wrapper at main boundary"
+        ],
+        "risks": [
+          "CRITICAL — pyadb_client Runtime Ownership: PyO3 pymethods are inherently sync and cannot mark themselves as async. Wrapping async Rust code requires either: (1) a module-level lazy_static Tokio runtime + block_in_place per method, (2) spawning a thread-local runtime clone per GIL-releasing block, or (3) pre-allocating a fixed thread pool. None are ergonomic; all risk deadlock if Python calls back into Rust while blocked.",
+          "CRITICAL — PyO3 GIL + async/await interaction: block_on() inside pymethods holding the GIL will deadlock if the future tries to spawn_blocking or re-enter Python. Solution requires releasing GIL before block_on, then re-acquiring after — adds complexity to each of 6 async device methods × 3 device classes = 18 binding points.",
+          "HIGH — adb_cli main() is synchronous (no async runtime): all 6 command handlers + run_command must either become async (restructure main to tokio::main) or use block_on wrapper; affects control flow significantly.",
+          "HIGH — Trait object boxed ADBDeviceExt cannot be naturally async in stable Rust < 1.75 (return_position_impl_trait_in_trait requires nightly). Consumers using Box<dyn ADBDeviceExt> will need either Box<dyn Future + Send> return types, trait object redesign, or async_trait macro (adds indirection).",
+          "HIGH — TCP/TLS transport (tcp_transport.rs): StreamOwned<ClientConnection, TcpStream> uses rustls which requires std::io::Read/Write; must migrate to tokio-rustls for async compatibility, changing handshake flow.",
+          "MEDIUM — nusb USB transport (usb_transport.rs): nusb provides MaybeFuture but integration is non-standard; current Mutex-locked endpoints + transfer_blocking must move to async-aware endpoint guards or spawn_blocking wrapper; impacts low-latency shell/sync streams.",
+          "MEDIUM — Server-side (adb_server.rs, tcp_server_transport.rs) still uses std::net TcpStream; must migrate to tokio or async-std, affecting host commands that adb_cli depends on.",
+          "MEDIUM — Backward compatibility: existing adb_cli users, scripts, and pyadb_client Python callers will break if signatures change. Consider providing a sync shim crate or async_trait wrapper for backward compat.",
+          "MEDIUM — Emulator transport (tcp_emulator_transport.rs) also has blocking TcpStream; must follow same async migration path.",
+          "LOW — examples/mdns: only one example; uses sync discovery API, easily converted to async or wrapped with block_on.",
+          "LOW — Data model serialization (models/) is pure logic, but any custom Read/Write trait impls must be checked for async compatibility."
+        ],
+        "open_questions": [
+          "Will pyadb_client runtime be a module-level lazy_static(tokio::runtime::Runtime)? How will you handle multiple Python threads calling into Rust async code simultaneously? (Consider: tokio spawn_blocking, thread-local runtimes, or dedicated executor thread.)",
+          "Should adb_cli main() become async (tokio::main) or keep sync + use block_on? Affects ergonomics of error handling and command dispatch.",
+          "Will you support async_trait or return_position_impl_trait_in_trait for ADBDeviceExt, or redesign the trait entirely? Impacts all three consumers.",
+          "Should server-side (ADBServer / tcp_server_transport) also migrate to async tokio, or stay sync-blocking? Server and device transports are tightly coupled; recommend same choice for both.",
+          "How will you handle graceful shutdown of async transports (especially USB persistent connection)? Current Mutex-locked endpoints need coordinated cleanup.",
+          "Will you provide a sync compatibility wrapper (async_std::task::block_on) in adb_client for users who want to opt-out of async migration, or force all consumers forward?",
+          "For PyO3, will you expose a block_on helper function to Python callers, or hide the async nature entirely with a dedicated executor thread?",
+          "Does pyadb_client need to support concurrent operations from multiple Python threads, or is single-threaded (GIL) operation acceptable? This changes the runtime strategy significantly."
+        ],
+        "_key": "consumers",
+        "_label": "consumers: adb_cli, pyadb_client, examples"
+      },
+      {
+        "area": "async/await migration for adboost USB + TCP transports (adb_client library)",
+        "summary": "The adboost project is a pure-Rust ADB client library (edition 2024, MSRV 1.88) with dual TCP and USB transports for Android device communication. It recently migrated from rusb to nusb (v0.2.3) with explicit blocking semantics (transfer_blocking + timeout polling) and a sync multithreaded reader-demux architecture. The codebase currently has zero async/tokio usage but has blocking points across: TCP TcpStream Read/Write, USB transfer_blocking with manual timeouts, mpsc::sync_channel blocking recvs/sends in flow-control paths, and std::thread-based background reader loops with mutexes.",
+        "blocking_points": [
+          {
+            "location": "adb_client/src/server/tcp_server_transport.rs:165-177",
+            "construct": "TcpStream::connect() + tcp_stream.read_exact()",
+            "async_target": "tokio::net::TcpStream + AsyncReadExt (via tokio-util)",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:211-226",
+            "construct": "thread::spawn (reader loop) with blocking reads + std::sync::mpsc::sync_channel",
+            "async_target": "tokio::spawn + bounded mpsc channels (tokio::sync::mpsc::channel or bounded) + AsyncRead loop",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:1154",
+            "construct": "ack_rx.recv_timeout(Duration::from_secs(10)) in windowed_write (blocking on flow control)",
+            "async_target": "tokio::time::timeout + async recv on tokio::sync channels",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:1192",
+            "construct": "ack_rx.recv_timeout() in classic stop-and-wait flow control (strictly blocking per protocol)",
+            "async_target": "tokio::time::timeout + async recv",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/usb_transport.rs:193, 203, 364",
+            "construct": "nusb endpoint.transfer_blocking() with Duration timeout (polling loop in reader_loop)",
+            "async_target": "nusb::MaybeFuture::wait() → convert to .await or use tokio-util AsyncRead wrapper",
+            "risk": "high"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:228",
+            "construct": "Arc<Mutex<USBTransport>> writer mutex in send path + lock_writer()",
+            "async_target": "tokio::sync::Mutex (shared, not owned per session)",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:355-356, 660-661, 708-709",
+            "construct": "self.writer.lock()? in open_session, do_auth, send_raw, write half impl",
+            "async_target": "async writer.lock().await",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:1262-1287",
+            "construct": "impl Read for SessionReadHalf (read_buf refilling via data_rx.recv())",
+            "async_target": "impl AsyncRead for SessionReadHalf (use AsyncRead::read_buf or manual poll_read)",
+            "risk": "medium"
+          },
+          {
+            "location": "adb_client/src/message_devices/usb/persistent.rs:1287-1310",
+            "construct": "impl Write for SessionWriteHalf (windowed_write + recv_timeout on ack_rx)",
+            "async_target": "impl AsyncWrite for SessionWriteHalf (use AsyncWrite poll_write or manual poll)",
+            "risk": "medium"
+          }
+        ],
+        "sans_io_assets": [
+          "adb_client/src/message_devices/usb/persistent.rs:79-100 (classify_message function) — pure router logic, unit-tested without I/O, survives async",
+          "adb_client/src/message_devices/usb/persistent.rs:1128-1209 (windowed_write logic) — stateless flow-control logic; refactor into state machine that returns next action (Send/Block/Error) instead of doing I/O directly",
+          "adb_client/src/message_devices/usb/shell_v2_session.rs:85+ (decode_frame_header + test helpers) — pure I/O-free frame parser; survives untouched",
+          "adb_client/src/message_devices/usb/persistent.rs:1211-1230 (drain_acks pure check loop) — can be extracted as pure iterator/collector",
+          "adb_client/src/message_devices/adb_message_transport.rs (protocol message encode/decode) — pure serialization, no I/O coupling",
+          "adb_client/src/error.rs — RustADBError enum (add tokio::task::JoinError variant for task panics if spawning async tasks)"
+        ],
+        "public_api_impact": [
+          "PersistentUsbConnection::new() → async fn new()",
+          "PersistentUsbConnection::open_session() → async fn open_session() → impl Future<Output=Result<MultiplexedSession>>",
+          "MultiplexedSession (currently impl Read + Write) → must become impl AsyncRead + AsyncWrite (breaking; can co-exist if feature-gated)",
+          "MultiplexedSession::into_split() → impl stays sync but returns async-capable halves (SessionReadHalf, SessionWriteHalf become async)",
+          "SessionReadHalf: impl Read → impl AsyncRead",
+          "SessionWriteHalf: impl Write → impl AsyncWrite",
+          "TCPServerTransport::connect() → async fn connect()",
+          "TCPServerTransport::send_adb_request() → async fn send_adb_request()",
+          "ADBTransport trait connect/disconnect → async fn connect(), fn disconnect() (or both async for consistency)",
+          "ADBServerDevice methods that call transport → likely become async (deep propagation to public Server APIs)",
+          "USBTransport::read_message_with_timeout() → async fn read_message_with_timeout()",
+          "USBTransport::write_message() → async fn write_message()"
+        ],
+        "risks": [
+          "DEEP PROPAGATION: If PersistentUsbConnection async becomes mandatory, callers (PersistentUsbConnection::new, ADBMessageDevice, server layer) all become async; colors the entire public API. Feature-gating async-only path (vs co-existing sync) is the key design decision.",
+          "BLOCKING READER THREAD ELIMINATION: Current design spawns std::thread with mpsc::sync_channel; tokio replaces this with tokio::spawn + tokio::sync channels + select! on multiple event sources. Requires rearchitecting demux loop from imperative (match decision) to async/await (tokio::select! on multiple Receivers).",
+          "FLOW CONTROL BLOCKING SEMANTICS: windowed_write does recv_timeout(10s) when window exhausted; translates to tokio::time::timeout but requires careful error mapping (timeout → io::ErrorKind::TimedOut, Disconnected → io::ErrorKind::BrokenPipe).",
+          "NUSB + TOKIO MISMATCH: nusb::MaybeFuture is not tokio-native; transfer_blocking is sync-only. Two paths: (1) spawn_blocking each transfer (thread-pool overhead per read/write), or (2) wrap nusb in AsyncRead adapter using tokio::io::UnixStream-like pattern (complex, requires custom poll_read impl).",
+          "SYNC CALLERS: If async becomes mandatory, sync callsites (adb_cli, examples, pyadb_client) must use tokio::runtime::Runtime or become async-first; major breaking change.",
+          "FEATURE-GATE COMPLEXITY: 'async' feature introduces two code paths (sync + async), increasing test burden (must test both). Feature interaction with 'usb'/'mdns' complicates CI.",
+          "ERROR HANDLING: tokio::task::JoinError (task panic) + timeout errors need integration into RustADBError enum; adds new failure modes (executor shutdown, task cancellation).",
+          "MPSC SEMANTICS: std::sync::mpsc drops on overflow with try_send; tokio::sync::mpsc does NOT drop (unbounded default) or uses bounded semantics; must verify reader loop backpressure policy survives.",
+          "CANCELLATION: AsyncRead/Write traits don't support cancellation tokens; session cleanup on drop becomes tricky if a poll_read is in-flight; requires careful shutdown choreography or async-drop (nightly).",
+          "TLS UPGRADE PATH: TCPServerTransport upgrades TCP→TLS via rustls; must remain compatible with either async (tokio-rustls) or stay sync (rustls native blocking); TLS handshake must not block other sessions."
+        ],
+        "open_questions": [
+          "FEATURE-GATE DESIGN: Should async live behind a dedicated 'async' feature (coexisting with sync code) or replace sync entirely? Coexistence = dual codepaths (higher test burden); replacement = breaking change but cleaner. Given MSRV 1.88 + edition 2024 (AFIT support), replacement is viable.",
+          "NUSB INTEGRATION: Is tokio::io::UnixStream-based AsyncRead wrapper for nusb transfers acceptable, or should transfer_blocking be wrapped in spawn_blocking (simpler, some overhead)? Tokio docs recommend spawn_blocking for sync I/O.",
+          "EXECUTOR REQUIREMENT: Should adb_client mandate tokio as a dependency (current design is executor-agnostic), or use a trait-based abstraction (local_executor pattern)? Tokio dependency = simpler, stronger ecosystem coupling.",
+          "READER THREAD ARCHITECTURE: Replace std::thread + mpsc with tokio::spawn in a background task loop, or make demuxing part of a futures-based event loop? Background task keeps module boundaries cleaner.",
+          "SYNC CALLER STORY: How should sync callers (adb_cli binary, pyadb_client) adapt? Provide a blocking wrapper (tokio::task::block_on), or require them to become async-first? Block-on adds overhead.",
+          "FLOW CONTROL BLOCKING: Should windowed_write's recv_timeout block the tokio task (acceptable if isolated), or should it fail fast with a user-configurable timeout? Current 10s hardcoded timeout is not ideal for embedded/timeout-sensitive apps.",
+          "SESSION CLEANUP ON CANCELLATION: If a tokio task reading from SessionReadHalf is cancelled mid-poll_read, how should session cleanup (CLSE message) be triggered? Standard Drop works but requires careful executor state management.",
+          "PUBLIC API COMPATIBILITY: Should Read/Write impls be kept as a compat layer wrapping AsyncRead/AsyncWrite (e.g., with adapter types), or fully replaced? Compat = easier migration, but adds code duplication."
+        ],
+        "_key": "deps-build",
+        "_label": "dependency + feature-gate + build landscape"
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/06-09-adboost-tokio-async-usb-tcp-server/research/async-rewrite-blueprint.md", "reason": "核心实现蓝图：sans-io 冻结清单、nusb 0.2.3 真实 API、writer-task 模型、teardown、取消安全、染色范围、阻塞点 file:line、依赖、测试策略"}
+{"file": ".trellis/tasks/06-09-adboost-tokio-async-usb-tcp-server/prd.md", "reason": "全部 P0/P1 设计决策（ADR-lite）+ 范围边界 + 验收标准"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError thiserror 模式 + #[from] 约定；新增 JoinError/timeout 变体需遵循"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic、MSRV 1.88、feature gate、测试风格、质量门"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "模块布局、mod.rs 约定、models/commands 拆分、device trait 分层——重构时保持一致"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "log facade 级别约定；reader 背压丢弃用 log::warn"}
+{"file": ".trellis/tasks/06-09-adboost-tokio-async-usb-tcp-server/research/recon-report.json", "reason": "完整阻塞点清单/染色表/风险（蓝图的详尽数据源，按需查阅）"}
