@@ -1,0 +1,44 @@
+adboost
+Copyright 2024-2026 The adboost Authors
+
+This product includes software developed as a fork of the "adb_client" project:
+
+    adb_client — Android Debug Bridge (ADB) client implementation in pure Rust
+    https://github.com/cocool97/adb_client
+    Copyright (c) 2023-2024 Corentin LIAUD
+
+adboost is forked from adb_client at tag v3.2.2. We are deeply grateful to
+Corentin LIAUD and all upstream contributors for their excellent work, which
+forms the foundation of this project.
+
+The original adb_client code is licensed under the MIT License (reproduced in
+full below). Modifications and new contributions made in adboost — including the
+migration from `rusb` to `nusb` and additional features — are licensed under the
+Apache License, Version 2.0 (see the LICENSE file). The combined work is
+therefore distributed under the terms "Apache-2.0 AND MIT".
+
+-------------------------------------------------------------------------------
+Original adb_client license (MIT), reproduced verbatim as required by its terms:
+-------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2023-2024 Corentin LIAUD
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

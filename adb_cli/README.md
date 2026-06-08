@@ -1,6 +1,6 @@
 # `adb_cli`
 
-[![MIT licensed](https://img.shields.io/crates/l/adb_cli.svg)](./LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../NOTICE)
 ![Crates.io Total Downloads](https://img.shields.io/crates/d/adb_cli)
 ![MSRV](https://img.shields.io/crates/msrv/adb_cli)
 

@@ -1,70 +1,70 @@
-<p align="center" style="text-align: center">
-  <img src="assets/logo.png" width="33%">
-</p>
+# adboost
 
-<p align="center">
-    <p align="center">Android Debug Bridge (ADB) client implementation in pure Rust !</p>
-    <p align="center">
-        <a href="https://crates.io/crates/adb_client">
-            <img alt="crates.io" src="https://img.shields.io/crates/v/adb_client.svg"/>
-        </a>
-        <a href="https://crates.io/crates/adb_client">
-            <img alt="msrv" src="https://img.shields.io/crates/msrv/adb_client"/>
-        </a>
-        <a href="https://github.com/cocool97/adb_client/actions">
-            <img alt="ci status" src="https://github.com/cocool97/adb_client/actions/workflows/rust-build-matrix.yml/badge.svg"/>
-        </a>
-        <a href="https://deps.rs/repo/github/cocool97/adb_client">
-            <img alt="dependency status" src="https://deps.rs/repo/github/cocool97/adb_client/status.svg"/>
-        </a>
-        <a href="https://opensource.org/licenses/MIT">
-            <img alt="dependency status" src="https://img.shields.io/badge/License-MIT-yellow.svg"/>
-        </a>
-    </p>
-</p>
+> **A courteous fork of [`adb_client`](https://github.com/cocool97/adb_client).**
+> Android Debug Bridge (ADB) client implementation in pure Rust.
 
-Main features of this library:
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- Full Rust, don't use `adb *` shell commands to interact with devices
-- Supports
-  - Using ADB server as a proxy (standard behavior when using `adb` CLI)
-  - Connecting directly to end devices (without using adb-server)
-    - Over **USB**
-    - Over **TCP/IP**
-- Implements hidden `adb` features, like `framebuffer`
-- Highly configurable
-- Provides wrappers to use directly from Python code
-- Easy to use !
+---
 
-## adb_client
+> ⚠️ **Work in progress.** This README is an interim placeholder. Detailed
+> features, installation, and usage documentation are coming soon — see the
+> [TODO](#todo) below.
 
-Rust library implementing both ADB protocols (server and end-devices) and providing a high-level abstraction over the many supported commands.
+## About this fork
 
-Improved documentation available [here](./adb_client/README.md).
+**adboost** is forked from [`adb_client`](https://github.com/cocool97/adb_client)
+at tag **v3.2.2**. It builds on that excellent foundation while evolving in a few
+directions of its own:
 
-## examples
+- **USB backend migrated from `rusb` to [`nusb`](https://github.com/kevinmehall/nusb)**
+  — a pure-Rust, async-friendly USB stack with no libusb C dependency.
+- Additional capabilities under active development (e.g. persistent-connection
+  server features).
 
-Some examples showing of to use this library are available in the `examples` directory:
+A larger refactor is planned, after which unneeded surface area will be trimmed
+down.
 
-- `examples/mdns`: mDNS device discovery
-- `examples/python_api`: demonstrates the use of Python API
+## 🙏 Acknowledgements
 
-## adb_cli
+This project would not exist without the original
+[**adb_client**](https://github.com/cocool97/adb_client) by **Corentin LIAUD**
+and its contributors. We are sincerely grateful for the high-quality, pure-Rust
+ADB implementation that adboost is built upon. Please consider starring and
+supporting the upstream project.
 
-Rust binary providing an improved version of Google's official `adb` CLI, by using `adb_client` library.
-Provides a "real-world" usage example of this library.
-
-Improved documentation available [here](./adb_cli/README.md).
-
-## pyadb_client
-
-Python wrapper using `adb_client` library to export classes usable directly from a Python environment.
-
-Improved documentation available [here](./pyadb_client/README.md)
-
-## Related publications
+The original publications describing the ADB protocol internals remain excellent
+reading:
 
 - [Diving into ADB protocol internals (1/2)](https://www.synacktiv.com/publications/diving-into-adb-protocol-internals-12)
 - [Diving into ADB protocol internals (2/2)](https://www.synacktiv.com/publications/diving-into-adb-protocol-internals-22)
 
-Some features may still be missing, all pull requests are welcome !
+## License
+
+adboost is distributed under the terms of **`Apache-2.0 AND MIT`**:
+
+- The **original `adb_client` code** remains under its **MIT** license,
+  © 2023-2024 Corentin LIAUD. The full MIT text is preserved verbatim in
+  [`NOTICE`](./NOTICE), as required by that license.
+- **Modifications and new contributions** made in adboost are licensed under the
+  **Apache License, Version 2.0** — see [`LICENSE`](./LICENSE).
+
+See [`NOTICE`](./NOTICE) for the complete attribution and the upstream MIT text.
+
+## Workspace layout
+
+| Crate           | Description                                                        |
+| --------------- | ------------------------------------------------------------------ |
+| `adb_client`    | Core Rust library implementing the ADB server & device protocols.  |
+| `adb_cli`       | CLI binary built on top of the library.                            |
+| `pyadb_client`  | Python bindings exposing the library to Python.                    |
+| `examples/mdns` | Example: mDNS device discovery.                                    |
+
+## TODO
+
+- [ ] Document features (server proxy mode, direct USB/TCP device connections, framebuffer, …)
+- [ ] Installation instructions (library, CLI, Python package)
+- [ ] Usage examples
+- [ ] Document the new persistent-connection capabilities
+- [ ] Finalize naming/branding once the planned refactor lands

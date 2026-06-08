@@ -40,4 +40,4 @@ section = "utility"
 assets = [
     { source = "target/release/adb_cli", dest = "/usr/bin/adb_cli", mode = "755" },
 ]
-license = "MIT"
+license = "Apache-2.0 AND MIT"

@@ -3,12 +3,12 @@ members = ["adb_cli", "adb_client", "examples/mdns", "pyadb_client"]
 resolver = "2"
 
 [workspace.package]
-authors = ["Corentin LIAUD"]
+authors = ["Corentin LIAUD", "jdjingdian"]
 edition = "2024"
-homepage = "https://github.com/cocool97/adb_client"
+homepage = "https://github.com/magicdian/adboost"
 keywords = ["adb", "android", "tcp", "usb"]
-license = "MIT"
-repository = "https://github.com/cocool97/adb_client"
+license = "Apache-2.0 AND MIT"
+repository = "https://github.com/magicdian/adboost"
 version = "3.2.2"
 rust-version = "1.88.0"
 
