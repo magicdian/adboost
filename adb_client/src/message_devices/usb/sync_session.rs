@@ -19,7 +19,7 @@
 //! Only SYNC **v1** is implemented (STAT/LIST/SEND/RECV/DATA/DONE/OKAY/FAIL).
 //! SYNC v2 + compression (brotli/lz4/zstd) is intentionally out of scope.
 
-use std::io::{Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Result;
 use crate::RustADBError;
@@ -68,30 +68,37 @@ impl SyncSession {
     /// Returns [`RustADBError::IOError`] on a transport error,
     /// [`RustADBError::ADBRequestFailed`] if the device replies `FAIL` or an
     /// unexpected opcode.
-    pub fn push<R: Read>(&mut self, mut reader: R, remote_path: &str, mode: u32) -> Result<()> {
+    pub async fn push<R: AsyncRead + Unpin>(
+        &mut self,
+        mut reader: R,
+        remote_path: &str,
+        mode: u32,
+    ) -> Result<()> {
         let path_header = format!("{remote_path},{mode}");
-        self.write_request(MessageSubcommand::Send, path_header.as_bytes())?;
+        self.write_request(MessageSubcommand::Send, path_header.as_bytes())
+            .await?;
 
         let mut buffer = vec![0u8; SYNC_DATA_MAX];
         loop {
-            let read = reader.read(&mut buffer)?;
+            let read = reader.read(&mut buffer).await?;
             if read == 0 {
                 break;
             }
-            self.write_request(MessageSubcommand::Data, &buffer[..read])?;
+            self.write_request(MessageSubcommand::Data, &buffer[..read])
+                .await?;
         }
 
         // DONE carries the file mtime in its length field. We do not forward an
         // mtime (mirrors the non-persistent `push_file`); send 0.
-        self.write_frame_header(MessageSubcommand::Done, 0)?;
-        self.inner.flush()?;
+        self.write_frame_header(MessageSubcommand::Done, 0).await?;
+        self.inner.flush().await?;
 
         // Expect OKAY (success) or FAIL (with reason payload).
-        let (id, len) = self.read_frame_header()?;
+        let (id, len) = self.read_frame_header().await?;
         match SyncResponse::classify(id) {
             SyncResponse::Okay => Ok(()),
             SyncResponse::Fail => {
-                let reason = self.read_exact_string(len)?;
+                let reason = self.read_exact_string(len).await?;
                 Err(RustADBError::ADBRequestFailed(format!(
                     "sync push failed: {reason}"
                 )))
@@ -116,23 +123,28 @@ impl SyncSession {
     /// Returns [`RustADBError::IOError`] on a transport error or
     /// [`RustADBError::ADBRequestFailed`] if the device replies `FAIL` or an
     /// unexpected opcode.
-    pub fn pull<W: Write>(&mut self, remote_path: &str, mut writer: W) -> Result<()> {
-        self.write_request(MessageSubcommand::Recv, remote_path.as_bytes())?;
-        self.inner.flush()?;
+    pub async fn pull<W: AsyncWrite + Unpin>(
+        &mut self,
+        remote_path: &str,
+        mut writer: W,
+    ) -> Result<()> {
+        self.write_request(MessageSubcommand::Recv, remote_path.as_bytes())
+            .await?;
+        self.inner.flush().await?;
 
         let mut chunk = vec![0u8; SYNC_DATA_MAX];
         loop {
-            let (id, len) = self.read_frame_header()?;
+            let (id, len) = self.read_frame_header().await?;
             match SyncResponse::classify(id) {
                 SyncResponse::Done => return Ok(()),
                 SyncResponse::Fail => {
-                    let reason = self.read_exact_string(len)?;
+                    let reason = self.read_exact_string(len).await?;
                     return Err(RustADBError::ADBRequestFailed(format!(
                         "sync pull failed: {reason}"
                     )));
                 }
                 SyncResponse::Data => {
-                    self.copy_payload(len, &mut chunk, &mut writer)?;
+                    self.copy_payload(len, &mut chunk, &mut writer).await?;
                 }
                 SyncResponse::Okay | SyncResponse::Other => {
                     return Err(RustADBError::ADBRequestFailed(format!(
@@ -146,10 +158,11 @@ impl SyncSession {
 
     /// Write a SYNC request frame: header (`id` + LE length) followed by the
     /// `payload` bytes (the length field is the payload length).
-    fn write_request(&mut self, sub: MessageSubcommand, payload: &[u8]) -> Result<()> {
-        self.write_frame_header(sub, u32::try_from(payload.len())?)?;
+    async fn write_request(&mut self, sub: MessageSubcommand, payload: &[u8]) -> Result<()> {
+        self.write_frame_header(sub, u32::try_from(payload.len())?)
+            .await?;
         if !payload.is_empty() {
-            self.inner.write_all(payload)?;
+            self.inner.write_all(payload).await?;
         }
         log::trace!(
             "PersistentUsb: sync wrote frame id={sub:?} len={}",
@@ -159,17 +172,17 @@ impl SyncSession {
     }
 
     /// Write just an 8-byte SYNC frame header (`id` + LE `len`).
-    fn write_frame_header(&mut self, sub: MessageSubcommand, len: u32) -> Result<()> {
+    async fn write_frame_header(&mut self, sub: MessageSubcommand, len: u32) -> Result<()> {
         let header = encode_sync_header(sub, len);
-        self.inner.write_all(&header)?;
+        self.inner.write_all(&header).await?;
         Ok(())
     }
 
     /// Read exactly an 8-byte SYNC frame header, returning the raw 4-byte id and
     /// the decoded LE length.
-    fn read_frame_header(&mut self) -> Result<([u8; 4], u32)> {
+    async fn read_frame_header(&mut self) -> Result<([u8; 4], u32)> {
         let mut header = [0u8; SYNC_HEADER_LEN];
-        self.read_exact(&mut header)?;
+        self.read_exact(&mut header).await?;
         let id: [u8; 4] = header[0..4].try_into()?;
         let len = u32::from_le_bytes(header[4..8].try_into()?);
         Ok((id, len))
@@ -177,7 +190,7 @@ impl SyncSession {
 
     /// Copy `len` bytes of DATA payload from the inner stream into `writer`,
     /// reusing `scratch` as the transfer buffer.
-    fn copy_payload<W: Write>(
+    async fn copy_payload<W: AsyncWrite + Unpin>(
         &mut self,
         len: u32,
         scratch: &mut [u8],
@@ -186,8 +199,8 @@ impl SyncSession {
         let mut remaining = len as usize;
         while remaining > 0 {
             let want = remaining.min(scratch.len());
-            self.read_exact(&mut scratch[..want])?;
-            writer.write_all(&scratch[..want])?;
+            self.read_exact(&mut scratch[..want]).await?;
+            writer.write_all(&scratch[..want]).await?;
             remaining -= want;
         }
         Ok(())
@@ -195,20 +208,21 @@ impl SyncSession {
 
     /// Read exactly `len` payload bytes and decode them lossily as a UTF-8
     /// string (used for `FAIL` reason text).
-    fn read_exact_string(&mut self, len: u32) -> Result<String> {
+    async fn read_exact_string(&mut self, len: u32) -> Result<String> {
         let mut buf = vec![0u8; len as usize];
-        self.read_exact(&mut buf)?;
+        self.read_exact(&mut buf).await?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
     /// Read exactly `buf.len()` bytes from the inner byte-transparent session.
     ///
-    /// `MultiplexedSession::read` returns whatever a single WRTE delivered, so a
-    /// SYNC frame may span several reads — loop until `buf` is full or EOF.
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+    /// `MultiplexedSession`'s `AsyncRead` returns whatever a single WRTE
+    /// delivered, so a SYNC frame may span several reads — loop until `buf` is
+    /// full or EOF.
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
-            let n = self.inner.read(&mut buf[filled..])?;
+            let n = self.inner.read(&mut buf[filled..]).await?;
             if n == 0 {
                 return Err(RustADBError::IOError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

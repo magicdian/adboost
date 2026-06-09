@@ -20,7 +20,7 @@
 //! [`PersistentUsbConnection`]: crate::message_devices::usb::PersistentUsbConnection
 //! [`PersistentUsbConnection::shell_exec`]: crate::message_devices::usb::PersistentUsbConnection::shell_exec
 
-use std::io::Read;
+use tokio::io::AsyncReadExt;
 
 use crate::Result;
 use crate::RustADBError;
@@ -140,14 +140,14 @@ impl ShellV2Session {
     /// Returns [`RustADBError::IOError`] on a transport error or
     /// [`RustADBError::ADBShellV2ParseError`] on a malformed frame (invalid
     /// channel id or a spurious exit-status payload size).
-    pub fn execute(&mut self) -> Result<ShellV2Output> {
+    pub async fn execute(&mut self) -> Result<ShellV2Output> {
         let mut out = ShellV2Output::default();
         let mut scratch = vec![0u8; READ_CHUNK];
 
         loop {
             // 1 byte channel + 4 bytes LE payload size.
             let mut header = [0u8; SHELL_V2_HEADER_LEN];
-            if !self.read_exact_or_eof(&mut header)? {
+            if !self.read_exact_or_eof(&mut header).await? {
                 // Stream closed cleanly between frames.
                 break;
             }
@@ -164,12 +164,14 @@ impl ShellV2Session {
                 ShellChannel::Stdout => {
                     self.drain_payload(payload_len, &mut scratch, |chunk| {
                         out.stdout.extend_from_slice(chunk);
-                    })?;
+                    })
+                    .await?;
                 }
                 ShellChannel::Stderr => {
                     self.drain_payload(payload_len, &mut scratch, |chunk| {
                         out.stderr.extend_from_slice(chunk);
-                    })?;
+                    })
+                    .await?;
                 }
                 ShellChannel::ExitStatus => {
                     if payload_len != 1 {
@@ -178,7 +180,7 @@ impl ShellV2Session {
                         )));
                     }
                     let mut byte = [0u8; 1];
-                    if !self.read_exact_or_eof(&mut byte)? {
+                    if !self.read_exact_or_eof(&mut byte).await? {
                         break;
                     }
                     out.exit_code = Some(byte[0]);
@@ -187,7 +189,8 @@ impl ShellV2Session {
                 // inbound on the device→host stream; consume any payload and
                 // ignore so a stray frame does not desync the decoder.
                 ShellChannel::Stdin | ShellChannel::CloseStdin | ShellChannel::WindowSizeChange => {
-                    self.drain_payload(payload_len, &mut scratch, |_| {})?;
+                    self.drain_payload(payload_len, &mut scratch, |_| {})
+                        .await?;
                 }
             }
         }
@@ -197,7 +200,7 @@ impl ShellV2Session {
 
     /// Drain exactly `len` payload bytes from the inner stream, invoking `sink`
     /// with each chunk as it arrives (reusing `scratch` as the transfer buffer).
-    fn drain_payload(
+    async fn drain_payload(
         &mut self,
         len: usize,
         scratch: &mut [u8],
@@ -206,7 +209,7 @@ impl ShellV2Session {
         let mut remaining = len;
         while remaining > 0 {
             let want = remaining.min(scratch.len());
-            let n = self.inner.read(&mut scratch[..want])?;
+            let n = self.inner.read(&mut scratch[..want]).await?;
             if n == 0 {
                 return Err(RustADBError::ADBShellV2ParseError(
                     "shell-v2 stream closed mid-frame".into(),
@@ -224,12 +227,13 @@ impl ShellV2Session {
     /// cleanly with *no* bytes read (a frame boundary EOF). Closing partway
     /// through `buf` is an error (a truncated frame).
     ///
-    /// `MultiplexedSession::read` returns whatever a single WRTE delivered, so a
-    /// frame may span several reads — loop until `buf` is full or EOF.
-    fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
+    /// `MultiplexedSession`'s `AsyncRead` returns whatever a single WRTE
+    /// delivered, so a frame may span several reads — loop until `buf` is full
+    /// or EOF.
+    async fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
         let mut filled = 0;
         while filled < buf.len() {
-            let n = self.inner.read(&mut buf[filled..])?;
+            let n = self.inner.read(&mut buf[filled..]).await?;
             if n == 0 {
                 if filled == 0 {
                     return Ok(false);
@@ -246,6 +250,8 @@ impl ShellV2Session {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     #[test]
