@@ -5,3 +5,6 @@ venv
 /.mypy_cache
 pyadb_client/pyadb_client.pyi
 __pycache__
+
+# stray build artifact from tooling
+check_duration

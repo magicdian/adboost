@@ -1005,8 +1005,14 @@ impl Drop for PersistentUsbConnection {
         // Best-effort connection-level CLSE: fire-and-forget onto the writer
         // queue (we cannot `.await` in Drop). If the queue is full or the writer
         // is gone, the abort below still tears the connection down.
-        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
-            let _ = self.writer.try_send_fire_forget(clse);
+        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])
+            && let Err(e) = self.writer.try_send_fire_forget(clse)
+        {
+            // Best-effort contract: a full/closed writer queue means the
+            // connection-level CLSE could not be delivered. The `abort` below
+            // still tears the connection down, but the device may keep the
+            // stream open until it times out — log it so the leak is observable.
+            log::warn!("PersistentUsb: could not enqueue connection CLSE on drop: {e}");
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -1052,8 +1058,15 @@ impl Drop for SessionInner {
                 self.remote_id,
                 &[],
             )
+            && let Err(e) = self.writer.try_send_fire_forget(clse)
         {
-            let _ = self.writer.try_send_fire_forget(clse);
+            // Best-effort contract: a full/closed writer queue means this
+            // session's CLSE was dropped, so the remote may leak the stream
+            // until it times out. Surface it rather than swallowing silently.
+            log::warn!(
+                "PersistentUsb: could not enqueue CLSE for session {} on drop: {e}",
+                self.local_id
+            );
         }
         // Ask the reader to drop this session id from its registry.
         let _ = self
@@ -1193,6 +1206,18 @@ pub struct SessionReadHalf {
 }
 
 /// Write half of a split [`MultiplexedSession`].
+///
+/// # Window accounting on drop while a WRTE is in flight
+///
+/// If this half is dropped while `write_state == Sending` (the WRTE bytes are
+/// on the writer queue but the writer task's ack `oneshot` has not yet
+/// resolved), the pending `record_sent` never runs, so this session's local
+/// send-window view is left un-debited. This is intentionally accepted, not a
+/// leak: the window lives entirely inside this half and is discarded with it,
+/// and dropping the write half tears the whole session down (the shared
+/// [`SessionInner`] still fires a best-effort CLSE on its own drop). There is no
+/// cross-session impact and nothing to reconcile, so eagerly debiting here would
+/// only add complexity for an accounting value that is about to be thrown away.
 pub struct SessionWriteHalf {
     shared: Arc<SessionInner>,
     ack_rx: mpsc::Receiver<ADBTransportMessage>,
@@ -2010,5 +2035,67 @@ mod tests {
             io::ErrorKind::BrokenPipe,
             "a write to a remotely-closed session must surface as BrokenPipe"
         );
+    }
+
+    #[tokio::test]
+    async fn drop_write_half_while_wrte_in_flight_is_clean() {
+        // L1 regression: dropping the write half while a WRTE is still in flight
+        // (enqueued, ack oneshot unresolved → `WriteState::Sending`) must not
+        // panic and must still tear the session down (CLSE on the last shared
+        // ref drop). The un-debited window is accepted: it dies with the half.
+        let (session, _data_tx, _ack_tx, mut writer_rx, mut control_rx) =
+            MultiplexedSession::new_for_test(
+                10,
+                20,
+                true,
+                FlowControl::new_windowed(INITIAL_DELAYED_ACK_BYTES),
+            );
+        let (read_half, write_half) = session.into_split();
+
+        // Drive a write far enough to enqueue the WRTE and park in `Sending`
+        // (the writer never replies on the ack oneshot, so it stays pending).
+        let mut write_half = write_half;
+        let writer = tokio::spawn(async move {
+            // This write will park (Sending) and never complete; the task is
+            // aborted when we drop our handle below.
+            let _ = write_half.write_all(b"inflight").await;
+            write_half
+        });
+
+        // Let the write enqueue its WRTE frame onto the writer queue.
+        let frame = writer_rx.recv().await.expect("WRTE enqueued");
+        match frame {
+            OutboundFrame::WithAck(m, _ack) => {
+                assert_eq!(
+                    m.header().command(),
+                    MessageCommand::Write,
+                    "the in-flight frame must be a WRTE"
+                );
+                // Drop `_ack` here WITHOUT replying: the write stays in `Sending`.
+            }
+            OutboundFrame::FireForget(_) => panic!("a WRTE must be WithAck"),
+        }
+
+        // Abort the parked write task and reclaim the (still-`Sending`) half,
+        // then drop it together with the read half.
+        writer.abort();
+        let _ = writer.await; // joins the aborted task (Err(cancelled)); no panic.
+        drop(read_half);
+        // `write_half` was moved into the aborted task and dropped there; the
+        // last `SessionInner` ref now goes away, firing the best-effort CLSE.
+
+        let clse = writer_rx.recv().await.expect("CLSE enqueued on full drop");
+        match clse {
+            OutboundFrame::FireForget(m) => assert_eq!(
+                m.header().command(),
+                MessageCommand::Clse,
+                "dropping both halves must still send a CLSE"
+            ),
+            OutboundFrame::WithAck(..) => panic!("drop CLSE must be fire-and-forget"),
+        }
+        match control_rx.recv().await.expect("unregister on drop") {
+            ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop unregisters the local id"),
+            _ => panic!("drop must unregister the session id"),
+        }
     }
 }

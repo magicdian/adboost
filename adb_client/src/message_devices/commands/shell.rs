@@ -80,12 +80,28 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         let mut transport = self.get_transport_mut().clone();
 
+        // Cooperative shutdown signal: the input side fires this once it sees
+        // EOF/error so the reader exits at a SAFE point (between reads) instead
+        // of being `abort`ed mid-`write_all`/`flush`. Aborting in the middle of
+        // a write would drop device output we have already protocol-ACKed,
+        // silently truncating interactive shell output (H2).
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Reading task, reads response from adbd and writes it into `writer`.
         let reader_task = tokio::spawn(async move {
             loop {
-                let message = match transport.read_message().await {
-                    Ok(message) => message,
-                    Err(e) => break Err::<(), RustADBError>(e),
+                // Race the next read against the shutdown signal. `read_message`
+                // is the cancel-safe atomic unit (one ADB frame), so cancelling
+                // it here loses nothing; and because the signal is only observed
+                // between reads, any in-flight write below always runs to
+                // completion before the loop can exit.
+                let message = tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break Ok::<(), RustADBError>(()),
+                    read = transport.read_message() => match read {
+                        Ok(message) => message,
+                        Err(e) => break Err(e),
+                    },
                 };
 
                 // Acknowledge for more data
@@ -104,6 +120,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
                 match message.header().command() {
                     MessageCommand::Write => {
+                        // Not inside the `select!`: once a frame is read and
+                        // ACKed, it MUST be fully flushed to `writer` before we
+                        // can observe the shutdown signal and exit.
                         if let Err(e) = writer.write_all(&message.into_payload()).await {
                             break Err(RustADBError::IOError(e));
                         }
@@ -134,9 +153,24 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
         };
 
-        // The reader task lives for the connection's lifetime; abort it once the
-        // input side is done so the cloned transport is released.
-        reader_task.abort();
+        // Input side is done. Signal the reader to stop at its next safe point
+        // (between reads) rather than aborting it mid-write, then wait for it to
+        // finish so any frame it had already read+ACKed is fully flushed to the
+        // writer before we return. This mirrors the synchronous original's
+        // intent (let the reader complete its current output) without leaking a
+        // task: the cooperative signal guarantees the reader unblocks even when
+        // the device is silent (the read loop has no inner timeout).
+        let _ = shutdown_tx.send(());
+        match reader_task.await {
+            Ok(Ok(())) => {}
+            // The reader commonly ends with a disconnect/CLSE error once the
+            // stream tears down; the synchronous original ran it on a detached
+            // thread and never observed this. Preserve that interactive
+            // semantic (input EOF drives the return value) but make the reader
+            // outcome observable instead of silently discarded.
+            Ok(Err(e)) => log::debug!("shell reader task ended: {e}"),
+            Err(join_err) => log::warn!("shell reader task did not join cleanly: {join_err}"),
+        }
 
         copy_result
     }
