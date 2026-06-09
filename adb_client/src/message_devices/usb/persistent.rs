@@ -1,19 +1,49 @@
-//! Persistent USB connection with session multiplexing.
+//! Persistent USB connection with session multiplexing (async / tokio).
 //!
 //! Holds a single CNXN+AUTH'd USB connection and allows multiple concurrent
 //! ADB sessions (shell, tcp, sync) to be opened without re-authenticating.
-//! A background reader thread demultiplexes incoming messages by `local_id`.
+//!
+//! # Architecture
+//!
+//! Two long-lived tokio tasks own the two halves of the USB pipe:
+//!
+//! - **reader task**: the single owner of the bulk-IN endpoint. It reads frames
+//!   in a loop and demultiplexes them by `local_id` into per-session channels,
+//!   the device-OPEN queue, and raw subscribers. It also owns the session
+//!   registry *privately* (no shared mutex): registration / unregistration flow
+//!   in over a control channel and are applied between reads. The routing
+//!   decision is the I/O-free [`classify_message`] (unit-tested without
+//!   hardware). The reader NEVER blocks — all sends use `try_send`; on overflow
+//!   it drops and `log::warn!`s so the loss is observable.
+//! - **writer task**: the single owner of the bulk-OUT endpoint. Every outbound
+//!   frame (OPEN / OKAY / WRTE / CLSE / raw) is delivered to it over one mpsc
+//!   channel as an [`OutboundFrame`]. It serializes the writes:
+//!   `OutboundFrame::FireForget` (OKAY / CLSE / OPEN / raw) is enqueued and
+//!   forgotten; `OutboundFrame::WithAck` (WRTE) carries a `oneshot::Sender` so
+//!   the caller can `.await` the write's `Result` before debiting the
+//!   flow-control window. Because the reader task never writes OUT, the OUT
+//!   endpoint has a single physical writer enforced structurally — no shared
+//!   writer mutex anywhere.
+//!
+//! Teardown is explicit: [`PersistentUsbConnection::close`] /
+//! [`MultiplexedSession::close`] send their CLSE and await confirmation. `Drop`
+//! is best-effort: it enqueues CLSE fire-and-forget onto the writer channel and
+//! `abort()`s the reader/writer tasks (Rust stable has no async `Drop`).
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rand::RngExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::adb_transport::ADBTransport;
 use crate::message_devices::adb_message_transport::ADBMessageTransport;
@@ -41,14 +71,80 @@ const PENDING_OPENS_CHANNEL_SIZE: usize = 64;
 /// Channel buffer size for each raw subscriber (`subscribe_raw`) queue.
 const RAW_SUBSCRIBER_CHANNEL_SIZE: usize = 64;
 
+/// Channel buffer size for the writer task's outbound-frame queue.
+const WRITER_CHANNEL_SIZE: usize = 256;
+
+/// Channel buffer size for the reader task's session-registry control queue.
+const CONTROL_CHANNEL_SIZE: usize = 64;
+
 /// Boxed predicate used to filter raw-tee'd messages for a subscriber.
 type RawFilter = Box<dyn Fn(&ADBTransportMessage) -> bool + Send>;
 
 /// A registered raw subscriber: its filter predicate plus the sender side of
-/// its bounded queue. Lives in [`PersistentUsbConnection::raw_subscribers`].
+/// its bounded queue. Lives in the reader task's private subscriber list.
 struct RawSubscriber {
     filter: RawFilter,
-    tx: SyncSender<ADBTransportMessage>,
+    tx: mpsc::Sender<ADBTransportMessage>,
+}
+
+/// An outbound frame queued for the single writer task.
+///
+/// `FireForget` is used for OKAY / CLSE / OPEN / raw sends where the caller does
+/// not need the write `Result` (it is enqueued and forgotten — Drop also uses
+/// this to push a best-effort CLSE). `WithAck` is used for WRTE so the caller
+/// can `.await` the write's `Result` before debiting the flow-control window,
+/// preserving send-side accounting correctness (P1-①, write-completion option 1).
+enum OutboundFrame {
+    FireForget(ADBTransportMessage),
+    WithAck(ADBTransportMessage, oneshot::Sender<io::Result<()>>),
+}
+
+/// A control message to the reader task to mutate its private session registry
+/// or subscriber list. The reader applies these between reads via `select!` so
+/// the registry never needs a shared lock.
+enum ReaderControl {
+    Register(u32, SessionChannels),
+    Unregister(u32),
+    Subscribe(RawSubscriber),
+}
+
+/// Handle used to talk to the single writer task: enqueue outbound frames.
+/// Cloned into every session half so each can write/close independently.
+#[derive(Clone)]
+struct WriterHandle {
+    tx: mpsc::Sender<OutboundFrame>,
+}
+
+impl WriterHandle {
+    /// Enqueue a fire-and-forget frame (OKAY / CLSE / OPEN / raw). Returns an
+    /// error only if the writer task is gone (channel closed) or its queue is
+    /// full — both surface as a broken pipe to the caller.
+    fn try_send_fire_forget(&self, msg: ADBTransportMessage) -> io::Result<()> {
+        self.tx
+            .try_send(OutboundFrame::FireForget(msg))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "writer queue full")
+                }
+                TrySendError::Closed(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "writer task gone")
+                }
+            })
+    }
+
+    /// Enqueue a WRTE with an ack channel and await the writer task's write
+    /// result. Used by the send path so the window is debited only after the
+    /// frame is actually on the wire.
+    async fn send_with_ack(&self, msg: ADBTransportMessage) -> io::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(OutboundFrame::WithAck(msg, ack_tx))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer task gone"))?;
+        ack_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
+    }
 }
 
 /// Routing decision computed by [`classify_message`] for a single inbound
@@ -120,14 +216,14 @@ fn banner_advertises_delayed_ack(banner: &str) -> bool {
 /// Unlike the per-operation model in `ADBUSBDevice`, this holds the USB handle
 /// permanently and multiplexes multiple sessions over a single authenticated connection.
 pub struct PersistentUsbConnection {
-    /// Writer half — serialized access via mutex.
-    writer: Arc<Mutex<USBTransport>>,
-    /// Session registry: `local_id` -> channels for incoming messages.
-    sessions: Arc<Mutex<HashMap<u32, SessionChannels>>>,
-    /// Reader thread handle.
-    reader_handle: Option<thread::JoinHandle<()>>,
-    /// Flag to signal shutdown.
-    shutdown: Arc<AtomicBool>,
+    /// Handle to enqueue outbound frames onto the single writer task.
+    writer: WriterHandle,
+    /// Control channel to mutate the reader task's private session registry.
+    control_tx: mpsc::Sender<ReaderControl>,
+    /// Reader task handle (aborted on Drop).
+    reader_handle: Option<JoinHandle<()>>,
+    /// Writer task handle (aborted on Drop).
+    writer_handle: Option<JoinHandle<()>>,
     /// Features advertised to the device in the CNXN banner.
     features: DeviceFeatureSet,
     /// Whether `delayed_ack` windowed flow control is negotiated for this
@@ -138,22 +234,20 @@ pub struct PersistentUsbConnection {
     /// The single consumer side of the device-originated OPEN queue. `Option`
     /// so it can be taken by [`Self::incoming_opens`]; subsequent calls return
     /// an error. The matching sender lives in (and is kept alive by) the reader
-    /// thread, so the receiver reports disconnect once the reader stops.
-    pending_opens_rx: Mutex<Option<Receiver<ADBTransportMessage>>>,
-    /// Registered raw subscribers (see [`Self::subscribe_raw`]). The reader
-    /// thread holds a clone and tees matching messages to each.
-    raw_subscribers: Arc<Mutex<Vec<RawSubscriber>>>,
+    /// task, so the receiver reports disconnect once the reader stops.
+    pending_opens_rx: Option<mpsc::Receiver<ADBTransportMessage>>,
 }
 
 impl PersistentUsbConnection {
     /// Create a new persistent connection from a USB transport.
     ///
-    /// Performs CNXN+AUTH handshake, then spawns a reader thread for message demuxing.
+    /// Performs CNXN+AUTH handshake, then spawns reader + writer tasks for
+    /// message demuxing and serialized writes.
     ///
     /// Advertises the honest [`DeviceFeatureSet::default`] banner. To advertise a
     /// custom feature set, use [`Self::new_with_features`].
-    pub fn new(transport: USBTransport, private_key_path: Option<PathBuf>) -> Result<Self> {
-        Self::new_with_features(transport, private_key_path, DeviceFeatureSet::default())
+    pub async fn new(transport: USBTransport, private_key_path: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_features(transport, private_key_path, DeviceFeatureSet::default()).await
     }
 
     /// Create a new persistent connection advertising an explicit feature set.
@@ -161,7 +255,7 @@ impl PersistentUsbConnection {
     /// The `features` set determines the `host::features=` list sent in the CNXN
     /// banner. Only advertise features this end actually implements — see
     /// [`DeviceFeatureSet`].
-    pub fn new_with_features(
+    pub async fn new_with_features(
         transport: USBTransport,
         private_key_path: Option<PathBuf>,
         features: DeviceFeatureSet,
@@ -183,11 +277,11 @@ impl PersistentUsbConnection {
 
         // Connect the transport (claim interface, find endpoints)
         let mut transport = transport;
-        transport.connect()?;
+        transport.connect().await?;
 
         // Perform CNXN handshake; the device's banner tells us which features it
         // supports so we can negotiate `delayed_ack` (intersection of both ends).
-        let device_banner = Self::do_connect(&mut transport, &private_key, &features)?;
+        let device_banner = Self::do_connect(&mut transport, &private_key, &features).await?;
         let delayed_ack_negotiated =
             features.delayed_ack && banner_advertises_delayed_ack(&device_banner);
         log::debug!(
@@ -196,46 +290,33 @@ impl PersistentUsbConnection {
             banner_advertises_delayed_ack(&device_banner)
         );
 
-        let sessions: Arc<Mutex<HashMap<u32, SessionChannels>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let raw_subscribers: Arc<Mutex<Vec<RawSubscriber>>> = Arc::new(Mutex::new(Vec::new()));
-        let (pending_opens_tx, pending_opens_rx) = mpsc::sync_channel(PENDING_OPENS_CHANNEL_SIZE);
+        let (pending_opens_tx, pending_opens_rx) = mpsc::channel(PENDING_OPENS_CHANNEL_SIZE);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_SIZE);
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_SIZE);
 
-        // Clone transport for reader thread (shares Arc<DeviceHandle>)
+        // The reader task owns one clone of the transport (drives bulk-IN);
+        // the writer task owns the original (drives bulk-OUT). Both share the
+        // same underlying `Arc<DeviceHandle>` but use the separate endpoint
+        // locks, so reads never block writes (see `USBTransport`).
         let reader_transport = transport.clone();
-        let reader_sessions = sessions.clone();
-        let reader_shutdown = shutdown.clone();
-        let reader_raw_subscribers = raw_subscribers.clone();
+        let writer_transport = transport;
 
-        let reader_handle = thread::Builder::new()
-            .name("usb-reader".into())
-            .spawn(move || {
-                // The reader thread owns the OPEN-queue sender, keeping the
-                // channel alive for its whole lifetime; the receiver reports
-                // disconnect only once this thread exits.
-                let pending_opens_tx = pending_opens_tx;
-                Self::reader_loop(
-                    reader_transport,
-                    &reader_sessions,
-                    &reader_shutdown,
-                    &reader_raw_subscribers,
-                    &pending_opens_tx,
-                );
-            })
-            .map_err(|e| RustADBError::IOError(io::Error::other(e)))?;
+        let reader_handle = tokio::spawn(async move {
+            Self::reader_loop(reader_transport, control_rx, pending_opens_tx).await;
+        });
 
-        let writer = Arc::new(Mutex::new(transport));
+        let writer_handle = tokio::spawn(async move {
+            Self::writer_loop(writer_transport, writer_rx).await;
+        });
 
         Ok(Self {
-            writer,
-            sessions,
+            writer: WriterHandle { tx: writer_tx },
+            control_tx,
             reader_handle: Some(reader_handle),
-            shutdown,
+            writer_handle: Some(writer_handle),
             features,
             delayed_ack_negotiated,
-            pending_opens_rx: Mutex::new(Some(pending_opens_rx)),
-            raw_subscribers,
+            pending_opens_rx: Some(pending_opens_rx),
         })
     }
 
@@ -243,7 +324,7 @@ impl PersistentUsbConnection {
     ///
     /// Advertises the honest [`DeviceFeatureSet::default`] banner. To advertise a
     /// custom feature set, use [`Self::new_from_ids_with_features`].
-    pub fn new_from_ids(
+    pub async fn new_from_ids(
         vendor_id: u16,
         product_id: u16,
         private_key_path: Option<PathBuf>,
@@ -254,17 +335,18 @@ impl PersistentUsbConnection {
             private_key_path,
             DeviceFeatureSet::default(),
         )
+        .await
     }
 
     /// Create from `vendor_id/product_id`, advertising an explicit feature set.
-    pub fn new_from_ids_with_features(
+    pub async fn new_from_ids_with_features(
         vendor_id: u16,
         product_id: u16,
         private_key_path: Option<PathBuf>,
         features: DeviceFeatureSet,
     ) -> Result<Self> {
-        let transport = USBTransport::new(vendor_id, product_id)?;
-        Self::new_with_features(transport, private_key_path, features)
+        let transport = USBTransport::new(vendor_id, product_id).await?;
+        Self::new_with_features(transport, private_key_path, features).await
     }
 
     /// The feature set advertised to the device in the CNXN banner.
@@ -275,7 +357,7 @@ impl PersistentUsbConnection {
 
     /// Subscribe to device-originated `OPEN` messages (pull model).
     ///
-    /// Returns the consumer side of a bounded queue. The reader thread routes
+    /// Returns the consumer side of a bounded queue. The reader task routes
     /// every inbound `OPEN` whose target local id is not a known session
     /// (i.e. a device-initiated stream such as a `reverse:`/scrcpy connection,
     /// `A_OPEN(device_local_id, 0, "<dest>")`) into this queue. The caller
@@ -291,11 +373,9 @@ impl PersistentUsbConnection {
     /// # Errors
     ///
     /// Returns [`RustADBError::ADBRequestFailed`] if the receiver has already
-    /// been taken by a previous call (there is a single consumer), or
-    /// [`RustADBError::PoisonError`] if the internal mutex is poisoned.
-    pub fn incoming_opens(&self) -> Result<Receiver<ADBTransportMessage>> {
-        let mut guard = self.pending_opens_rx.lock()?;
-        guard.take().ok_or_else(|| {
+    /// been taken by a previous call (there is a single consumer).
+    pub fn incoming_opens(&mut self) -> Result<mpsc::Receiver<ADBTransportMessage>> {
+        self.pending_opens_rx.take().ok_or_else(|| {
             RustADBError::ADBRequestFailed(
                 "incoming_opens: receiver already taken (single consumer only)".into(),
             )
@@ -305,7 +385,7 @@ impl PersistentUsbConnection {
     /// Subscribe to a raw, filtered copy of every inbound message (low-level
     /// primitive, committed stable public API).
     ///
-    /// The reader thread tees every received [`ADBTransportMessage`] for which
+    /// The reader task tees every received [`ADBTransportMessage`] for which
     /// `filter` returns `true` to the returned bounded queue — *in addition* to
     /// the message's normal session/OPEN routing. This bypasses the session
     /// registry, giving callers a raw view of the wire for relay/reverse use
@@ -319,47 +399,57 @@ impl PersistentUsbConnection {
     ///
     /// Because there is exactly one bulk-IN reader, this is implemented as a tee
     /// inside the existing reader loop — it does NOT spawn a second reader.
-    pub fn subscribe_raw(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RustADBError::SendError`] if the reader task is gone.
+    pub async fn subscribe_raw(
         &self,
         filter: impl Fn(&ADBTransportMessage) -> bool + Send + 'static,
-    ) -> Result<Receiver<ADBTransportMessage>> {
-        let (tx, rx) = mpsc::sync_channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
-        let mut subs = self.raw_subscribers.lock()?;
-        subs.push(RawSubscriber {
-            filter: Box::new(filter),
-            tx,
-        });
+    ) -> Result<mpsc::Receiver<ADBTransportMessage>> {
+        let (tx, rx) = mpsc::channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
+        self.control_tx
+            .send(ReaderControl::Subscribe(RawSubscriber {
+                filter: Box::new(filter),
+                tx,
+            }))
+            .await
+            .map_err(|_| RustADBError::SendError)?;
         Ok(rx)
     }
 
     /// Send a raw [`ADBTransportMessage`] over the connection (low-level
     /// primitive, committed stable public API).
     ///
-    /// Writes through the shared writer mutex, exactly like `open_session`. The
-    /// caller is responsible for all protocol semantics (id allocation, flow
-    /// control). Pairs with [`Self::subscribe_raw`] for relay/reverse use.
+    /// Enqueues the frame onto the single writer task, exactly like
+    /// `open_session`. The caller is responsible for all protocol semantics (id
+    /// allocation, flow control). Pairs with [`Self::subscribe_raw`] for
+    /// relay/reverse use.
     ///
     /// # Errors
     ///
-    /// Returns [`RustADBError::PoisonError`] if the writer mutex is poisoned, or
-    /// any error from the underlying transport write.
-    pub fn send_raw(&self, msg: ADBTransportMessage) -> Result<()> {
-        let mut writer = self.writer.lock()?;
-        writer.write_message(msg)
+    /// Returns [`RustADBError::SendError`] if the writer task is gone, or any
+    /// error from the underlying transport write.
+    pub async fn send_raw(&self, msg: ADBTransportMessage) -> Result<()> {
+        self.writer
+            .send_with_ack(msg)
+            .await
+            .map_err(RustADBError::IOError)
     }
 
     /// Perform CNXN+AUTH handshake on a connected transport.
     ///
     /// Returns the device's CNXN banner string (used to negotiate features such
     /// as `delayed_ack`).
-    fn do_connect(
+    async fn do_connect(
         transport: &mut USBTransport,
         private_key: &ADBRsaKey,
         features: &DeviceFeatureSet,
     ) -> Result<String> {
         // Drain any stale messages from previous sessions on this USB pipe
-        while let Ok(msg) =
-            transport.read_message_with_timeout(std::time::Duration::from_millis(100))
+        while let Ok(msg) = transport
+            .read_message_with_timeout(Duration::from_millis(100))
+            .await
         {
             log::trace!(
                 "PersistentUsb: drained stale message: cmd={}",
@@ -379,9 +469,9 @@ impl PersistentUsbConnection {
                 1_048_576,
                 banner.as_bytes(),
             )?;
-            transport.write_message(cnxn_msg)?;
+            transport.write_message(cnxn_msg).await?;
 
-            let response = transport.read_message()?;
+            let response = transport.read_message().await?;
 
             match response.header().command() {
                 MessageCommand::Cnxn => {
@@ -393,7 +483,7 @@ impl PersistentUsbConnection {
                 }
                 MessageCommand::Auth => {
                     log::debug!("PersistentUsb: authentication required");
-                    return Self::do_auth(transport, response, private_key);
+                    return Self::do_auth(transport, response, private_key).await;
                 }
                 MessageCommand::Stls => {
                     return Err(RustADBError::ADBRequestFailed(
@@ -403,7 +493,7 @@ impl PersistentUsbConnection {
                 MessageCommand::Clse => {
                     // Stale CLSE from previous session — retry
                     log::debug!("PersistentUsb: got stale CLSE on attempt {attempt}, retrying");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 _ => {
                     return Err(RustADBError::WrongResponseReceived(
@@ -418,7 +508,7 @@ impl PersistentUsbConnection {
         ))
     }
 
-    fn do_auth(
+    async fn do_auth(
         transport: &mut USBTransport,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
@@ -432,9 +522,9 @@ impl PersistentUsbConnection {
 
         let sign = private_key.sign(message.into_payload())?;
         let sig_msg = ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign)?;
-        transport.write_message(sig_msg)?;
+        transport.write_message(sig_msg).await?;
 
-        let received = transport.read_message()?;
+        let received = transport.read_message().await?;
         if received.header().command() == MessageCommand::Cnxn {
             let banner = String::from_utf8_lossy(received.payload()).into_owned();
             log::info!("PersistentUsb: auth OK (signature accepted), device banner: {banner:?}");
@@ -446,52 +536,69 @@ impl PersistentUsbConnection {
         pubkey.push(b'\0');
         let pk_msg =
             ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey)?;
-        transport.write_message(pk_msg)?;
+        transport.write_message(pk_msg).await?;
 
-        let final_resp = transport.read_message_with_timeout(Duration::from_secs(10))?;
+        let final_resp = transport
+            .read_message_with_timeout(Duration::from_secs(10))
+            .await?;
         final_resp.assert_command(MessageCommand::Cnxn)?;
         let banner = String::from_utf8_lossy(final_resp.payload()).into_owned();
         log::info!("PersistentUsb: auth OK (public key accepted), device banner: {banner:?}");
         Ok(banner)
     }
 
-    /// Reader loop: the single owner of the USB bulk-IN endpoint.
+    /// Reader task: the single owner of the USB bulk-IN endpoint.
     ///
-    /// There is exactly ONE reader thread per connection — a second reader would
+    /// There is exactly ONE reader task per connection — a second reader would
     /// deadlock on the IN-endpoint mutex (see `usb_transport`). So all inbound
     /// routing (session-data, session-ack, device-OPEN, raw tee) happens in this
     /// one loop. The routing decision is factored into the I/O-free
     /// [`classify_message`] so it can be unit-tested without hardware (D1).
     ///
+    /// The reader OWNS the session registry and raw-subscriber list privately —
+    /// no shared lock. Registry mutations arrive over `control_rx` and are
+    /// applied via `select!` between reads, so the reader never holds a lock
+    /// across a USB `.await`.
+    ///
     /// The reader must NEVER block: blocking on a full queue would stall every
     /// session. All sends use `try_send`; on overflow we drop and `log::warn!`
     /// so the loss is observable (never a silent drop).
-    fn reader_loop(
+    async fn reader_loop(
         mut transport: USBTransport,
-        sessions: &Arc<Mutex<HashMap<u32, SessionChannels>>>,
-        shutdown: &Arc<AtomicBool>,
-        raw_subscribers: &Arc<Mutex<Vec<RawSubscriber>>>,
-        pending_opens_tx: &SyncSender<ADBTransportMessage>,
+        mut control_rx: mpsc::Receiver<ReaderControl>,
+        pending_opens_tx: mpsc::Sender<ADBTransportMessage>,
     ) {
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
+        let mut sessions: HashMap<u32, SessionChannels> = HashMap::new();
+        let mut raw_subscribers: Vec<RawSubscriber> = Vec::new();
 
-            let msg = match transport.read_message_with_timeout(Duration::from_secs(1)) {
-                Ok(msg) => msg,
-                // Normal read timeout — `transfer_blocking` hit its deadline.
+        loop {
+            // A single ADB frame read is a cancel-safe atomic unit (nusb
+            // `next_complete` is cancel-safe; the transport wraps it in its own
+            // 1s timeout). We `select!` it against control-channel mutations so
+            // registry changes are applied promptly without ever holding a lock
+            // across the read `.await`.
+            let outcome = Self::read_or_control(
+                &mut transport,
+                &mut control_rx,
+                &mut sessions,
+                &mut raw_subscribers,
+            )
+            .await;
+
+            let msg = match outcome {
+                ReadStep::Message(msg) => msg,
+                // Normal read timeout — the transport hit its per-read deadline.
                 // `nusb` surfaces this as `TransferError::Cancelled`, which the
-                // transport maps to `RustADBError::UsbTimeout`. Match on it
-                // structurally instead of string-matching the error message.
-                Err(RustADBError::UsbTimeout) => continue,
-                Err(e) => {
-                    // Check if we're shutting down
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
+                // transport maps to `RustADBError::UsbTimeout`. Keep looping.
+                ReadStep::ReadTimeout => continue,
+                // A control message was applied (registry already mutated).
+                ReadStep::Control => continue,
+                ReadStep::Closed => {
+                    log::debug!("PersistentUsb reader: control channel closed, exiting");
+                    break;
+                }
+                ReadStep::ReadError(e) => {
                     log::warn!("PersistentUsb reader error: {e}");
-                    // USB likely disconnected
                     break;
                 }
             };
@@ -505,33 +612,13 @@ impl PersistentUsbConnection {
             );
 
             // Tee to raw subscribers first (orthogonal to the primary route).
-            // Each subscriber that matches the filter gets a clone; on overflow
-            // we drop that clone with a warning (never block the reader).
-            Self::tee_raw(raw_subscribers, &msg);
+            Self::tee_raw(&mut raw_subscribers, &msg);
 
             // Primary routing decision (I/O-free, unit-testable).
-            let decision = {
-                let sessions_lock = match sessions.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        log::warn!("PersistentUsb reader: sessions mutex poisoned: {e}");
-                        break;
-                    }
-                };
-                classify_message(&msg, &sessions_lock)
-            };
-
-            match decision {
+            match classify_message(&msg, &sessions) {
                 RouteDecision::SessionAck(id) | RouteDecision::SessionData(id) => {
-                    let is_ack = matches!(decision, RouteDecision::SessionAck(_));
-                    let sessions_lock = match sessions.lock() {
-                        Ok(g) => g,
-                        Err(e) => {
-                            log::warn!("PersistentUsb reader: sessions mutex poisoned: {e}");
-                            break;
-                        }
-                    };
-                    if let Some(channels) = sessions_lock.get(&id) {
+                    let is_ack = msg.header().command() == MessageCommand::Okay;
+                    if let Some(channels) = sessions.get(&id) {
                         let cmd = msg.header().command();
                         let target = if is_ack {
                             &channels.ack_tx
@@ -540,8 +627,7 @@ impl PersistentUsbConnection {
                         };
                         if target.try_send(msg).is_err() {
                             // Bounded queue full. Do NOT block (would stall all
-                            // sessions). Drop with an observable warning; full
-                            // windowed backpressure arrives in a later PR.
+                            // sessions). Drop with an observable warning.
                             log::warn!(
                                 "PersistentUsb: session {id} queue full, dropped {cmd} message"
                             );
@@ -550,8 +636,7 @@ impl PersistentUsbConnection {
                 }
                 RouteDecision::DeviceOpen => {
                     // Bounded queue, overflow policy = drop the incoming OPEN
-                    // (simplest correct non-blocking behavior; the reader can
-                    // never block on a full queue). Observable via warning.
+                    // (the reader can never block on a full queue).
                     if pending_opens_tx.try_send(msg).is_err() {
                         log::warn!(
                             "PersistentUsb: incoming-OPEN queue full, dropped device-originated OPEN"
@@ -567,28 +652,86 @@ impl PersistentUsbConnection {
                 }
             }
         }
-        log::debug!("PersistentUsb reader thread exiting");
+        log::debug!("PersistentUsb reader task exiting");
+    }
+
+    /// Await either the next USB frame or the next reader-control message,
+    /// applying control messages to the registry directly (so no lock crosses
+    /// the read `.await`).
+    async fn read_or_control(
+        transport: &mut USBTransport,
+        control_rx: &mut mpsc::Receiver<ReaderControl>,
+        sessions: &mut HashMap<u32, SessionChannels>,
+        raw_subscribers: &mut Vec<RawSubscriber>,
+    ) -> ReadStep {
+        tokio::select! {
+            biased;
+            ctrl = control_rx.recv() => match ctrl {
+                Some(ReaderControl::Register(id, channels)) => {
+                    sessions.insert(id, channels);
+                    ReadStep::Control
+                }
+                Some(ReaderControl::Unregister(id)) => {
+                    sessions.remove(&id);
+                    ReadStep::Control
+                }
+                Some(ReaderControl::Subscribe(sub)) => {
+                    raw_subscribers.push(sub);
+                    ReadStep::Control
+                }
+                None => ReadStep::Closed,
+            },
+            read = transport.read_message_with_timeout(Duration::from_secs(1)) => match read {
+                Ok(msg) => ReadStep::Message(msg),
+                Err(RustADBError::UsbTimeout) => ReadStep::ReadTimeout,
+                Err(e) => ReadStep::ReadError(e),
+            },
+        }
+    }
+
+    /// Writer task: the single owner of the USB bulk-OUT endpoint.
+    ///
+    /// Drains the outbound-frame queue and serializes every write. WRTE frames
+    /// (`WithAck`) report their write `Result` back over a `oneshot`; OKAY /
+    /// CLSE / OPEN / raw (`FireForget`) are written best-effort and logged on
+    /// failure. The task exits when every sender (the connection + all session
+    /// halves) has been dropped, draining the channel first.
+    async fn writer_loop(
+        mut transport: USBTransport,
+        mut writer_rx: mpsc::Receiver<OutboundFrame>,
+    ) {
+        while let Some(frame) = writer_rx.recv().await {
+            match frame {
+                OutboundFrame::FireForget(msg) => {
+                    if let Err(e) = transport.write_message(msg).await {
+                        log::warn!("PersistentUsb writer: fire-and-forget write failed: {e}");
+                    }
+                }
+                OutboundFrame::WithAck(msg, ack) => {
+                    let result = transport
+                        .write_message(msg)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()));
+                    // The receiver may have been cancelled (dropped); ignore.
+                    let _ = ack.send(result);
+                }
+            }
+        }
+        log::debug!("PersistentUsb writer task exiting");
     }
 
     /// Tee a received message to every raw subscriber whose filter matches.
     /// Never blocks: on a full subscriber queue the clone is dropped with a
     /// warning. Dead (disconnected) subscribers are pruned lazily.
-    fn tee_raw(raw_subscribers: &Arc<Mutex<Vec<RawSubscriber>>>, msg: &ADBTransportMessage) {
-        let mut subs = match raw_subscribers.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!("PersistentUsb reader: raw-subscribers mutex poisoned: {e}");
-                return;
-            }
-        };
-        if subs.is_empty() {
+    fn tee_raw(raw_subscribers: &mut Vec<RawSubscriber>, msg: &ADBTransportMessage) {
+        if raw_subscribers.is_empty() {
             return;
         }
-        subs.retain(|sub| {
+        raw_subscribers.retain(|sub| {
             if (sub.filter)(msg) {
                 match sub.tx.try_send(msg.clone()) {
                     Ok(()) => true,
-                    Err(mpsc::TrySendError::Full(_)) => {
+                    Err(TrySendError::Full(_)) => {
                         log::warn!(
                             "PersistentUsb: raw subscriber queue full, dropped {} message",
                             msg.header().command()
@@ -596,7 +739,7 @@ impl PersistentUsbConnection {
                         true
                     }
                     // Receiver dropped → prune this subscriber.
-                    Err(mpsc::TrySendError::Disconnected(_)) => false,
+                    Err(TrySendError::Closed(_)) => false,
                 }
             } else {
                 true
@@ -608,27 +751,34 @@ impl PersistentUsbConnection {
     ///
     /// When `delayed_ack` is negotiated for this connection, the session uses
     /// windowed flow control (32 MiB initial window, granted per AOSP semantics);
-    /// otherwise it uses classic strict stop-and-wait. The blocking `Read`/`Write`
-    /// trait contract is identical in both modes (see [`MultiplexedSession`]).
+    /// otherwise it uses classic strict stop-and-wait. The async
+    /// `AsyncRead`/`AsyncWrite` contract is identical in both modes (see
+    /// [`MultiplexedSession`]).
     ///
     /// # Errors
     ///
-    /// Returns [`RustADBError::PoisonError`] if an internal mutex is poisoned,
+    /// Returns [`RustADBError::SendError`] if a background task is gone,
     /// [`RustADBError::ADBRequestFailed`] on a missing/late OKAY, or any
     /// transport error.
-    pub fn open_session(&self, cmd: &ADBLocalCommand) -> Result<MultiplexedSession> {
+    pub async fn open_session(&self, cmd: &ADBLocalCommand) -> Result<MultiplexedSession> {
         let mut rng = rand::rng();
         let local_id: u32 = rng.random();
 
         // Create separate channels for data (WRTE/CLSE) and acks (OKAY)
-        let (data_tx, data_rx) = mpsc::sync_channel(SESSION_CHANNEL_SIZE);
-        let (ack_tx, ack_rx) = mpsc::sync_channel(SESSION_CHANNEL_SIZE);
+        let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (ack_tx, mut ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
 
-        // Register in session map BEFORE sending OPEN (reader may respond fast)
-        {
-            let mut sessions = self.sessions.lock()?;
-            sessions.insert(local_id, SessionChannels { data_tx, ack_tx });
-        }
+        // Register in the reader's session map BEFORE sending OPEN (the reader
+        // may respond fast). The control message is applied before any frame
+        // for this id can be routed because the reader applies control messages
+        // and reads from the same `select!` loop.
+        self.control_tx
+            .send(ReaderControl::Register(
+                local_id,
+                SessionChannels { data_tx, ack_tx },
+            ))
+            .await
+            .map_err(|_| RustADBError::SendError)?;
 
         // Send OPEN message (ADB protocol requires null-terminated service string)
         let mut service_bytes = cmd.to_string().into_bytes();
@@ -655,20 +805,33 @@ impl PersistentUsbConnection {
             open_arg1,
             &service_bytes,
         )?;
-
-        {
-            let mut writer = self.writer.lock()?;
-            writer.write_message(open_msg)?;
+        if self.writer.send_with_ack(open_msg).await.is_err() {
+            let _ = self
+                .control_tx
+                .send(ReaderControl::Unregister(local_id))
+                .await;
+            return Err(RustADBError::SendError);
         }
 
         // Wait for OKAY response on ack channel
-        let response = ack_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
-            RustADBError::ADBRequestFailed("open_session: timeout waiting for OKAY".into())
-        })?;
+        let response = match tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await {
+            Ok(Some(msg)) => msg,
+            _ => {
+                let _ = self
+                    .control_tx
+                    .send(ReaderControl::Unregister(local_id))
+                    .await;
+                return Err(RustADBError::ADBRequestFailed(
+                    "open_session: timeout waiting for OKAY".into(),
+                ));
+            }
+        };
 
         if response.header().command() != MessageCommand::Okay {
-            // Unregister
-            self.sessions.lock()?.remove(&local_id);
+            let _ = self
+                .control_tx
+                .send(ReaderControl::Unregister(local_id))
+                .await;
             return Err(RustADBError::ADBRequestFailed(format!(
                 "open_session: expected OKAY, got {}",
                 response.header().command()
@@ -694,33 +857,44 @@ impl PersistentUsbConnection {
         // (32 MiB as i32 LE in the payload). Without it (classic), the OKAY
         // carries an empty payload and just signals readiness. adbd won't send
         // WRTE until it gets this initial OKAY.
-        {
-            let ready_payload = encode_okay_payload(
-                self.delayed_ack_negotiated,
-                usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX),
-            );
-            let ready_msg = ADBTransportMessage::try_new(
-                MessageCommand::Okay,
-                local_id,
-                remote_id,
-                &ready_payload,
-            )?;
-            let mut writer = self.writer.lock()?;
-            writer.write_message(ready_msg)?;
+        let ready_payload = encode_okay_payload(
+            self.delayed_ack_negotiated,
+            usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX),
+        );
+        let ready_msg = ADBTransportMessage::try_new(
+            MessageCommand::Okay,
+            local_id,
+            remote_id,
+            &ready_payload,
+        )?;
+        self.writer
+            .try_send_fire_forget(ready_msg)
+            .map_err(|_| RustADBError::SendError)?;
+
+        // Take any window deltas already buffered on the ack channel (the device
+        // may have credited us between OPEN and now); non-blocking.
+        while let Ok(extra) = ack_rx.try_recv() {
+            send_flow.on_okay_payload(extra.payload());
         }
 
-        Ok(MultiplexedSession {
+        let close_state = Arc::new(AtomicBool::new(false));
+        let inner = SessionInner {
             local_id,
             remote_id,
             writer: self.writer.clone(),
+            control_tx: self.control_tx.clone(),
+            closed: close_state,
+            windowed: self.delayed_ack_negotiated,
+        };
+
+        Ok(MultiplexedSession {
+            shared: Arc::new(inner),
             data_rx,
             ack_rx,
-            sessions: self.sessions.clone(),
             read_buf: Vec::new(),
             read_pos: 0,
-            closed: false,
-            windowed: self.delayed_ack_negotiated,
             send_flow,
+            write_state: WriteState::Idle,
         })
     }
 
@@ -729,43 +903,32 @@ impl PersistentUsbConnection {
     /// Returns a [`SyncSession`] for `adb push`/`adb pull`. It opens a normal
     /// `sync:` session ([`Self::open_session`]) and rides the shared reader-loop
     /// demux like any other stream — so file transfer runs on the SAME
-    /// authenticated USB connection as concurrent shell/tcp sessions. This is
-    /// the crate-side mechanism that removes the need to open a separate,
-    /// exclusive `ADBUSBDevice` for push/pull (which would double-claim the USB
-    /// interface and conflict with this connection's exclusive claim).
+    /// authenticated USB connection as concurrent shell/tcp sessions.
     ///
     /// SYNC v2 + compression is out of scope; this is v1 only.
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`Self::open_session`] (poisoned mutex, missing
-    /// OKAY, or transport error).
-    pub fn open_sync_session(&self) -> Result<SyncSession> {
-        let session = self.open_session(&ADBLocalCommand::Sync)?;
+    /// Propagates any error from [`Self::open_session`].
+    pub async fn open_sync_session(&self) -> Result<SyncSession> {
+        let session = self.open_session(&ADBLocalCommand::Sync).await?;
         Ok(SyncSession::new(session))
     }
 
     /// Open a `shell,v2` session on this connection and decode the inner-frame
     /// protocol (separate stdout/stderr + exit code).
     ///
-    /// Unlike the v1 [`Self::shell_exec`] (which streams raw bytes and cannot
-    /// report an exit code), this requests the shell-v2 service
-    /// (`shell,v2,raw:<cmd>`) and returns a [`ShellV2Session`] that decodes the
-    /// `[id][len][payload]` frames. Call [`ShellV2Session::execute`] to run the
-    /// command to completion and obtain stdout/stderr/exit-code.
-    ///
-    /// Requires the device to support `shell_v2` (advertised in its CNXN
-    /// banner). The v1 [`Self::shell_exec`] remains available for back-compat.
+    /// Requests the shell-v2 service (`shell,v2,raw:<cmd>`) and returns a
+    /// [`ShellV2Session`] that decodes the `[id][len][payload]` frames.
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`Self::open_session`] (poisoned mutex, missing
-    /// OKAY, or transport error).
-    pub fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> {
+    /// Propagates any error from [`Self::open_session`].
+    pub async fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> {
         // Non-empty args ⇒ `ADBLocalCommand` formats the service as
         // `shell,v2,raw:<cmd>` (shell-v2), vs the empty-args `shell:<cmd>` (v1).
         let command = ADBLocalCommand::ShellCommand(cmd.to_string(), vec!["v2".to_string()]);
-        let session = self.open_session(&command)?;
+        let session = self.open_session(&command).await?;
         Ok(ShellV2Session::new(session))
     }
 
@@ -774,14 +937,16 @@ impl PersistentUsbConnection {
     /// This is the v1 (raw, no inner framing) path: it cannot report an exit
     /// code (always `None`). For separated stdout/stderr and a real exit code,
     /// use [`Self::open_shell_v2`].
-    pub fn shell_exec(&self, cmd: &str) -> Result<(String, Option<u8>)> {
+    pub async fn shell_exec(&self, cmd: &str) -> Result<(String, Option<u8>)> {
+        use tokio::io::AsyncReadExt;
+
         let command = ADBLocalCommand::ShellCommand(cmd.to_string(), vec![]);
-        let mut session = self.open_session(&command)?;
+        let mut session = self.open_session(&command).await?;
 
         let mut output = Vec::new();
         loop {
             let mut buf = [0u8; 4096];
-            match session.read(&mut buf) {
+            match session.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => output.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -789,14 +954,11 @@ impl PersistentUsbConnection {
             }
         }
 
-        // The last byte of shell output is the exit code (ADB shell v2 protocol isn't used here,
-        // but the simple shell protocol doesn't include exit code in the stream).
-        // For compatibility with the existing API, return None for exit code.
         let text = String::from_utf8_lossy(&output).to_string();
         Ok((text, None))
     }
 
-    /// Check if the connection is still alive (reader thread running).
+    /// Check if the connection is still alive (reader task running).
     #[must_use]
     pub fn is_alive(&self) -> bool {
         match &self.reader_handle {
@@ -804,429 +966,250 @@ impl PersistentUsbConnection {
             None => false,
         }
     }
+
+    /// Gracefully close the connection: enqueues a connection-level CLSE and
+    /// aborts the background tasks after the writer drains.
+    ///
+    /// `Drop` does this best-effort automatically; call `close` explicitly when
+    /// you want to ensure the CLSE is flushed before the connection is dropped.
+    pub async fn close(mut self) {
+        // Best-effort connection-level CLSE.
+        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
+            let _ = self.writer.send_with_ack(clse).await;
+        }
+        // Dropping the writer handle + control tx lets both tasks drain and exit;
+        // then abort to guarantee they stop even if a read is in flight.
+        if let Some(h) = self.reader_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.writer_handle.take() {
+            h.abort();
+        }
+    }
+}
+
+/// Outcome of a single reader `select!` step.
+enum ReadStep {
+    Message(ADBTransportMessage),
+    ReadTimeout,
+    Control,
+    Closed,
+    ReadError(RustADBError),
 }
 
 impl Drop for PersistentUsbConnection {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        // Best-effort connection-level CLSE: fire-and-forget onto the writer
+        // queue (we cannot `.await` in Drop). If the queue is full or the writer
+        // is gone, the abort below still tears the connection down.
+        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
+            let _ = self.writer.try_send_fire_forget(clse);
+        }
         if let Some(handle) = self.reader_handle.take() {
-            // Give reader thread time to notice shutdown
-            let _ = handle.join();
+            handle.abort();
         }
-        // Disconnect the writer transport
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.disconnect();
+        if let Some(handle) = self.writer_handle.take() {
+            handle.abort();
         }
     }
 }
 
-/// A multiplexed session over a persistent USB connection.
-///
-/// Represents a single ADB stream (e.g., one shell command or one TCP connection).
-/// Implements `Read + Write` for use as a byte stream. Thread-safe writes via
-/// the shared writer mutex; reads come from a dedicated per-session channel.
-pub struct MultiplexedSession {
+/// Shared per-session context cloned into both halves: the writer handle, the
+/// reader control channel (for unregistration on close), socket ids, and the
+/// shared close flag. Reference-counted so the session map entry is removed and
+/// the CLSE is sent exactly once when the last reference is dropped.
+struct SessionInner {
     local_id: u32,
     remote_id: u32,
-    writer: Arc<Mutex<USBTransport>>,
-    /// Channel for data messages (WRTE, CLSE)
-    data_rx: Receiver<ADBTransportMessage>,
-    /// Channel for flow control (OKAY)
-    ack_rx: Receiver<ADBTransportMessage>,
-    sessions: Arc<Mutex<HashMap<u32, SessionChannels>>>,
-    read_buf: Vec<u8>,
-    read_pos: usize,
-    closed: bool,
-    /// Whether `delayed_ack` windowed flow control is active for this session.
-    /// Governs both the OKAY payload emitted on the read side and the windowing
-    /// on the write side.
+    writer: WriterHandle,
+    control_tx: mpsc::Sender<ReaderControl>,
+    /// Shared close flag. `true` once a CLSE has been observed (inbound) or sent.
+    closed: Arc<AtomicBool>,
+    /// Whether `delayed_ack` windowing is active for this session.
     windowed: bool,
-    /// Send-side flow control window (windowed mode) / stop-and-wait marker
-    /// (classic mode). Touched only by the write path.
-    send_flow: FlowControl,
 }
 
-/// Channels for a single multiplexed session.
-pub struct SessionChannels {
-    pub data_tx: SyncSender<ADBTransportMessage>,
-    pub ack_tx: SyncSender<ADBTransportMessage>,
-}
-
-impl MultiplexedSession {
-    /// Get the local session ID.
-    #[must_use]
-    pub fn local_id(&self) -> u32 {
-        self.local_id
+impl SessionInner {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
-    /// Get the remote session ID.
-    #[must_use]
-    pub fn remote_id(&self) -> u32 {
-        self.remote_id
-    }
-
-    /// Split into independent read and write halves for concurrent use.
-    /// The session map entry is cleaned up when BOTH halves are dropped.
-    #[must_use]
-    pub fn into_split(mut self) -> (SessionReadHalf, SessionWriteHalf) {
-        let local_id = self.local_id;
-        let remote_id = self.remote_id;
-        let writer = self.writer.clone();
-        let sessions = self.sessions.clone();
-
-        // Use ManuallyDrop + ptr::read to move fields out before forgetting self
-        let data_rx = std::mem::replace(&mut self.data_rx, {
-            // Create a dummy receiver that will never be used
-            let (_, rx) = mpsc::sync_channel(1);
-            rx
-        });
-        let ack_rx = std::mem::replace(&mut self.ack_rx, {
-            let (_, rx) = mpsc::sync_channel(1);
-            rx
-        });
-        let read_buf = std::mem::take(&mut self.read_buf);
-        let read_pos = self.read_pos;
-        let closed = self.closed;
-        let windowed = self.windowed;
-        let send_flow = std::mem::replace(&mut self.send_flow, FlowControl::new_classic());
-
-        // Prevent Drop from sending CLSE or removing from sessions
-        self.closed = true; // suppress CLSE in Drop
-        // Drop will still remove from sessions map, but we'll re-insert...
-        // Actually, better: just mark closed so Drop only removes from map.
-        // We need to NOT remove from map. Let's just forget self.
-        // But we already replaced fields with dummies, so Drop is safe to run
-        // on the dummies. Actually the Drop will send CLSE if !closed and remove from map.
-        // Set closed=true above prevents CLSE. But it will still remove from sessions.
-        // We don't want that. So let's just std::mem::forget.
-        std::mem::forget(self);
-
-        let close_state = Arc::new(std::sync::atomic::AtomicBool::new(closed));
-        let cleanup = Arc::new(SessionCleanup {
-            local_id,
-            remote_id,
-            writer: writer.clone(),
-            sessions,
-            closed: close_state.clone(),
-        });
-
-        let read_half = SessionReadHalf {
-            local_id,
-            remote_id,
-            writer: writer.clone(),
-            data_rx,
-            read_buf,
-            read_pos,
-            closed: close_state.clone(),
-            windowed,
-            _cleanup: cleanup.clone(),
-        };
-
-        let write_half = SessionWriteHalf {
-            local_id,
-            remote_id,
-            writer,
-            ack_rx,
-            closed: close_state,
-            send_flow,
-            _cleanup: cleanup,
-        };
-
-        (read_half, write_half)
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Relaxed);
     }
 }
 
-/// Shared cleanup logic — sends CLSE and removes from sessions map when last reference dropped.
-struct SessionCleanup {
-    local_id: u32,
-    remote_id: u32,
-    writer: Arc<Mutex<USBTransport>>,
-    sessions: Arc<Mutex<HashMap<u32, SessionChannels>>>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for SessionCleanup {
+impl Drop for SessionInner {
     fn drop(&mut self) {
-        if !self.closed.load(std::sync::atomic::Ordering::Relaxed)
+        // Best-effort CLSE + unregister. Fire-and-forget; cannot `.await` here.
+        if !self.is_closed()
             && let Ok(clse) = ADBTransportMessage::try_new(
                 MessageCommand::Clse,
                 self.local_id,
                 self.remote_id,
                 &[],
             )
-            && let Ok(mut writer) = self.writer.lock()
         {
-            let _ = writer.write_message(clse);
+            let _ = self.writer.try_send_fire_forget(clse);
         }
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(&self.local_id);
-        }
+        // Ask the reader to drop this session id from its registry.
+        let _ = self
+            .control_tx
+            .try_send(ReaderControl::Unregister(self.local_id));
     }
 }
 
-/// Read half of a split `MultiplexedSession`.
-pub struct SessionReadHalf {
-    local_id: u32,
-    remote_id: u32,
-    writer: Arc<Mutex<USBTransport>>,
-    data_rx: Receiver<ADBTransportMessage>,
+/// A multiplexed session over a persistent USB connection.
+///
+/// Represents a single ADB stream (e.g., one shell command or one TCP
+/// connection). Implements [`AsyncRead`] + [`AsyncWrite`] for use as a byte
+/// stream. Writes go through the single writer task; reads come from a dedicated
+/// per-session channel fed by the reader task.
+pub struct MultiplexedSession {
+    shared: Arc<SessionInner>,
+    /// Channel for data messages (WRTE, CLSE).
+    data_rx: mpsc::Receiver<ADBTransportMessage>,
+    /// Channel for flow control (OKAY).
+    ack_rx: mpsc::Receiver<ADBTransportMessage>,
     read_buf: Vec<u8>,
     read_pos: usize,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether `delayed_ack` windowing is active (governs the OKAY payload).
-    windowed: bool,
-    _cleanup: Arc<SessionCleanup>,
-}
-
-/// Write half of a split `MultiplexedSession`.
-pub struct SessionWriteHalf {
-    local_id: u32,
-    remote_id: u32,
-    writer: Arc<Mutex<USBTransport>>,
-    ack_rx: Receiver<ADBTransportMessage>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    /// Send-side flow-control window (windowed) / stop-and-wait marker (classic).
+    /// Send-side flow control window (windowed) / stop-and-wait marker (classic).
     send_flow: FlowControl,
-    _cleanup: Arc<SessionCleanup>,
+    /// In-flight write state (drives one WRTE through the writer task).
+    write_state: WriteState,
 }
 
-/// Map a poisoned writer mutex into an `io::Error` for the `Read`/`Write` impls
-/// (which can only return `io::Result`). Avoids the forbidden `lock().unwrap()`.
-fn lock_writer(
-    writer: &Mutex<USBTransport>,
-) -> io::Result<std::sync::MutexGuard<'_, USBTransport>> {
-    writer
-        .lock()
-        .map_err(|_| io::Error::other(RustADBError::PoisonError.to_string()))
+/// Channels for a single multiplexed session (held by the reader task).
+pub struct SessionChannels {
+    pub data_tx: mpsc::Sender<ADBTransportMessage>,
+    pub ack_tx: mpsc::Sender<ADBTransportMessage>,
 }
 
-/// Immutable per-session wire context shared by the read/write helpers: the
-/// writer mutex plus the local/remote socket ids. Grouping these keeps the
-/// shared helpers under clippy's argument-count limit and makes the read/write
-/// call sites read uniformly.
-struct SessionWire<'a> {
-    writer: &'a Mutex<USBTransport>,
-    local_id: u32,
-    remote_id: u32,
+#[cfg(test)]
+impl MultiplexedSession {
+    /// Test-only constructor that wires a session directly to caller-supplied
+    /// channels (bypassing the real USB handshake). The returned `writer_rx` is
+    /// the writer-task side of the outbound-frame channel; tests drive it to
+    /// emulate the writer task and observe what the session enqueues.
+    fn new_for_test(
+        local_id: u32,
+        remote_id: u32,
+        windowed: bool,
+        send_flow: FlowControl,
+    ) -> (
+        Self,
+        mpsc::Sender<ADBTransportMessage>, // data_tx (feed WRTE/CLSE to the session)
+        mpsc::Sender<ADBTransportMessage>, // ack_tx  (feed OKAY/CLSE acks)
+        mpsc::Receiver<OutboundFrame>,     // writer_rx (what the session sends out)
+        mpsc::Receiver<ReaderControl>,     // control_rx (unregister on drop/close)
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (ack_tx, ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_SIZE);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_SIZE);
+        let shared = Arc::new(SessionInner {
+            local_id,
+            remote_id,
+            writer: WriterHandle { tx: writer_tx },
+            control_tx,
+            closed: Arc::new(AtomicBool::new(false)),
+            windowed,
+        });
+        let session = Self {
+            shared,
+            data_rx,
+            ack_rx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            send_flow,
+            write_state: WriteState::Idle,
+        };
+        (session, data_tx, ack_tx, writer_rx, control_rx)
+    }
 }
 
-/// Mutable re-buffering state for the read side (the tail of a WRTE payload that
-/// did not fit into the caller's `buf` on the previous `read`).
-struct ReadBuffer<'a> {
-    buf: &'a mut Vec<u8>,
-    pos: &'a mut usize,
-}
-
-/// Shared read-with-ack body for both `SessionReadHalf` and `MultiplexedSession`.
-///
-/// Receives one message from the data channel (after draining the local
-/// re-buffered tail), emits the appropriate OKAY (windowed: payload = bytes just
-/// delivered as i32 LE; classic: empty payload), copies the WRTE payload into
-/// `buf`, and re-buffers any remainder. This is the SINGLE implementation of the
-/// receive-side flow-control policy — both read paths call it, so the windowing
-/// is not copy-pasted (code-reuse-thinking-guide).
-fn read_with_ack(
-    wire: &SessionWire<'_>,
-    data_rx: &Receiver<ADBTransportMessage>,
-    windowed: bool,
-    rebuf: ReadBuffer<'_>,
-    buf: &mut [u8],
-) -> io::Result<ReadOutcome> {
-    let ReadBuffer {
-        buf: read_buf,
-        pos: read_pos,
-    } = rebuf;
-    // Return buffered data first (no new OKAY needed; it was acked on arrival).
-    if *read_pos < read_buf.len() {
-        let available = &read_buf[*read_pos..];
-        let to_copy = available.len().min(buf.len());
-        buf[..to_copy].copy_from_slice(&available[..to_copy]);
-        *read_pos += to_copy;
-        if *read_pos >= read_buf.len() {
-            read_buf.clear();
-            *read_pos = 0;
-        }
-        return Ok(ReadOutcome::Data(to_copy));
+impl MultiplexedSession {
+    /// Get the local session ID.
+    #[must_use]
+    pub fn local_id(&self) -> u32 {
+        self.shared.local_id
     }
 
-    let msg = data_rx
-        .recv()
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session channel closed"))?;
+    /// Get the remote session ID.
+    #[must_use]
+    pub fn remote_id(&self) -> u32 {
+        self.shared.remote_id
+    }
 
-    match msg.header().command() {
-        MessageCommand::Write => {
-            let payload = msg.into_payload();
-            // Emit the OKAY crediting the receive window: in windowed mode the
-            // payload is the just-delivered byte count (i32 LE), eagerly per
-            // flush; in classic mode it is empty (the stop-and-wait rendezvous).
-            let okay_payload = encode_okay_payload(windowed, payload.len());
-            let okay = ADBTransportMessage::try_new(
-                MessageCommand::Okay,
-                wire.local_id,
-                wire.remote_id,
-                &okay_payload,
+    /// Gracefully close the session: send a CLSE and mark the session closed so
+    /// `Drop` does not send a duplicate. Best-effort; ignores write errors.
+    pub async fn close(self) {
+        if !self.shared.is_closed()
+            && let Ok(clse) = ADBTransportMessage::try_new(
+                MessageCommand::Clse,
+                self.shared.local_id,
+                self.shared.remote_id,
+                &[],
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            {
-                let mut writer = lock_writer(wire.writer)?;
-                writer
-                    .write_message(okay)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-            }
-            if payload.is_empty() {
-                return Ok(ReadOutcome::Data(0));
-            }
-            let to_copy = payload.len().min(buf.len());
-            buf[..to_copy].copy_from_slice(&payload[..to_copy]);
-            if to_copy < payload.len() {
-                *read_buf = payload;
-                *read_pos = to_copy;
-            }
-            Ok(ReadOutcome::Data(to_copy))
+        {
+            let _ = self.shared.writer.send_with_ack(clse).await;
+            self.shared.mark_closed();
         }
-        MessageCommand::Clse => Ok(ReadOutcome::Closed),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected command in data channel: {other}"),
-        )),
+        // Drop runs here: `SessionInner` sees `closed == true`, so it only
+        // unregisters from the reader (no duplicate CLSE).
+    }
+
+    /// Split into independent read and write halves for concurrent use.
+    /// The session map entry is cleaned up and a CLSE sent when BOTH halves are
+    /// dropped (the shared [`SessionInner`] is reference-counted).
+    #[must_use]
+    pub fn into_split(self) -> (SessionReadHalf, SessionWriteHalf) {
+        let shared = self.shared;
+        let read_half = SessionReadHalf {
+            shared: shared.clone(),
+            data_rx: self.data_rx,
+            read_buf: self.read_buf,
+            read_pos: self.read_pos,
+        };
+        let write_half = SessionWriteHalf {
+            shared,
+            ack_rx: self.ack_rx,
+            send_flow: self.send_flow,
+            write_state: WriteState::Idle,
+        };
+        (read_half, write_half)
     }
 }
 
-/// Result of [`read_with_ack`]: either bytes were copied into the buffer, or the
-/// stream was closed (the caller flips its own `closed` flag, which differs
-/// between the owned session and the split half).
-enum ReadOutcome {
-    Data(usize),
-    Closed,
+/// Read half of a split [`MultiplexedSession`].
+pub struct SessionReadHalf {
+    shared: Arc<SessionInner>,
+    data_rx: mpsc::Receiver<ADBTransportMessage>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
 }
 
-/// Shared windowed-write body for both `SessionWriteHalf` and `MultiplexedSession`.
+/// Write half of a split [`MultiplexedSession`].
+pub struct SessionWriteHalf {
+    shared: Arc<SessionInner>,
+    ack_rx: mpsc::Receiver<ADBTransportMessage>,
+    send_flow: FlowControl,
+    write_state: WriteState,
+}
+
+/// State of the write side's single in-flight WRTE.
 ///
-/// This is the SINGLE implementation of the send-side flow-control policy. Both
-/// write paths call it, so the windowing logic is not copy-pasted.
-///
-/// Behavior (preserves the blocking `io::Write` contract, D7):
-/// - Drain any already-arrived OKAYs (non-blocking) to credit the window.
-/// - If windowed and the window is exhausted (`<= 0`), BLOCK on the ack channel
-///   until an OKAY credits it (or a CLSE closes the stream). This is the only
-///   point that blocks for backpressure.
-/// - Send ONE chunk (clamped to `MAX_PAYLOAD` = 1 MiB), debit the window, and
-///   return its length. Multiple WRTEs may be in flight up to the 32 MiB window
-///   — we do NOT wait for this chunk's own OKAY (that's the pipelining).
-/// - In classic mode (`!windowed`) preserve strict stop-and-wait: after sending
-///   the chunk, block for exactly one OKAY before returning.
-///
-/// Borrowed close-state accessors. The owned session uses a plain `bool` while
-/// the split halves share an atomic, so close detection is abstracted behind two
-/// closures rather than a concrete type.
-struct CloseState<'a> {
-    is_closed: &'a dyn Fn() -> bool,
-    set_closed: &'a dyn Fn(),
-}
-
-/// Returns the number of `buf` bytes accepted into the pipeline.
-fn windowed_write(
-    wire: &SessionWire<'_>,
-    ack_rx: &Receiver<ADBTransportMessage>,
-    send_flow: &mut FlowControl,
-    close: &CloseState<'_>,
-    buf: &[u8],
-) -> io::Result<usize> {
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    if (close.is_closed)() {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
-    }
-
-    // 1. Credit the window with any OKAYs that have already arrived (non-blocking).
-    drain_acks(ack_rx, send_flow, close)?;
-    if (close.is_closed)() {
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "session closed by remote",
-        ));
-    }
-
-    // 2. Windowed backpressure: if the window is exhausted, block until credited.
-    if send_flow.is_windowed() {
-        while !send_flow.can_send() {
-            let response = ack_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timeout waiting for OKAY to reopen send window",
-                )
-            })?;
-            apply_ack(&response, send_flow, close)?;
-            if (close.is_closed)() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "session closed by remote",
-                ));
-            }
-            // Opportunistically credit anything else already queued.
-            drain_acks(ack_rx, send_flow, close)?;
-        }
-    }
-
-    // 3. Send one chunk, clamped to MAX_PAYLOAD (decoupled from the window).
-    let chunk_size = buf.len().min(MAX_PAYLOAD);
-    let chunk = &buf[..chunk_size];
-    let msg =
-        ADBTransportMessage::try_new(MessageCommand::Write, wire.local_id, wire.remote_id, chunk)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-    {
-        let mut writer = lock_writer(wire.writer)?;
-        writer
-            .write_message(msg)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-    }
-    send_flow.record_sent(chunk_size);
-    log::trace!(
-        "PersistentUsb: session {} sent WRTE size={chunk_size}, window={:?}",
-        wire.local_id,
-        send_flow.available_bytes()
-    );
-
-    // 4. Classic mode preserves strict stop-and-wait: block for one OKAY.
-    if !send_flow.is_windowed() {
-        let response = ack_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timeout waiting for OKAY after WRTE",
-            )
-        })?;
-        apply_ack(&response, send_flow, close)?;
-        if (close.is_closed)() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session closed by remote",
-            ));
-        }
-    }
-
-    Ok(chunk_size)
-}
-
-/// Drain all currently-queued ack-channel messages (non-blocking), applying each
-/// to the send window / close state.
-fn drain_acks(
-    ack_rx: &Receiver<ADBTransportMessage>,
-    send_flow: &mut FlowControl,
-    close: &CloseState<'_>,
-) -> io::Result<()> {
-    loop {
-        match ack_rx.try_recv() {
-            Ok(msg) => apply_ack(&msg, send_flow, close)?,
-            Err(mpsc::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "session ack channel closed",
-                ));
-            }
-        }
-    }
+/// `Idle` means no write is outstanding. `Sending` holds the `oneshot::Receiver`
+/// for the writer task's write result plus the byte count to debit once the
+/// write confirms — we poll the receiver directly (no boxed `'static` future,
+/// no borrow of the session's channels), keeping the accounting on a single
+/// non-await segment after the ack (P1-①, P1-③).
+enum WriteState {
+    Idle,
+    Sending {
+        ack: oneshot::Receiver<io::Result<()>>,
+        chunk_size: usize,
+    },
 }
 
 /// Apply a single ack-channel message: OKAY credits the window from its payload
@@ -1234,7 +1217,7 @@ fn drain_acks(
 fn apply_ack(
     msg: &ADBTransportMessage,
     send_flow: &mut FlowControl,
-    close: &CloseState<'_>,
+    shared: &SessionInner,
 ) -> io::Result<()> {
     match msg.header().command() {
         MessageCommand::Okay => {
@@ -1249,7 +1232,7 @@ fn apply_ack(
             Ok(())
         }
         MessageCommand::Clse => {
-            (close.set_closed)();
+            shared.mark_closed();
             Ok(())
         }
         other => Err(io::Error::new(
@@ -1259,129 +1242,345 @@ fn apply_ack(
     }
 }
 
-impl Read for SessionReadHalf {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(0);
+/// Drive the shared `poll_read` state machine: drain any re-buffered tail first,
+/// otherwise `poll_recv` the per-session data channel, emit the crediting OKAY
+/// (synchronously, no await between recv and OKAY — cancellation safety, P1-③),
+/// and copy the WRTE payload into `buf`. Shared by [`MultiplexedSession`] and
+/// [`SessionReadHalf`].
+///
+/// `poll_recv` is cancel-safe: a cancelled `poll_read` future does NOT take a
+/// message off the channel, so a window credit cannot be lost in the gap between
+/// receiving a WRTE and enqueueing its OKAY — those happen in one synchronous
+/// step here.
+fn poll_read_impl(
+    cx: &mut Context<'_>,
+    shared: &Arc<SessionInner>,
+    data_rx: &mut mpsc::Receiver<ADBTransportMessage>,
+    read_buf: &mut Vec<u8>,
+    read_pos: &mut usize,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<()>> {
+    if shared.is_closed() {
+        return Poll::Ready(Ok(()));
+    }
+
+    // Return buffered data first (no new OKAY needed; it was acked on arrival).
+    if *read_pos < read_buf.len() {
+        let available = &read_buf[*read_pos..];
+        let to_copy = available.len().min(buf.remaining());
+        buf.put_slice(&available[..to_copy]);
+        *read_pos += to_copy;
+        if *read_pos >= read_buf.len() {
+            read_buf.clear();
+            *read_pos = 0;
         }
-        let wire = SessionWire {
-            writer: &self.writer,
-            local_id: self.local_id,
-            remote_id: self.remote_id,
-        };
-        let rebuf = ReadBuffer {
-            buf: &mut self.read_buf,
-            pos: &mut self.read_pos,
-        };
-        match read_with_ack(&wire, &self.data_rx, self.windowed, rebuf, buf)? {
-            ReadOutcome::Data(n) => Ok(n),
-            ReadOutcome::Closed => {
-                self.closed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(0)
+        return Poll::Ready(Ok(()));
+    }
+
+    match data_rx.poll_recv(cx) {
+        Poll::Ready(Some(msg)) => match msg.header().command() {
+            MessageCommand::Write => {
+                let payload = msg.into_payload();
+                let okay_payload = encode_okay_payload(shared.windowed, payload.len());
+                let okay = match ADBTransportMessage::try_new(
+                    MessageCommand::Okay,
+                    shared.local_id,
+                    shared.remote_id,
+                    &okay_payload,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+                };
+                // Synchronous, non-blocking enqueue — no await between recv and
+                // OKAY (cancellation safety, P1-③).
+                if let Err(e) = shared.writer.try_send_fire_forget(okay) {
+                    return Poll::Ready(Err(e));
+                }
+                if payload.is_empty() {
+                    // 0-byte frame: nothing to copy; the read still made progress.
+                    return Poll::Ready(Ok(()));
+                }
+                let to_copy = payload.len().min(buf.remaining());
+                buf.put_slice(&payload[..to_copy]);
+                if to_copy < payload.len() {
+                    *read_buf = payload;
+                    *read_pos = to_copy;
+                }
+                Poll::Ready(Ok(()))
+            }
+            MessageCommand::Clse => {
+                shared.mark_closed();
+                Poll::Ready(Ok(())) // EOF (0 bytes filled)
+            }
+            other => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected command in data channel: {other}"),
+            ))),
+        },
+        Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "session channel closed",
+        ))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Drive the shared `poll_write` state machine — the SINGLE send-side
+/// flow-control policy, shared by both write paths.
+///
+/// Steps (preserving the windowed flow-control semantics of the sync impl):
+/// 1. If a WRTE is already in flight, poll its `oneshot` ack; on success debit
+///    the window (`record_sent`) in one synchronous segment (P1-①).
+/// 2. Drain already-arrived OKAYs (non-blocking) to credit the window.
+/// 3. If windowed and the window is exhausted, `poll_recv` the ack channel until
+///    an OKAY credits it (registering the waker — backpressure).
+/// 4. Enqueue ONE WRTE chunk with an ack `oneshot` and stash the `Sending`
+///    state; poll it once so a synchronously-ready write completes immediately.
+fn poll_write_impl(
+    cx: &mut Context<'_>,
+    shared: &Arc<SessionInner>,
+    ack_rx: &mut mpsc::Receiver<ADBTransportMessage>,
+    send_flow: &mut FlowControl,
+    write_state: &mut WriteState,
+    buf: &[u8],
+) -> Poll<io::Result<usize>> {
+    // 1. Resolve any in-flight WRTE first: poll its write-result oneshot. The
+    //    window debit lands here, AFTER the write is confirmed, in one
+    //    synchronous (non-await) segment (P1-① / P1-③).
+    if let WriteState::Sending { ack, chunk_size } = write_state {
+        match Pin::new(ack).poll(cx) {
+            Poll::Ready(Ok(Ok(()))) => {
+                let n = *chunk_size;
+                send_flow.record_sent(n);
+                *write_state = WriteState::Idle;
+                log::trace!(
+                    "PersistentUsb: session {} sent WRTE size={n}, window={:?}",
+                    shared.local_id,
+                    send_flow.available_bytes()
+                );
+                return Poll::Ready(Ok(n));
+            }
+            Poll::Ready(Ok(Err(e))) => {
+                *write_state = WriteState::Idle;
+                shared.mark_closed();
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(Err(_canceled)) => {
+                *write_state = WriteState::Idle;
+                shared.mark_closed();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "writer dropped ack",
+                )));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+
+    if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+    }
+    if shared.is_closed() {
+        return Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "session closed",
+        )));
+    }
+
+    // 2. Credit the window with any OKAYs that already arrived (non-blocking).
+    loop {
+        match ack_rx.try_recv() {
+            Ok(msg) => apply_ack(&msg, send_flow, shared)?,
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "session ack channel closed",
+                )));
             }
         }
     }
-}
-
-impl Write for SessionWriteHalf {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let closed = &self.closed;
-        let is_closed = || closed.load(std::sync::atomic::Ordering::Relaxed);
-        let set_closed = || closed.store(true, std::sync::atomic::Ordering::Relaxed);
-        let wire = SessionWire {
-            writer: &self.writer,
-            local_id: self.local_id,
-            remote_id: self.remote_id,
-        };
-        let close = CloseState {
-            is_closed: &is_closed,
-            set_closed: &set_closed,
-        };
-        windowed_write(&wire, &self.ack_rx, &mut self.send_flow, &close, buf)
+    if shared.is_closed() {
+        return Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "session closed by remote",
+        )));
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Read for MultiplexedSession {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.closed {
-            return Ok(0);
-        }
-        let wire = SessionWire {
-            writer: &self.writer,
-            local_id: self.local_id,
-            remote_id: self.remote_id,
-        };
-        let rebuf = ReadBuffer {
-            buf: &mut self.read_buf,
-            pos: &mut self.read_pos,
-        };
-        match read_with_ack(&wire, &self.data_rx, self.windowed, rebuf, buf)? {
-            ReadOutcome::Data(n) => Ok(n),
-            ReadOutcome::Closed => {
-                self.closed = true;
-                Ok(0)
+    // 3. Windowed backpressure: if the window is exhausted, register for a wake
+    //    when an OKAY arrives. `poll_recv` registers the waker on Pending.
+    if send_flow.is_windowed() {
+        while !send_flow.can_send() {
+            match ack_rx.poll_recv(cx) {
+                Poll::Ready(Some(msg)) => {
+                    apply_ack(&msg, send_flow, shared)?;
+                    if shared.is_closed() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "session closed by remote",
+                        )));
+                    }
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "session ack channel closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
-}
 
-impl Write for MultiplexedSession {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // The owned session's `closed` is a plain `bool`, not the shared atomic
-        // of the split halves, so close-detection threads through a Cell.
-        let closed = std::cell::Cell::new(self.closed);
-        let is_closed = || closed.get();
-        let set_closed = || closed.set(true);
-        let wire = SessionWire {
-            writer: &self.writer,
-            local_id: self.local_id,
-            remote_id: self.remote_id,
-        };
-        let close = CloseState {
-            is_closed: &is_closed,
-            set_closed: &set_closed,
-        };
-        let result = windowed_write(&wire, &self.ack_rx, &mut self.send_flow, &close, buf);
-        // Mirror any close observed during the write back onto the session.
-        if closed.get() {
-            self.closed = true;
+    // 4. Enqueue ONE chunk (clamped to MAX_PAYLOAD) with a write-result oneshot.
+    let chunk_size = buf.len().min(MAX_PAYLOAD);
+    let msg = match ADBTransportMessage::try_new(
+        MessageCommand::Write,
+        shared.local_id,
+        shared.remote_id,
+        &buf[..chunk_size],
+    ) {
+        Ok(m) => m,
+        Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+    };
+    let (tx, rx) = oneshot::channel();
+    // Non-blocking enqueue onto the writer task. A full writer queue surfaces as
+    // backpressure (`WouldBlock`), which `poll_write` callers re-poll on wake.
+    match shared.writer.tx.try_send(OutboundFrame::WithAck(msg, tx)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            // Writer queue full; re-poll later. Wake immediately so the task is
+            // re-scheduled (the writer drains quickly under the single-writer
+            // model). This mirrors the reader's never-block discipline.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
-        result
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for MultiplexedSession {
-    fn drop(&mut self) {
-        // Send CLSE to remote
-        if !self.closed
-            && let Ok(clse) = ADBTransportMessage::try_new(
-                MessageCommand::Clse,
-                self.local_id,
-                self.remote_id,
-                &[],
-            )
-            && let Ok(mut writer) = self.writer.lock()
-        {
-            let _ = writer.write_message(clse);
-        }
-
-        // Unregister from sessions map
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(&self.local_id);
+        Err(TrySendError::Closed(_)) => {
+            shared.mark_closed();
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer task gone",
+            )));
         }
     }
+    *write_state = WriteState::Sending { ack: rx, chunk_size };
+
+    // Poll the just-created ack once so a synchronously-ready write completes now.
+    if let WriteState::Sending { ack, chunk_size } = write_state {
+        match Pin::new(ack).poll(cx) {
+            Poll::Ready(Ok(Ok(()))) => {
+                let n = *chunk_size;
+                send_flow.record_sent(n);
+                *write_state = WriteState::Idle;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Ok(Err(e))) => {
+                *write_state = WriteState::Idle;
+                shared.mark_closed();
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Err(_canceled)) => {
+                *write_state = WriteState::Idle;
+                shared.mark_closed();
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "writer dropped ack",
+                )))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    } else {
+        Poll::Pending
+    }
 }
 
-// MultiplexedSession is Send: all fields are Send-safe (Mutex, Arc, Receiver, Vec, etc.)
+impl AsyncRead for SessionReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        poll_read_impl(
+            cx,
+            &this.shared,
+            &mut this.data_rx,
+            &mut this.read_buf,
+            &mut this.read_pos,
+            buf,
+        )
+    }
+}
+
+impl AsyncWrite for SessionWriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        poll_write_impl(
+            cx,
+            &this.shared,
+            &mut this.ack_rx,
+            &mut this.send_flow,
+            &mut this.write_state,
+            buf,
+        )
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for MultiplexedSession {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        poll_read_impl(
+            cx,
+            &this.shared,
+            &mut this.data_rx,
+            &mut this.read_buf,
+            &mut this.read_pos,
+            buf,
+        )
+    }
+}
+
+impl AsyncWrite for MultiplexedSession {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        poll_write_impl(
+            cx,
+            &this.shared,
+            &mut this.ack_rx,
+            &mut this.send_flow,
+            &mut this.write_state,
+            buf,
+        )
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1394,8 +1593,8 @@ mod tests {
         for &id in ids {
             // `classify_message` only inspects key presence, so the dropped
             // receivers are irrelevant here.
-            let (data_tx, _) = mpsc::sync_channel(1);
-            let (ack_tx, _) = mpsc::sync_channel(1);
+            let (data_tx, _) = mpsc::channel(1);
+            let (ack_tx, _) = mpsc::channel(1);
             map.insert(id, SessionChannels { data_tx, ack_tx });
         }
         map
@@ -1462,12 +1661,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_tee_delivers_only_matching_messages() {
-        let subscribers: Arc<Mutex<Vec<RawSubscriber>>> = Arc::new(Mutex::new(Vec::new()));
+    #[tokio::test]
+    async fn raw_tee_delivers_only_matching_messages() {
+        let mut subscribers: Vec<RawSubscriber> = Vec::new();
         // Subscriber matches only WRTE messages.
-        let (tx, rx) = mpsc::sync_channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
-        subscribers.lock().expect("lock").push(RawSubscriber {
+        let (tx, mut rx) = mpsc::channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
+        subscribers.push(RawSubscriber {
             filter: Box::new(|m| m.header().command() == MessageCommand::Write),
             tx,
         });
@@ -1475,8 +1674,8 @@ mod tests {
         let wrte = msg(MessageCommand::Write, 1, 2, b"payload");
         let okay = msg(MessageCommand::Okay, 1, 2, &[]);
 
-        PersistentUsbConnection::tee_raw(&subscribers, &wrte);
-        PersistentUsbConnection::tee_raw(&subscribers, &okay);
+        PersistentUsbConnection::tee_raw(&mut subscribers, &wrte);
+        PersistentUsbConnection::tee_raw(&mut subscribers, &okay);
 
         let received = rx.try_recv().expect("matching WRTE should be tee'd");
         assert_eq!(
@@ -1527,11 +1726,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_tee_prunes_disconnected_subscribers() {
-        let subscribers: Arc<Mutex<Vec<RawSubscriber>>> = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::sync_channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
-        subscribers.lock().expect("lock").push(RawSubscriber {
+    #[tokio::test]
+    async fn raw_tee_prunes_disconnected_subscribers() {
+        let mut subscribers: Vec<RawSubscriber> = Vec::new();
+        let (tx, rx) = mpsc::channel(RAW_SUBSCRIBER_CHANNEL_SIZE);
+        subscribers.push(RawSubscriber {
             filter: Box::new(|_| true),
             tx,
         });
@@ -1539,11 +1738,248 @@ mod tests {
         drop(rx);
 
         let m = msg(MessageCommand::Write, 1, 2, b"x");
-        PersistentUsbConnection::tee_raw(&subscribers, &m);
+        PersistentUsbConnection::tee_raw(&mut subscribers, &m);
 
         assert!(
-            subscribers.lock().expect("lock").is_empty(),
+            subscribers.is_empty(),
             "tee must prune a subscriber whose receiver was dropped"
+        );
+    }
+
+    // --- Async session-stream integration tests (in-memory, no USB) ----------
+    //
+    // These exercise the writer-task contract, the read-side OKAY emission,
+    // windowed backpressure, cancellation safety, and teardown by wiring a
+    // `MultiplexedSession` directly to channels via `new_for_test` and emulating
+    // the writer task in the test.
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in for the writer task: receive one outbound frame, reply `Ok` on
+    /// any attached ack oneshot, and return the frame for assertions.
+    async fn pump_writer(rx: &mut mpsc::Receiver<OutboundFrame>) -> ADBTransportMessage {
+        match rx.recv().await.expect("writer frame") {
+            OutboundFrame::FireForget(m) => m,
+            OutboundFrame::WithAck(m, ack) => {
+                let _ = ack.send(Ok(()));
+                m
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_emits_okay_and_delivers_payload() {
+        let (mut session, data_tx, _ack_tx, mut writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, true, FlowControl::new_windowed(0));
+
+        // Reader task feeds one WRTE into the data channel.
+        data_tx
+            .send(msg(MessageCommand::Write, 20, 10, b"hello"))
+            .await
+            .expect("send WRTE");
+
+        let mut buf = [0u8; 5];
+        session.read_exact(&mut buf).await.expect("read payload");
+        assert_eq!(&buf, b"hello", "WRTE payload must be delivered to the reader");
+
+        // The session must have enqueued the crediting OKAY (windowed: 5 as i32 LE).
+        let okay = writer_rx.recv().await.expect("OKAY enqueued");
+        match okay {
+            OutboundFrame::FireForget(m) => {
+                assert_eq!(m.header().command(), MessageCommand::Okay, "credit is an OKAY");
+                assert_eq!(
+                    m.payload(),
+                    &5_i32.to_le_bytes(),
+                    "windowed OKAY payload must be the delivered byte count (i32 LE)"
+                );
+            }
+            OutboundFrame::WithAck(..) => panic!("OKAY must be fire-and-forget"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_goes_through_writer_task_with_ack() {
+        // Windowed with a credited window so the write is not blocked.
+        let (mut session, _data_tx, _ack_tx, mut writer_rx, _ctl) = MultiplexedSession::new_for_test(
+            10,
+            20,
+            true,
+            FlowControl::new_windowed(INITIAL_DELAYED_ACK_BYTES),
+        );
+
+        // Drive the write and the writer concurrently: poll_write enqueues a
+        // WithAck frame and awaits its oneshot; the emulated writer replies Ok.
+        let writer = tokio::spawn(async move {
+            let frame = pump_writer(&mut writer_rx).await;
+            assert_eq!(frame.header().command(), MessageCommand::Write, "WRTE on the wire");
+            assert_eq!(frame.payload(), b"data", "payload must match");
+        });
+
+        session.write_all(b"data").await.expect("write succeeds");
+        session.flush().await.expect("flush");
+        writer.await.expect("writer task");
+    }
+
+    #[tokio::test]
+    async fn write_blocks_until_window_credited_then_proceeds() {
+        // Opener window starts at 0 → first write must block until an OKAY
+        // credits the send window.
+        let (mut session, _data_tx, ack_tx, mut writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, true, FlowControl::new_windowed(0));
+
+        let write = tokio::spawn(async move {
+            session.write_all(b"abc").await.expect("write after credit");
+            session
+        });
+
+        // The write should be parked on the exhausted window — no frame yet.
+        tokio::task::yield_now().await;
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "no WRTE must be enqueued while the send window is exhausted"
+        );
+
+        // Credit the window via an OKAY on the ack channel.
+        ack_tx
+            .send(msg(MessageCommand::Okay, 20, 10, &1024_i32.to_le_bytes()))
+            .await
+            .expect("send OKAY credit");
+
+        // Now the writer task should see the WRTE; reply Ok so the write returns.
+        let frame = pump_writer(&mut writer_rx).await;
+        assert_eq!(frame.payload(), b"abc", "credited write must flush the chunk");
+        let _session = write.await.expect("write task completes");
+    }
+
+    #[tokio::test]
+    async fn read_returns_eof_on_clse() {
+        let (mut session, data_tx, _ack_tx, _writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, false, FlowControl::new_classic());
+
+        data_tx
+            .send(msg(MessageCommand::Clse, 20, 10, &[]))
+            .await
+            .expect("send CLSE");
+
+        let mut buf = [0u8; 8];
+        let n = session.read(&mut buf).await.expect("read after CLSE");
+        assert_eq!(n, 0, "a CLSE must surface as EOF (0 bytes)");
+    }
+
+    #[tokio::test]
+    async fn drop_without_close_enqueues_clse_and_unregisters() {
+        let (session, _data_tx, _ack_tx, mut writer_rx, mut control_rx) =
+            MultiplexedSession::new_for_test(10, 20, false, FlowControl::new_classic());
+
+        drop(session);
+
+        // Best-effort Drop must enqueue a CLSE fire-and-forget...
+        let frame = writer_rx.recv().await.expect("CLSE enqueued on drop");
+        match frame {
+            OutboundFrame::FireForget(m) => {
+                assert_eq!(m.header().command(), MessageCommand::Clse, "drop sends CLSE");
+            }
+            OutboundFrame::WithAck(..) => panic!("drop CLSE must be fire-and-forget"),
+        }
+        // ...and ask the reader to unregister the session id.
+        match control_rx.recv().await.expect("unregister enqueued on drop") {
+            ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop unregisters the local id"),
+            _ => panic!("drop must enqueue an Unregister"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_sends_clse_then_drop_does_not_duplicate() {
+        let (session, _data_tx, _ack_tx, mut writer_rx, mut control_rx) =
+            MultiplexedSession::new_for_test(10, 20, false, FlowControl::new_classic());
+
+        // Emulate the writer replying to the close's WithAck CLSE.
+        let writer = tokio::spawn(async move {
+            let frame = pump_writer(&mut writer_rx).await;
+            assert_eq!(frame.header().command(), MessageCommand::Clse, "close sends CLSE");
+            // No further frame must arrive (Drop must not duplicate the CLSE).
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "graceful close must not be followed by a duplicate CLSE from Drop"
+            );
+        });
+
+        session.close().await;
+        writer.await.expect("writer task");
+
+        // Drop still unregisters the session id (idempotent cleanup).
+        match control_rx.recv().await.expect("unregister enqueued") {
+            ReaderControl::Unregister(id) => assert_eq!(id, 10),
+            _ => panic!("close+drop must unregister"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_does_not_lose_the_frame_or_its_credit() {
+        // Cancellation safety: a `read` future cancelled before any WRTE arrives
+        // must not consume a later WRTE — and once it does arrive, the OKAY is
+        // still emitted exactly once.
+        let (mut session, data_tx, _ack_tx, mut writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, true, FlowControl::new_windowed(0));
+
+        // Start a read with nothing queued, then cancel it via a timeout.
+        {
+            let mut buf = [0u8; 4];
+            let r = tokio::time::timeout(Duration::from_millis(20), session.read(&mut buf)).await;
+            assert!(r.is_err(), "read must still be pending (and is cancelled)");
+        }
+        // No OKAY may have been emitted yet (no WRTE was delivered).
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a cancelled read with no data must not emit a spurious OKAY"
+        );
+
+        // Now deliver a WRTE; the next read must succeed and emit exactly one OKAY.
+        data_tx
+            .send(msg(MessageCommand::Write, 20, 10, b"data"))
+            .await
+            .expect("send WRTE");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).await.expect("read after cancel");
+        assert_eq!(&buf, b"data", "the WRTE survives the earlier cancellation");
+
+        let okay = writer_rx.recv().await.expect("OKAY emitted once");
+        match okay {
+            OutboundFrame::FireForget(m) => {
+                assert_eq!(m.header().command(), MessageCommand::Okay);
+                assert_eq!(m.payload(), &4_i32.to_le_bytes(), "credit = 4 bytes");
+            }
+            OutboundFrame::WithAck(..) => panic!("OKAY is fire-and-forget"),
+        }
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "exactly one OKAY must be emitted for one delivered WRTE (no double-credit)"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_after_remote_close_fails_with_broken_pipe() {
+        let (mut session, _data_tx, ack_tx, _writer_rx, _ctl) = MultiplexedSession::new_for_test(
+            10,
+            20,
+            true,
+            FlowControl::new_windowed(INITIAL_DELAYED_ACK_BYTES),
+        );
+
+        // Remote closes the stream via a CLSE on the ack channel.
+        ack_tx
+            .send(msg(MessageCommand::Clse, 20, 10, &[]))
+            .await
+            .expect("send remote CLSE");
+
+        let err = session
+            .write_all(b"data")
+            .await
+            .expect_err("write after remote close must fail");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::BrokenPipe,
+            "a write to a remotely-closed session must surface as BrokenPipe"
         );
     }
 }
