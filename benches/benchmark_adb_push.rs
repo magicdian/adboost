@@ -30,12 +30,18 @@ fn generate_test_file(size_in_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Use `adb_client` crate to push a file on device
-fn bench_adb_client_push() -> Result<()> {
-    let mut client = ADBServer::default();
-    let mut device = client.get_device()?;
-    let f = File::open(LOCAL_TEST_FILE_PATH)?;
-    Ok(device.push(f, REMOTE_TEST_FILE_PATH)?)
+/// Use `adb_client` crate to push a file on device.
+///
+/// `adb_client` is now async-native (tokio); the benchmark owns the runtime and
+/// drives the async API to completion via `block_on`.
+fn bench_adb_client_push(runtime: &tokio::runtime::Runtime) -> Result<()> {
+    runtime.block_on(async {
+        let mut client = ADBServer::default();
+        let mut device = client.get_device().await?;
+        let f = tokio::fs::File::open(LOCAL_TEST_FILE_PATH).await?;
+        device.push(f, REMOTE_TEST_FILE_PATH).await?;
+        Ok(())
+    })
 }
 
 /// Use standard `adb` command ti push a file on device
@@ -54,6 +60,8 @@ fn bench_adb_push_command() -> Result<()> {
 
 /// benchmarking `adb push INPUT DEST` and `adb_client` `ADBServerDevice.push(INPUT, DEST)`
 fn benchmark_adb_push(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("cannot build tokio runtime");
+
     for (file_size, sample_size) in [
         (10 * 1024 * 1024, 100),  // 10MB -> 100 iterations
         (500 * 1024 * 1024, 50),  // 500MB -> 50 iterations
@@ -68,7 +76,7 @@ fn benchmark_adb_push(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("adb_client", "push"), |b| {
             b.iter(|| {
-                bench_adb_client_push().expect("Error while benchmarking adb_client push");
+                bench_adb_client_push(&runtime).expect("Error while benchmarking adb_client push");
             });
         });
 

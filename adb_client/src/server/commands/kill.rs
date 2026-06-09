@@ -6,9 +6,11 @@ use crate::{
 
 impl ADBServer {
     /// Asks the ADB server to quit immediately.
-    pub fn kill(&mut self) -> Result<()> {
-        self.connect()?
+    pub async fn kill(&mut self) -> Result<()> {
+        self.connect()
+            .await?
             .proxy_connection(&ADBCommand::Host(ADBHostCommand::Kill), false)
+            .await
             .map(|_| ())
     }
 }

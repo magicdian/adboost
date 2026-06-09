@@ -1,13 +1,18 @@
-use std::io::{self, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::AsyncWrite;
 
 use crate::{ADBDeviceExt, Result, server_device::ADBServerDevice};
 
-struct LogFilter<W: Write> {
+/// `AsyncWrite` adapter that forwards only complete (newline-terminated) lines
+/// to the wrapped writer, buffering any trailing partial line.
+struct LogFilter<W: AsyncWrite + Unpin> {
     writer: W,
     buffer: Vec<u8>,
 }
 
-impl<W: Write> LogFilter<W> {
+impl<W: AsyncWrite + Unpin> LogFilter<W> {
     pub const fn new(writer: W) -> Self {
         Self {
             writer,
@@ -16,40 +21,56 @@ impl<W: Write> LogFilter<W> {
     }
 }
 
-impl<W: Write> Write for LogFilter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for LogFilter<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
         // Add newly received bytes to the internal buffer
-        self.buffer.extend_from_slice(buf);
+        this.buffer.extend_from_slice(buf);
 
-        let mut processed = 0;
-        while let Some(pos) = self.buffer[processed..].iter().position(|&b| b == b'\n') {
-            // Found a newline, need to process it
-            let end = processed + pos + 1; // +1 to include the '\n'
-            let line = &self.buffer[processed..end];
+        // Find the end of the last complete line; only flush complete lines.
+        let flush_until = this
+            .buffer
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|pos| pos + 1);
 
-            self.writer.write_all(line)?;
-
-            processed = end;
+        if let Some(end) = flush_until {
+            let mut written = 0;
+            while written < end {
+                match Pin::new(&mut this.writer).poll_write(cx, &this.buffer[written..end]) {
+                    Poll::Ready(Ok(0)) => break,
+                    Poll::Ready(Ok(n)) => written += n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            this.buffer.drain(..written);
         }
 
-        // Keep only remaining bytes after the last complete line
-        if processed > 0 {
-            self.buffer.copy_within(processed.., 0);
-            self.buffer.truncate(self.buffer.len() - processed);
-        }
-
-        Ok(buf.len())
+        Poll::Ready(Ok(buf.len()))
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
     }
 }
 
 impl ADBServerDevice {
     /// Get logs from device
-    pub fn get_logs<W: Write>(&mut self, output: W) -> Result<()> {
-        let _status = self.shell_command(&"exec logcat", Some(&mut LogFilter::new(output)), None);
+    pub async fn get_logs<W: AsyncWrite + Unpin + Send>(&mut self, output: W) -> Result<()> {
+        let mut filter = LogFilter::new(output);
+        let _status = self
+            .shell_command(&"exec logcat", Some(&mut filter), None)
+            .await;
         Ok(())
     }
 }

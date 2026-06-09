@@ -13,10 +13,10 @@ use crate::{
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    pub(crate) fn framebuffer_inner(&mut self) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
-        let mut session = self.open_session(&ADBLocalCommand::FrameBuffer)?;
+    pub(crate) async fn framebuffer_inner(&mut self) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+        let mut session = self.open_session(&ADBLocalCommand::FrameBuffer).await?;
 
-        let response = session.recv_and_reply_okay()?;
+        let response = session.recv_and_reply_okay().await?;
 
         let mut payload_cursor = Cursor::new(response.payload());
 
@@ -39,7 +39,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                         break;
                     }
 
-                    let response = session.recv_and_reply_okay()?;
+                    let response = session.recv_and_reply_okay().await?;
 
                     framebuffer_data.extend_from_slice(&response.into_payload());
 
@@ -72,7 +72,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                         break;
                     }
 
-                    let response = session.recv_and_reply_okay()?;
+                    let response = session.recv_and_reply_okay().await?;
 
                     framebuffer_data.extend_from_slice(&response.into_payload());
 
@@ -95,7 +95,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         session
             .get_transport_mut()
             .read_message()
-            .and_then(|message| message.assert_command(MessageCommand::Clse))?;
+            .await?
+            .assert_command(MessageCommand::Clse)?;
 
         Ok(img)
     }

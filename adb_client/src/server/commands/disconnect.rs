@@ -7,10 +7,12 @@ use std::net::SocketAddrV4;
 
 impl ADBServer {
     /// Connect device over tcp with address and port
-    pub fn disconnect_device(&mut self, address: SocketAddrV4) -> Result<()> {
+    pub async fn disconnect_device(&mut self, address: SocketAddrV4) -> Result<()> {
         let response = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Disconnect(address)), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Disconnect(address)), true)
+            .await?;
 
         match String::from_utf8(response) {
             Ok(s) if s.starts_with("disconnected") => Ok(()),

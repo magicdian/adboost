@@ -6,18 +6,20 @@ use crate::{
 
 impl ADBServerDevice {
     /// Disable verity on the device
-    pub fn disable_verity(&mut self) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn disable_verity(&mut self) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::DisableVerity))
+            .await
     }
 
     /// Enable verity on the device
-    pub fn enable_verity(&mut self) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn enable_verity(&mut self) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::EnableVerity))
+            .await
     }
 }

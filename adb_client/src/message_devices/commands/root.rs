@@ -8,11 +8,12 @@ use crate::{
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    pub(crate) fn root(&mut self) -> Result<()> {
-        self.open_session(&ADBLocalCommand::Root)?;
+    pub(crate) async fn root(&mut self) -> Result<()> {
+        self.open_session(&ADBLocalCommand::Root).await?;
 
         self.get_transport_mut()
             .read_message()
-            .and_then(|message| message.assert_command(MessageCommand::Okay))
+            .await?
+            .assert_command(MessageCommand::Okay)
     }
 }

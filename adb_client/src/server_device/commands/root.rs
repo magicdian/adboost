@@ -6,11 +6,12 @@ use crate::{
 
 impl ADBServerDevice {
     /// Restart adb daemon with root permissions
-    pub fn root(&mut self) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn root(&mut self) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .proxy_connection(&ADBCommand::Local(ADBLocalCommand::Root), false)
+            .await
             .map(|_| ())
     }
 }

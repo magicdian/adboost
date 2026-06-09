@@ -53,8 +53,8 @@ impl ADBEmulatorDevice {
     }
 
     /// Connect to underlying transport
-    pub(crate) fn connect(&mut self) -> Result<&mut TCPEmulatorTransport> {
-        self.transport.connect()?;
+    pub(crate) async fn connect(&mut self) -> Result<&mut TCPEmulatorTransport> {
+        self.transport.connect().await?;
 
         Ok(self.get_transport_mut())
     }
@@ -81,9 +81,7 @@ impl TryFrom<ADBServerDevice> for ADBEmulatorDevice {
     }
 }
 
-impl Drop for ADBEmulatorDevice {
-    fn drop(&mut self) {
-        // Best effort here
-        let _ = self.transport.disconnect();
-    }
-}
+// NOTE (async teardown, P0-②): `disconnect` is now an async transport method and
+// cannot be awaited in a stable-Rust `Drop`. The underlying `tokio::net::TcpStream`
+// closes its socket when dropped, so teardown is handled structurally. Callers
+// wanting a graceful, awaited shutdown should call `disconnect` explicitly.

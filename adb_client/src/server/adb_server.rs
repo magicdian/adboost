@@ -87,7 +87,7 @@ impl ADBServer {
     }
 
     /// Connect to underlying transport
-    pub(crate) fn connect(&mut self) -> Result<&mut TCPServerTransport> {
+    pub(crate) async fn connect(&mut self) -> Result<&mut TCPServerTransport> {
         let mut is_local_ip = false;
         let mut transport = if let Some(addr) = &self.socket_addr {
             let ip = addr.ip();
@@ -104,17 +104,14 @@ impl ADBServer {
             Self::start(&self.envs, &self.adb_path);
         }
 
-        transport.connect()?;
+        transport.connect().await?;
         self.transport = Some(transport);
 
         self.get_transport()
     }
 }
 
-impl Drop for ADBServer {
-    fn drop(&mut self) {
-        if let Some(transport) = &mut self.transport {
-            let _ = transport.disconnect();
-        }
-    }
-}
+// NOTE (async teardown, P0-②): `disconnect` is now an async transport method and
+// cannot be awaited in a stable-Rust `Drop`. The underlying `tokio::net::TcpStream`
+// closes its socket when dropped, so teardown is handled structurally. Callers
+// wanting a graceful, awaited shutdown should call `disconnect` explicitly.

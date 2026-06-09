@@ -1,102 +1,81 @@
 use crate::{
-    Result,
+    Result, RustADBError,
     models::{ADBCommand, ADBLocalCommand, SyncCommand},
     server_device::ADBServerDevice,
 };
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::{BufReader, BufWriter, Read, Write};
-
-/// Internal structure wrapping a [`std::io::Read`] and hiding underlying protocol logic.
-struct ADBRecvCommandReader<R: Read> {
-    inner: R,
-    remaining_data_bytes_to_read: usize,
-}
-
-impl<R: Read> ADBRecvCommandReader<R> {
-    pub const fn new(inner: R) -> Self {
-        Self {
-            inner,
-            remaining_data_bytes_to_read: 0,
-        }
-    }
-}
-
-impl<R: Read> Read for ADBRecvCommandReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // In case of a "DATA" header, we may not have enough space in `buf` to fill it with "length" bytes coming from device.
-        // `remaining_data_bytes_to_read` represents how many bytes are still left to read before receiving another header.
-        if self.remaining_data_bytes_to_read == 0 {
-            let mut header = [0_u8; 4];
-            self.inner.read_exact(&mut header)?;
-
-            match &header[..] {
-                b"DATA" => {
-                    let length = self.inner.read_u32::<LittleEndian>()? as usize;
-                    // ensuring read data is at most the buffer length
-                    let min_data_to_read = std::cmp::min(length, buf.len());
-                    let effective_read = self.inner.read(&mut buf[0..min_data_to_read])?;
-                    self.remaining_data_bytes_to_read = length - effective_read;
-
-                    Ok(effective_read)
-                }
-                b"DONE" => Ok(0),
-                b"FAIL" => {
-                    let length = self.inner.read_u32::<LittleEndian>()? as usize;
-                    let mut error_msg = vec![0; length];
-                    self.inner.read_exact(&mut error_msg)?;
-
-                    Err(std::io::Error::other(format!(
-                        "ADB request failed: {}",
-                        String::from_utf8_lossy(&error_msg)
-                    )))
-                }
-                _ => Err(std::io::Error::other(format!(
-                    "Unknown response from device {header:#?}"
-                ))),
-            }
-        } else {
-            // Computing minimum to ensure to stop reading before next header...
-            let data_to_read = std::cmp::min(self.remaining_data_bytes_to_read, buf.len());
-            self.inner.read_exact(&mut buf[..data_to_read])?;
-
-            self.remaining_data_bytes_to_read -= self.remaining_data_bytes_to_read;
-
-            Ok(data_to_read)
-        }
-    }
-}
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const BUFFER_SIZE: usize = 65535;
 
 impl ADBServerDevice {
     /// Receives path to stream from the device.
-    pub fn pull(&mut self, path: &dyn AsRef<str>, stream: &mut dyn Write) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn pull(
+        &mut self,
+        path: &(dyn AsRef<str> + Sync),
+        stream: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.set_serial_transport().await?;
 
         // Set device in SYNC mode
         self.transport
-            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::Sync))?;
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::Sync))
+            .await?;
 
         // Send a recv command
-        self.transport.send_sync_request(&SyncCommand::Recv)?;
+        self.transport.send_sync_request(&SyncCommand::Recv).await?;
 
-        self.handle_recv_command(path, stream)
+        self.handle_recv_command(path, stream).await
     }
 
-    fn handle_recv_command<S: AsRef<str>>(&self, from: S, output: &mut dyn Write) -> Result<()> {
-        let mut raw_connection = self.transport.get_raw_connection()?;
-
+    async fn handle_recv_command<S: AsRef<str>>(
+        &mut self,
+        from: S,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
         let from_as_bytes = from.as_ref().as_bytes();
         let mut buffer = Vec::with_capacity(4 + from_as_bytes.len());
         buffer.extend_from_slice(&(u32::try_from(from.as_ref().len())?).to_le_bytes());
         buffer.extend_from_slice(from_as_bytes);
-        raw_connection.write_all(&buffer)?;
+        self.transport
+            .get_raw_connection()?
+            .write_all(&buffer)
+            .await?;
 
-        let reader = ADBRecvCommandReader::new(raw_connection);
-        std::io::copy(
-            &mut BufReader::with_capacity(BUFFER_SIZE, reader),
-            &mut BufWriter::with_capacity(BUFFER_SIZE, output),
-        )?;
+        let mut chunk = vec![0u8; BUFFER_SIZE].into_boxed_slice();
+        loop {
+            let connection = self.transport.get_raw_connection()?;
+            let mut header = [0_u8; 4];
+            connection.read_exact(&mut header).await?;
+
+            match &header[..] {
+                b"DATA" => {
+                    let mut remaining = connection.read_u32_le().await? as usize;
+                    while remaining > 0 {
+                        let to_read = std::cmp::min(remaining, chunk.len());
+                        connection.read_exact(&mut chunk[..to_read]).await?;
+                        output.write_all(&chunk[..to_read]).await?;
+                        remaining -= to_read;
+                    }
+                }
+                b"DONE" => break,
+                b"FAIL" => {
+                    let length = connection.read_u32_le().await? as usize;
+                    let mut error_msg = vec![0; length];
+                    connection.read_exact(&mut error_msg).await?;
+
+                    return Err(RustADBError::ADBRequestFailed(
+                        String::from_utf8_lossy(&error_msg).to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(RustADBError::UnknownResponseType(format!(
+                        "Unknown response from device {header:#?}"
+                    )));
+                }
+            }
+        }
+
+        output.flush().await?;
 
         // Connection should've been left in SYNC mode by now
         Ok(())

@@ -6,10 +6,12 @@ use crate::{
 
 impl ADBServer {
     /// Check ADB server status
-    pub fn server_status(&mut self) -> Result<ServerStatus> {
+    pub async fn server_status(&mut self) -> Result<ServerStatus> {
         let status = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::ServerStatus), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::ServerStatus), true)
+            .await?;
 
         ServerStatus::try_from(status)
     }

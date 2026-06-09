@@ -6,12 +6,13 @@ use crate::{
 
 impl ADBServerDevice {
     /// Lists available ADB server features.
-    pub fn host_features(&mut self) -> Result<Vec<HostFeatures>> {
-        self.set_serial_transport()?;
+    pub async fn host_features(&mut self) -> Result<Vec<HostFeatures>> {
+        self.set_serial_transport().await?;
 
         let features = self
             .transport
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::HostFeatures), true)?;
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::HostFeatures), true)
+            .await?;
 
         Ok(features
             .split(|x| x.eq(&b','))

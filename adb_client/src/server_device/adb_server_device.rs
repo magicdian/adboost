@@ -65,8 +65,8 @@ impl ADBServerDevice {
     }
 
     /// Connect to underlying transport
-    pub(crate) fn connect(&mut self) -> Result<&mut TCPServerTransport> {
-        self.transport.connect()?;
+    pub(crate) async fn connect(&mut self) -> Result<&mut TCPServerTransport> {
+        self.transport.connect().await?;
 
         Ok(&mut self.transport)
     }
@@ -75,7 +75,7 @@ impl ADBServerDevice {
     ///
     /// Prefers `transport_id` when set (unique even with duplicate serials), then falls back
     /// to `identifier` (serial), and finally to `transport-any` when neither is configured.
-    pub(crate) fn set_serial_transport(&mut self) -> Result<()> {
+    pub(crate) async fn set_serial_transport(&mut self) -> Result<()> {
         let cmd = if let Some(id) = self.transport_id {
             ADBHostCommand::TransportId(id)
         } else if let Some(serial) = self.identifier.clone() {
@@ -83,13 +83,14 @@ impl ADBServerDevice {
         } else {
             ADBHostCommand::TransportAny
         };
-        self.connect()?.send_adb_request(&ADBCommand::Host(cmd))
+        self.connect()
+            .await?
+            .send_adb_request(&ADBCommand::Host(cmd))
+            .await
     }
 }
 
-impl Drop for ADBServerDevice {
-    fn drop(&mut self) {
-        // Best effort here
-        let _ = self.transport.disconnect();
-    }
-}
+// NOTE (async teardown, P0-②): `disconnect` is now an async transport method and
+// cannot be awaited in a stable-Rust `Drop`. The underlying `tokio::net::TcpStream`
+// closes its socket when dropped, so teardown is handled structurally. Callers
+// wanting a graceful, awaited shutdown should call `disconnect` explicitly.

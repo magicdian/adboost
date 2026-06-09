@@ -10,10 +10,12 @@ const OPENSCREEN_MDNS_BACKEND: &str = "ADB_MDNS_OPENSCREEN";
 
 impl ADBServer {
     /// Check if mdns discovery is available
-    pub fn mdns_check(&mut self) -> Result<bool> {
+    pub async fn mdns_check(&mut self) -> Result<bool> {
         let response = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::MDNSCheck), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::MDNSCheck), true)
+            .await?;
 
         match String::from_utf8(response) {
             Ok(s) if s.starts_with("mdns daemon version") => Ok(true),
@@ -23,10 +25,12 @@ impl ADBServer {
     }
 
     /// List all discovered mdns services
-    pub fn mdns_services(&mut self) -> Result<Vec<MDNSServices>> {
+    pub async fn mdns_services(&mut self) -> Result<Vec<MDNSServices>> {
         let services = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::MDNSServices), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::MDNSServices), true)
+            .await?;
 
         let mut vec_services: Vec<MDNSServices> = vec![];
         for service in services.lines() {
@@ -42,10 +46,10 @@ impl ADBServer {
     }
 
     /// Check if specified backend mdns service is used, otherwise restart adb server with envs
-    pub fn mdns_force_backend(&mut self, backend: MDNSBackend) -> Result<()> {
-        let server_status = self.server_status()?;
+    pub async fn mdns_force_backend(&mut self, backend: MDNSBackend) -> Result<()> {
+        let server_status = self.server_status().await?;
         if server_status.mdns_backend != backend {
-            self.kill()?;
+            self.kill().await?;
             self.envs.insert(
                 OPENSCREEN_MDNS_BACKEND.to_string(),
                 (if backend == MDNSBackend::OpenScreen {
@@ -55,7 +59,7 @@ impl ADBServer {
                 })
                 .to_string(),
             );
-            self.connect()?;
+            self.connect().await?;
         }
 
         Ok(())

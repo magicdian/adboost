@@ -7,17 +7,21 @@ use crate::{
 
 impl ADBEmulatorDevice {
     /// Get the AVD discovery path of this emulator
-    pub fn avd_discovery_path(&mut self) -> Result<PathBuf> {
+    pub async fn avd_discovery_path(&mut self) -> Result<PathBuf> {
         let path = self
-            .connect()?
-            .send_command(&ADBEmulatorCommand::AvdDiscoveryPath)?;
+            .connect()
+            .await?
+            .send_command(&ADBEmulatorCommand::AvdDiscoveryPath)
+            .await?;
         Ok(PathBuf::from(path.trim()))
     }
     /// Get the gRPC port of this emulator
-    pub fn avd_grpc_port(&mut self) -> Result<u16> {
+    pub async fn avd_grpc_port(&mut self) -> Result<u16> {
         let port = self
-            .connect()?
-            .send_command(&ADBEmulatorCommand::AvdGrpcPort)?;
+            .connect()
+            .await?
+            .send_command(&ADBEmulatorCommand::AvdGrpcPort)
+            .await?;
         Ok(port.trim().parse()?)
     }
 }

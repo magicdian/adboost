@@ -1,4 +1,4 @@
-use std::io::Read;
+use tokio::io::AsyncReadExt;
 
 use crate::{
     Result, RustADBError,
@@ -10,10 +10,12 @@ use crate::{
 
 impl ADBServer {
     /// Gets a list of connected devices.
-    pub fn devices(&mut self) -> Result<Vec<DeviceShort>> {
+    pub async fn devices(&mut self) -> Result<Vec<DeviceShort>> {
         let devices = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Devices), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Devices), true)
+            .await?;
 
         let mut vec_devices: Vec<DeviceShort> = vec![];
         for device in devices.split(|x| x.eq(&b'\n')) {
@@ -28,10 +30,12 @@ impl ADBServer {
     }
 
     /// Gets an extended list of connected devices including the device paths in the state.
-    pub fn devices_long(&mut self) -> Result<Vec<DeviceLong>> {
+    pub async fn devices_long(&mut self) -> Result<Vec<DeviceLong>> {
         let devices_long = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::DevicesLong), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::DevicesLong), true)
+            .await?;
 
         let mut vec_devices: Vec<DeviceLong> = vec![];
         for device in devices_long.split(|x| x.eq(&b'\n')) {
@@ -46,8 +50,8 @@ impl ADBServer {
     }
 
     /// Get a device, assuming that only this device is connected.
-    pub fn get_device(&mut self) -> Result<ADBServerDevice> {
-        let mut devices = self.devices()?.into_iter();
+    pub async fn get_device(&mut self) -> Result<ADBServerDevice> {
+        let mut devices = self.devices().await?.into_iter();
         match devices.next() {
             Some(device) => match devices.next() {
                 Some(_) => Err(RustADBError::DeviceNotFound(
@@ -65,9 +69,10 @@ impl ADBServer {
     /// - There is no device connected => Error
     /// - There is a single device connected => Ok
     /// - There are more than 1 device connected => Error
-    pub fn get_device_by_name(&mut self, name: &str) -> Result<ADBServerDevice> {
+    pub async fn get_device_by_name(&mut self, name: &str) -> Result<ADBServerDevice> {
         let nb_devices = self
-            .devices()?
+            .devices()
+            .await?
             .into_iter()
             .filter(|d| d.identifier.as_str() == name)
             .count();
@@ -85,9 +90,13 @@ impl ADBServer {
     /// Transport ids are unique within a running ADB server and disambiguate devices that
     /// share the same serial number. They are reassigned on device reconnect or server
     /// restart, so callers should re-query rather than caching the id.
-    pub fn get_device_by_transport_id(&mut self, transport_id: u32) -> Result<ADBServerDevice> {
+    pub async fn get_device_by_transport_id(
+        &mut self,
+        transport_id: u32,
+    ) -> Result<ADBServerDevice> {
         let nb_devices = self
-            .devices_long()?
+            .devices_long()
+            .await?
             .into_iter()
             .filter(|d| d.transport_id == transport_id)
             .count();
@@ -104,12 +113,17 @@ impl ADBServer {
     }
 
     /// Tracks new devices showing up.
-    pub fn track_devices(&mut self, callback: impl Fn(DeviceShort) -> Result<()>) -> Result<()> {
-        self.connect()?
-            .send_adb_request(&ADBCommand::Host(ADBHostCommand::TrackDevices))?;
+    pub async fn track_devices(
+        &mut self,
+        callback: impl Fn(DeviceShort) -> Result<()>,
+    ) -> Result<()> {
+        self.connect()
+            .await?
+            .send_adb_request(&ADBCommand::Host(ADBHostCommand::TrackDevices))
+            .await?;
 
         loop {
-            let length = self.get_transport()?.get_hex_body_length()?;
+            let length = self.get_transport()?.get_hex_body_length().await?;
 
             if length > 0 {
                 let mut body = vec![
@@ -120,7 +134,8 @@ impl ADBServer {
                 ];
                 self.get_transport()?
                     .get_raw_connection()?
-                    .read_exact(&mut body)?;
+                    .read_exact(&mut body)
+                    .await?;
 
                 for device in body.split(|x| x.eq(&b'\n')) {
                     if device.is_empty() {
@@ -133,15 +148,15 @@ impl ADBServer {
     }
 
     /// Get an emulator, assuming that only this device is connected.
-    pub fn get_emulator_device(&mut self) -> Result<ADBEmulatorDevice> {
-        let device = self.get_device()?;
+    pub async fn get_emulator_device(&mut self) -> Result<ADBEmulatorDevice> {
+        let device = self.get_device().await?;
 
         ADBEmulatorDevice::try_from(device)
     }
 
     /// Get an emulator by its name
-    pub fn get_emulator_device_by_name(&mut self, name: &str) -> Result<ADBEmulatorDevice> {
-        let device = self.get_device_by_name(name)?;
+    pub async fn get_emulator_device_by_name(&mut self, name: &str) -> Result<ADBEmulatorDevice> {
+        let device = self.get_device_by_name(name).await?;
 
         ADBEmulatorDevice::try_from(device)
     }

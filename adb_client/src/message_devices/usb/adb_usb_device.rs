@@ -1,7 +1,8 @@
-use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
+
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::ADBDeviceExt;
 use crate::ADBListItemType;
@@ -23,21 +24,25 @@ pub struct ADBUSBDevice {
 
 impl ADBUSBDevice {
     /// Instantiate a new [`ADBUSBDevice`]
-    pub fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
-        Self::new_with_custom_private_key(vendor_id, product_id, get_default_adb_key_path()?)
+    pub async fn new(vendor_id: u16, product_id: u16) -> Result<Self> {
+        Self::new_with_custom_private_key(vendor_id, product_id, get_default_adb_key_path()?).await
     }
 
     /// Instantiate a new [`ADBUSBDevice`] using a custom private key path
-    pub fn new_with_custom_private_key<P: AsRef<Path>>(
+    pub async fn new_with_custom_private_key<P: AsRef<Path>>(
         vendor_id: u16,
         product_id: u16,
         private_key_path: P,
     ) -> Result<Self> {
-        Self::new_from_transport_inner(USBTransport::new(vendor_id, product_id)?, private_key_path)
+        Self::new_from_transport_inner(
+            USBTransport::new(vendor_id, product_id).await?,
+            private_key_path,
+        )
+        .await
     }
 
     /// Instantiate a new [`ADBUSBDevice`] from a [`USBTransport`] and an optional private key path.
-    pub fn new_from_transport(
+    pub async fn new_from_transport(
         transport: USBTransport,
         private_key_path: Option<PathBuf>,
     ) -> Result<Self> {
@@ -46,10 +51,10 @@ impl ADBUSBDevice {
             None => get_default_adb_key_path()?,
         };
 
-        Self::new_from_transport_inner(transport, &private_key_path)
+        Self::new_from_transport_inner(transport, &private_key_path).await
     }
 
-    fn new_from_transport_inner<P: AsRef<Path>>(
+    async fn new_from_transport_inner<P: AsRef<Path>>(
         transport: USBTransport,
         private_key_path: P,
     ) -> Result<Self> {
@@ -57,7 +62,7 @@ impl ADBUSBDevice {
         let product_id = transport.product_id();
 
         Ok(Self {
-            inner: ADBMessageDevice::new(transport, private_key_path)?,
+            inner: ADBMessageDevice::new(transport, private_key_path).await?,
             vendor_id,
             product_id,
         })
@@ -85,8 +90,8 @@ impl ADBUSBDevice {
     /// # Errors
     ///
     /// Returns an error if multiple devices or none are connected.
-    pub fn autodetect() -> Result<Self> {
-        Self::autodetect_with_custom_private_key(get_default_adb_key_path()?)
+    pub async fn autodetect() -> Result<Self> {
+        Self::autodetect_with_custom_private_key(get_default_adb_key_path()?).await
     }
 
     /// Autodetect connected ADB devices and establish a connection with the first device found using a custom private key path
@@ -94,13 +99,16 @@ impl ADBUSBDevice {
     /// # Errors
     ///
     /// Returns an error if multiple devices are connected or if none can be detected.
-    pub fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
+    pub async fn autodetect_with_custom_private_key(private_key_path: PathBuf) -> Result<Self> {
         match utils::get_single_connected_adb_device()? {
-            Some(device_info) => Self::new_with_custom_private_key(
-                device_info.vendor_id,
-                device_info.product_id,
-                private_key_path,
-            ),
+            Some(device_info) => {
+                Self::new_with_custom_private_key(
+                    device_info.vendor_id,
+                    device_info.product_id,
+                    private_key_path,
+                )
+                .await
+            }
             _ => Err(RustADBError::DeviceNotFound(
                 "cannot find USB devices matching the signature of an ADB device".into(),
             )),
@@ -109,89 +117,97 @@ impl ADBUSBDevice {
 }
 
 impl ADBDeviceExt for ADBUSBDevice {
-    #[inline]
-    fn shell_command(
+    async fn shell_command(
         &mut self,
-        command: &dyn AsRef<str>,
-        stdout: Option<&mut dyn Write>,
-        stderr: Option<&mut dyn Write>,
+        command: &(dyn AsRef<str> + Sync),
+        stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
-        self.inner.shell_command(command, stdout, stderr)
+        self.inner.shell_command(command, stdout, stderr).await
     }
 
-    #[inline]
-    fn shell<'a>(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
-        self.inner.shell(reader, writer)
+    async fn shell(
+        &mut self,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
+    ) -> Result<()> {
+        self.inner.shell(reader, writer).await
     }
 
-    #[inline]
-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<crate::AdbStatResponse> {
-        self.inner.stat(remote_path)
+    async fn stat(
+        &mut self,
+        remote_path: &(dyn AsRef<str> + Sync),
+    ) -> Result<crate::AdbStatResponse> {
+        self.inner.stat(remote_path).await
     }
 
-    #[inline]
-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()> {
-        self.inner.pull(source, output)
+    async fn pull(
+        &mut self,
+        source: &(dyn AsRef<str> + Sync),
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.inner.pull(source, output).await
     }
 
-    #[inline]
-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
-        self.inner.push(stream, path)
+    async fn push(
+        &mut self,
+        stream: &mut (dyn AsyncRead + Unpin + Send),
+        path: &(dyn AsRef<str> + Sync),
+    ) -> Result<()> {
+        self.inner.push(stream, path).await
     }
 
-    #[inline]
-    fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
-        self.inner.reboot(reboot_type)
+    async fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
+        self.inner.reboot(reboot_type).await
     }
 
-    #[inline]
-    fn remount(&mut self) -> Result<Vec<RemountInfo>> {
-        self.inner.remount()
+    async fn remount(&mut self) -> Result<Vec<RemountInfo>> {
+        self.inner.remount().await
     }
 
-    #[inline]
-    fn root(&mut self) -> Result<()> {
-        self.inner.root()
+    async fn root(&mut self) -> Result<()> {
+        self.inner.root().await
     }
 
-    #[inline]
-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
-        self.inner.install(apk_path, user)
+    async fn install(
+        &mut self,
+        apk_path: &(dyn AsRef<Path> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.inner.install(apk_path, user).await
     }
 
-    #[inline]
-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
-        self.inner.uninstall(package, user)
+    async fn uninstall(
+        &mut self,
+        package: &(dyn AsRef<str> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.inner.uninstall(package, user).await
     }
 
-    #[inline]
-    fn enable_verity(&mut self) -> Result<()> {
-        self.inner.enable_verity()
+    async fn enable_verity(&mut self) -> Result<()> {
+        self.inner.enable_verity().await
     }
 
-    #[inline]
-    fn disable_verity(&mut self) -> Result<()> {
-        self.inner.disable_verity()
+    async fn disable_verity(&mut self) -> Result<()> {
+        self.inner.disable_verity().await
     }
 
-    #[inline]
     #[cfg(feature = "framebuffer")]
-    fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-        self.inner.framebuffer_inner()
+    async fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        self.inner.framebuffer_inner().await
     }
 
-    #[inline]
-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
-        self.inner.list(path)
+    async fn list(&mut self, path: &(dyn AsRef<str> + Sync)) -> Result<Vec<ADBListItemType>> {
+        self.inner.list(path).await
     }
 
-    #[inline]
-    fn exec(
+    async fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
-        writer: Box<dyn Write + Send>,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
     ) -> Result<()> {
-        self.inner.exec(command, reader, writer)
+        self.inner.exec(command, reader, writer).await
     }
 }

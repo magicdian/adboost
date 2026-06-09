@@ -6,35 +6,38 @@ use crate::{
 
 impl ADBServerDevice {
     /// Reverse socket connection
-    pub fn reverse(&mut self, remote: String, local: String) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn reverse(&mut self, remote: String, local: String) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .proxy_connection(
                 &ADBCommand::Local(ADBLocalCommand::Reverse(remote, local)),
                 false,
             )
+            .await
             .map(|_| ())
     }
 
     /// Remove a previously applied reverse rule by its remote endpoint.
-    pub fn reverse_remove(&mut self, remote: String) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn reverse_remove(&mut self, remote: String) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .proxy_connection(
                 &ADBCommand::Local(ADBLocalCommand::ReverseRemove(remote)),
                 false,
             )
+            .await
             .map(|_| ())
     }
 
     /// Remove all reverse rules
-    pub fn reverse_remove_all(&mut self) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn reverse_remove_all(&mut self) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .proxy_connection(&ADBCommand::Local(ADBLocalCommand::ReverseRemoveAll), false)
+            .await
             .map(|_| ())
     }
 }

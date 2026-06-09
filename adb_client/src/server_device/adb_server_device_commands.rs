@@ -1,9 +1,6 @@
-use std::{
-    io::{ErrorKind, Read, Write},
-    path::Path,
-};
+use std::{io::ErrorKind, path::Path, pin::Pin};
 
-use byteorder::ReadBytesExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     ADBDeviceExt, ADBListItemType, Result, RustADBError,
@@ -38,116 +35,138 @@ impl TryFrom<u8> for ShellChannel {
 }
 
 impl ADBDeviceExt for ADBServerDevice {
-    fn shell_command(
+    async fn shell_command(
         &mut self,
-        command: &dyn AsRef<str>,
-        stdout: Option<&mut dyn Write>,
-        stderr: Option<&mut dyn Write>,
+        command: &(dyn AsRef<str> + Sync),
+        stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
-        let supported_features = self.host_features();
+        let supported_features = self.host_features().await;
         let use_shell_v2 = supported_features.is_ok_and(|features| {
             features.contains(&HostFeatures::ShellV2) || features.contains(&HostFeatures::Cmd)
         });
 
-        self.set_serial_transport()?;
+        self.set_serial_transport().await?;
 
         if use_shell_v2 {
-            self.shell_command_v2(command, stdout, stderr)
+            self.shell_command_v2(command, stdout, stderr).await
         } else {
-            self.shell_command_v1(command, stdout)
+            self.shell_command_v1(command, stdout).await
         }
     }
 
-    #[inline]
-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
-        self.stat(remote_path.as_ref())
+    async fn stat(&mut self, remote_path: &(dyn AsRef<str> + Sync)) -> Result<AdbStatResponse> {
+        self.stat(remote_path.as_ref()).await
     }
 
-    fn exec(
+    async fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
-        writer: Box<dyn Write + Send>,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
     ) -> Result<()> {
         self.bidirectional_session(
             &ADBCommand::Local(ADBLocalCommand::Exec(command.to_owned())),
             reader,
             writer,
         )
+        .await
     }
 
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
+    async fn shell(
+        &mut self,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
+    ) -> Result<()> {
         self.bidirectional_session(&ADBCommand::Local(ADBLocalCommand::Shell), reader, writer)
+            .await
     }
 
-    fn pull(&mut self, source: &dyn AsRef<str>, mut output: &mut dyn Write) -> Result<()> {
-        self.pull(source, &mut output)
+    async fn pull(
+        &mut self,
+        source: &(dyn AsRef<str> + Sync),
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.pull(source, output).await
     }
 
-    fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
-        self.reboot(reboot_type)
+    async fn reboot(&mut self, reboot_type: crate::RebootType) -> Result<()> {
+        self.reboot(reboot_type).await
     }
 
-    fn root(&mut self) -> Result<()> {
-        self.root()
+    async fn root(&mut self) -> Result<()> {
+        self.root().await
     }
 
-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
-        self.push(stream, path)
+    async fn push(
+        &mut self,
+        stream: &mut (dyn AsyncRead + Unpin + Send),
+        path: &(dyn AsRef<str> + Sync),
+    ) -> Result<()> {
+        self.push(stream, path.as_ref()).await
     }
 
-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
-        self.install(apk_path, user)
+    async fn install(
+        &mut self,
+        apk_path: &(dyn AsRef<Path> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.install(apk_path, user).await
     }
 
-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
-        self.uninstall(package.as_ref(), user)
+    async fn uninstall(
+        &mut self,
+        package: &(dyn AsRef<str> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.uninstall(package.as_ref(), user).await
     }
 
     #[cfg(feature = "framebuffer")]
-    fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-        self.framebuffer_inner()
+    async fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        self.framebuffer_inner().await
     }
 
-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
-        self.list(path)
+    async fn list(&mut self, path: &(dyn AsRef<str> + Sync)) -> Result<Vec<ADBListItemType>> {
+        self.list(path.as_ref()).await
     }
 
-    fn remount(&mut self) -> Result<Vec<RemountInfo>> {
-        self.remount()
+    async fn remount(&mut self) -> Result<Vec<RemountInfo>> {
+        self.remount().await
     }
 
-    fn enable_verity(&mut self) -> Result<()> {
-        self.enable_verity()
+    async fn enable_verity(&mut self) -> Result<()> {
+        self.enable_verity().await
     }
 
-    fn disable_verity(&mut self) -> Result<()> {
-        self.disable_verity()
+    async fn disable_verity(&mut self) -> Result<()> {
+        self.disable_verity().await
     }
 }
 
 impl ADBServerDevice {
     /// Shell v1: simple shell without protocol (for older ADB versions)
-    fn shell_command_v1(
-        &self,
-        command: &dyn AsRef<str>,
-        mut stdout: Option<&mut dyn Write>,
+    async fn shell_command_v1(
+        &mut self,
+        command: &(dyn AsRef<str> + Sync),
+        mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
         self.transport
             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
                 command.as_ref().to_string(),
                 vec![],
-            )))?;
+            )))
+            .await?;
 
-        let mut input = self.transport.get_raw_connection()?;
+        let input = self.transport.get_raw_connection()?;
         let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
 
         loop {
-            match input.read(&mut buffer) {
+            match input.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(size) => {
                     if let Some(stdout) = stdout.as_mut() {
-                        stdout.write_all(&buffer[..size])?;
+                        stdout.write_all(&buffer[..size]).await?;
                     }
                 }
                 Err(e) => match e.kind() {
@@ -161,11 +180,11 @@ impl ADBServerDevice {
     }
 
     /// Shell v2: with protocol packets (for newer ADB versions)
-    fn shell_command_v2(
-        &self,
-        command: &dyn AsRef<str>,
-        mut stdout: Option<&mut dyn Write>,
-        mut stderr: Option<&mut dyn Write>,
+    async fn shell_command_v2(
+        &mut self,
+        command: &(dyn AsRef<str> + Sync),
+        mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        mut stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
         let mut args = vec!["v2".to_string()];
 
@@ -178,20 +197,21 @@ impl ADBServerDevice {
             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
                 command.as_ref().to_string(),
                 args,
-            )))?;
+            )))
+            .await?;
 
         // Now decode the shell v2 protocol packets, reference:
         // https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/shell_protocol.h
 
         let mut exit = None;
-        let mut input = std::io::BufReader::new(self.transport.get_raw_connection()?);
+        let input = self.transport.get_raw_connection()?;
 
         let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
         loop {
             // 1 byte of channel
             // 4 bytes of payload size
-            let mut pckt_metadata = vec![0; 5];
-            if let Err(err) = input.read_exact(&mut pckt_metadata) {
+            let mut pckt_metadata = [0u8; 5];
+            if let Err(err) = input.read_exact(&mut pckt_metadata).await {
                 match err.kind() {
                     ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(None),
                     _ => return Err(RustADBError::IOError(err)),
@@ -213,7 +233,7 @@ impl ADBServerDevice {
                     let mut remainder = payload_size;
                     while remainder > 0 {
                         let to_read = std::cmp::min(remainder, BUFFER_SIZE);
-                        match input.read(&mut buffer[0..to_read]) {
+                        match input.read(&mut buffer[0..to_read]).await {
                             Ok(size) => {
                                 if size == 0 {
                                     return Ok(exit);
@@ -222,15 +242,15 @@ impl ADBServerDevice {
                                 match channel {
                                     ShellChannel::Stdout => {
                                         if let Some(stdout) = stdout.as_mut() {
-                                            stdout.write_all(&buffer[..size])?;
+                                            stdout.write_all(&buffer[..size]).await?;
                                         }
                                     }
                                     ShellChannel::Stderr => {
                                         // first stderr if existing, else a merged output into stdout
                                         if let Some(writer) = stderr.as_mut() {
-                                            writer.write_all(&buffer[..size])?;
+                                            writer.write_all(&buffer[..size]).await?;
                                         } else if let Some(writer) = stdout.as_mut() {
-                                            writer.write_all(&buffer[..size])?;
+                                            writer.write_all(&buffer[..size]).await?;
                                         }
                                     }
                                     ShellChannel::ExitStatus => {
@@ -253,7 +273,7 @@ impl ADBServerDevice {
                         )));
                     }
 
-                    match input.read_u8() {
+                    match input.read_u8().await {
                         Ok(status) => exit = Some(status),
                         Err(err) => match err.kind() {
                             ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(None),
@@ -265,50 +285,64 @@ impl ADBServerDevice {
         }
     }
 
-    fn bidirectional_session(
+    async fn bidirectional_session(
         &mut self,
         server_cmd: &ADBCommand,
-        mut reader: &mut dyn Read,
-        mut writer: Box<dyn Write + Send>,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        mut writer: Pin<Box<dyn AsyncWrite + Send>>,
     ) -> Result<()> {
         // For bidirectional session, we still need shell features
         // But we can try without checking features first
-        self.set_serial_transport()?;
-        self.transport.send_adb_request(server_cmd)?;
+        self.set_serial_transport().await?;
+        self.transport.send_adb_request(server_cmd).await?;
 
-        let mut read_stream = self.transport.get_raw_connection()?.try_clone()?;
+        // Split the single connection into independent read/write halves so the
+        // outbound (stdin -> socket) and inbound (socket -> writer) directions can
+        // be driven concurrently without cloning the stream (no `try_clone`).
+        let connection = self.transport.get_raw_connection()?;
+        let (mut read_half, mut write_half) = tokio::io::split(connection);
 
-        let mut write_stream = read_stream.try_clone()?;
-
-        // Reading thread, reads response from adb-server
-        std::thread::spawn(move || -> Result<()> {
-            let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
-
+        // Inbound: socket -> writer (runs concurrently with the outbound copy).
+        let reader_fut = async {
+            let mut buffer = vec![0u8; BUFFER_SIZE].into_boxed_slice();
             loop {
-                match read_stream.read(&mut buffer) {
-                    Ok(0) => {
-                        read_stream.shutdown(std::net::Shutdown::Both)?;
-                        return Ok(());
-                    }
+                match read_half.read(&mut buffer).await {
+                    Ok(0) => return Ok::<(), RustADBError>(()),
                     Ok(size) => {
-                        writer.write_all(&buffer[..size])?;
-                        writer.flush()?;
+                        writer.write_all(&buffer[..size]).await?;
+                        writer.flush().await?;
                     }
-                    Err(e) => {
-                        return Err(RustADBError::IOError(e));
-                    }
+                    Err(e) => return Err(RustADBError::IOError(e)),
                 }
             }
-        });
+        };
 
-        // Read from given reader (that could be stdin e.g), and write content to server socket
-        if let Err(e) = std::io::copy(&mut reader, &mut write_stream) {
-            match e.kind() {
-                ErrorKind::BrokenPipe => return Ok(()),
-                _ => return Err(RustADBError::IOError(e)),
+        // Outbound: reader (e.g. stdin) -> socket.
+        let writer_fut = async {
+            let mut buffer = vec![0u8; BUFFER_SIZE].into_boxed_slice();
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => return Ok::<(), RustADBError>(()),
+                    Ok(size) => {
+                        if let Err(e) = write_half.write_all(&buffer[..size]).await {
+                            match e.kind() {
+                                ErrorKind::BrokenPipe => return Ok(()),
+                                _ => return Err(RustADBError::IOError(e)),
+                            }
+                        }
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::BrokenPipe => return Ok(()),
+                        _ => return Err(RustADBError::IOError(e)),
+                    },
+                }
             }
-        }
+        };
 
-        Ok(())
+        // Whichever direction finishes first ends the session.
+        tokio::select! {
+            res = reader_fut => res,
+            res = writer_fut => res,
+        }
     }
 }

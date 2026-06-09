@@ -1,4 +1,4 @@
-use std::io::Read;
+use tokio::io::AsyncRead;
 
 use crate::{
     Result,
@@ -12,8 +12,12 @@ use crate::{
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    pub(crate) fn push<R: Read, A: AsRef<str>>(&mut self, stream: R, path: A) -> Result<()> {
-        let mut session = self.open_synchronization_session()?;
+    pub(crate) async fn push<R: AsyncRead + Unpin, A: AsRef<str>>(
+        &mut self,
+        stream: R,
+        path: A,
+    ) -> Result<()> {
+        let mut session = self.open_synchronization_session().await?;
 
         let path_header = format!("{},0777", path.as_ref());
 
@@ -21,15 +25,17 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let mut send_buffer = send_buffer.encode();
         send_buffer.append(&mut path_header.as_bytes().to_vec());
 
-        session.send_and_expect_okay(ADBTransportMessage::try_new(
-            MessageCommand::Write,
-            session.local_id(),
-            session.remote_id(),
-            &send_buffer,
-        )?)?;
+        session
+            .send_and_expect_okay(ADBTransportMessage::try_new(
+                MessageCommand::Write,
+                session.local_id(),
+                session.remote_id(),
+                &send_buffer,
+            )?)
+            .await?;
 
-        session.push_file(stream)?;
-        self.end_transaction(&mut session)?;
+        session.push_file(stream).await?;
+        self.end_transaction(&mut session).await?;
 
         Ok(())
     }

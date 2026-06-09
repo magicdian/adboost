@@ -1,4 +1,4 @@
-use std::io::Write;
+use tokio::io::AsyncWrite;
 
 use crate::{
     Result, RustADBError,
@@ -12,11 +12,15 @@ use crate::{
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    pub(crate) fn pull<A: AsRef<str>, W: Write>(&mut self, source: A, output: W) -> Result<()> {
-        let mut session = self.open_synchronization_session()?;
+    pub(crate) async fn pull<A: AsRef<str>, W: AsyncWrite + Unpin>(
+        &mut self,
+        source: A,
+        output: W,
+    ) -> Result<()> {
+        let mut session = self.open_synchronization_session().await?;
         let source = source.as_ref();
 
-        let adb_stat_response = session.stat_with_explicit_ids(source)?;
+        let adb_stat_response = session.stat_with_explicit_ids(source).await?;
 
         if adb_stat_response.file_perm == 0 {
             return Err(RustADBError::UnknownResponseType(
@@ -24,32 +28,38 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             ));
         }
 
-        self.get_transport_mut().write_message_with_timeout(
-            ADBTransportMessage::try_new(
-                MessageCommand::Okay,
-                session.local_id(),
-                session.remote_id(),
-                &[],
-            )?,
-            std::time::Duration::from_secs(4),
-        )?;
+        self.get_transport_mut()
+            .write_message_with_timeout(
+                ADBTransportMessage::try_new(
+                    MessageCommand::Okay,
+                    session.local_id(),
+                    session.remote_id(),
+                    &[],
+                )?,
+                std::time::Duration::from_secs(4),
+            )
+            .await?;
 
         let recv_buffer = MessageSubcommand::Recv.with_arg(u32::try_from(source.len())?);
-        session.send_and_expect_okay(ADBTransportMessage::try_new(
-            MessageCommand::Write,
-            session.local_id(),
-            session.remote_id(),
-            &recv_buffer.encode(),
-        )?)?;
-        session.send_and_expect_okay(ADBTransportMessage::try_new(
-            MessageCommand::Write,
-            session.local_id(),
-            session.remote_id(),
-            source.as_bytes(),
-        )?)?;
+        session
+            .send_and_expect_okay(ADBTransportMessage::try_new(
+                MessageCommand::Write,
+                session.local_id(),
+                session.remote_id(),
+                &recv_buffer.encode(),
+            )?)
+            .await?;
+        session
+            .send_and_expect_okay(ADBTransportMessage::try_new(
+                MessageCommand::Write,
+                session.local_id(),
+                session.remote_id(),
+                source.as_bytes(),
+            )?)
+            .await?;
 
-        session.recv_file(output)?;
-        self.end_transaction(&mut session)?;
+        session.recv_file(output).await?;
+        self.end_transaction(&mut session).await?;
         Ok(())
     }
 }

@@ -1,6 +1,5 @@
-use std::io::{Read, Write};
-
 use byteorder::{ByteOrder, LittleEndian};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     AdbStatResponse, Result, RustADBError,
@@ -9,25 +8,33 @@ use crate::{
 };
 
 impl ADBServerDevice {
-    fn handle_stat_command<S: AsRef<str>>(&self, path: S) -> Result<AdbStatResponse> {
+    async fn handle_stat_command<S: AsRef<str>>(&mut self, path: S) -> Result<AdbStatResponse> {
         let mut len_buf = [0_u8; 4];
         LittleEndian::write_u32(&mut len_buf, u32::try_from(path.as_ref().len())?);
 
         // 4 bytes of command name is already sent by send_sync_request
-        self.transport.get_raw_connection()?.write_all(&len_buf)?;
         self.transport
             .get_raw_connection()?
-            .write_all(path.as_ref().to_string().as_bytes())?;
+            .write_all(&len_buf)
+            .await?;
+        self.transport
+            .get_raw_connection()?
+            .write_all(path.as_ref().to_string().as_bytes())
+            .await?;
 
         // Reads returned status code from ADB server
         let mut response = [0_u8; 4];
         self.transport
             .get_raw_connection()?
-            .read_exact(&mut response)?;
+            .read_exact(&mut response)
+            .await?;
         match std::str::from_utf8(response.as_ref())? {
             "STAT" => {
                 let mut data = [0_u8; 12];
-                self.transport.get_raw_connection()?.read_exact(&mut data)?;
+                self.transport
+                    .get_raw_connection()?
+                    .read_exact(&mut data)
+                    .await?;
 
                 Ok(data.into())
             }
@@ -38,16 +45,17 @@ impl ADBServerDevice {
     }
 
     /// Stat file given as path on the device.
-    pub fn stat<A: AsRef<str>>(&mut self, path: A) -> Result<AdbStatResponse> {
-        self.set_serial_transport()?;
+    pub async fn stat<A: AsRef<str>>(&mut self, path: A) -> Result<AdbStatResponse> {
+        self.set_serial_transport().await?;
 
         // Set device in SYNC mode
         self.transport
-            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::Sync))?;
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::Sync))
+            .await?;
 
         // Send a "Stat" command
-        self.transport.send_sync_request(&SyncCommand::Stat)?;
+        self.transport.send_sync_request(&SyncCommand::Stat).await?;
 
-        self.handle_stat_command(path)
+        self.handle_stat_command(path).await
     }
 }

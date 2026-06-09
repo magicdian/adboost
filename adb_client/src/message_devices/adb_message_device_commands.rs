@@ -1,3 +1,7 @@
+use std::pin::Pin;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use crate::{
     ADBDeviceExt, ADBListItemType, RebootType, Result,
     message_devices::{
@@ -5,95 +9,97 @@ use crate::{
     },
     models::{AdbStatResponse, RemountInfo},
 };
-use std::{
-    io::{Read, Write},
-    path::Path,
-};
+use std::path::Path;
 
 impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
-    #[inline]
-    fn shell_command(
+    async fn shell_command(
         &mut self,
-        command: &dyn AsRef<str>,
-        stdout: Option<&mut dyn Write>,
-        stderr: Option<&mut dyn Write>,
+        command: &(dyn AsRef<str> + Sync),
+        stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
-        self.shell_command(command, stdout, stderr)
+        self.shell_command(command, stdout, stderr).await
     }
 
-    #[inline]
-    fn shell(&mut self, reader: &mut dyn Read, writer: Box<dyn Write + Send>) -> Result<()> {
-        self.shell(reader, writer)
+    async fn shell(
+        &mut self,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
+    ) -> Result<()> {
+        self.shell(reader, writer).await
     }
 
-    #[inline]
-    fn exec(
+    async fn exec(
         &mut self,
         command: &str,
-        reader: &mut dyn Read,
-        writer: Box<dyn Write + Send>,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
     ) -> Result<()> {
-        self.exec(command, reader, writer)
+        self.exec(command, reader, writer).await
     }
 
-    #[inline]
-    fn stat(&mut self, remote_path: &dyn AsRef<str>) -> Result<AdbStatResponse> {
-        self.stat(remote_path)
+    async fn stat(&mut self, remote_path: &(dyn AsRef<str> + Sync)) -> Result<AdbStatResponse> {
+        self.stat(remote_path).await
     }
 
-    #[inline]
-    fn pull(&mut self, source: &dyn AsRef<str>, output: &mut dyn Write) -> Result<()> {
-        self.pull(source, output)
+    async fn pull(
+        &mut self,
+        source: &(dyn AsRef<str> + Sync),
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.pull(source.as_ref(), output).await
     }
 
-    #[inline]
-    fn push(&mut self, stream: &mut dyn Read, path: &dyn AsRef<str>) -> Result<()> {
-        self.push(stream, path)
+    async fn push(
+        &mut self,
+        stream: &mut (dyn AsyncRead + Unpin + Send),
+        path: &(dyn AsRef<str> + Sync),
+    ) -> Result<()> {
+        self.push(stream, path.as_ref()).await
     }
 
-    #[inline]
-    fn reboot(&mut self, reboot_type: RebootType) -> Result<()> {
-        self.reboot(reboot_type)
+    async fn reboot(&mut self, reboot_type: RebootType) -> Result<()> {
+        self.reboot(reboot_type).await
     }
 
-    #[inline]
-    fn remount(&mut self) -> Result<Vec<RemountInfo>> {
-        self.remount()
+    async fn remount(&mut self) -> Result<Vec<RemountInfo>> {
+        self.remount().await
     }
 
-    #[inline]
-    fn root(&mut self) -> Result<()> {
-        self.root()
+    async fn root(&mut self) -> Result<()> {
+        self.root().await
     }
 
-    #[inline]
-    fn install(&mut self, apk_path: &dyn AsRef<Path>, user: Option<&str>) -> Result<()> {
-        self.install(apk_path, user)
+    async fn install(
+        &mut self,
+        apk_path: &(dyn AsRef<Path> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.install(apk_path, user).await
     }
 
-    #[inline]
-    fn uninstall(&mut self, package: &dyn AsRef<str>, user: Option<&str>) -> Result<()> {
-        self.uninstall(package, user)
+    async fn uninstall(
+        &mut self,
+        package: &(dyn AsRef<str> + Sync),
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.uninstall(package, user).await
     }
 
-    #[inline]
-    fn enable_verity(&mut self) -> Result<()> {
-        self.enable_verity()
+    async fn enable_verity(&mut self) -> Result<()> {
+        self.enable_verity().await
     }
 
-    #[inline]
-    fn disable_verity(&mut self) -> Result<()> {
-        self.disable_verity()
+    async fn disable_verity(&mut self) -> Result<()> {
+        self.disable_verity().await
     }
 
-    #[inline]
     #[cfg(feature = "framebuffer")]
-    fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-        self.framebuffer_inner()
+    async fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        self.framebuffer_inner().await
     }
 
-    #[inline]
-    fn list(&mut self, path: &dyn AsRef<str>) -> Result<Vec<ADBListItemType>> {
-        self.list(path)
+    async fn list(&mut self, path: &(dyn AsRef<str> + Sync)) -> Result<Vec<ADBListItemType>> {
+        self.list(path.as_ref()).await
     }
 }

@@ -15,12 +15,12 @@ use crate::models::{ADBListItem, ADBListItemType};
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     /// List the entries in the given directory on the device.
     /// note: path uses internal file paths, so Documents is at /storage/emulated/0/Documents
-    pub(crate) fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
-        let mut session = self.open_synchronization_session()?;
+    pub(crate) async fn list<A: AsRef<str>>(&mut self, path: A) -> Result<Vec<ADBListItemType>> {
+        let mut session = self.open_synchronization_session().await?;
 
-        let output = self.handle_list(&mut session, path);
+        let output = self.handle_list(&mut session, path).await;
 
-        self.end_transaction(&mut session)?;
+        self.end_transaction(&mut session).await?;
         output
     }
 
@@ -38,7 +38,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     ///     Current             └─────┘
     ///     payload          Wanted in
     ///                      Next payload
-    fn read_bytes_from_transport(
+    async fn read_bytes_from_transport(
         session: &mut ADBSession<T>,
         requested_bytes: usize,
         current_index: &mut usize,
@@ -69,9 +69,14 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                     local_id,
                     remote_id,
                     &[],
-                )?)?;
+                )?)
+                .await?;
 
-            *payload = session.get_transport_mut().read_message()?.into_payload();
+            *payload = session
+                .get_transport_mut()
+                .read_message()
+                .await?
+                .into_payload();
 
             let bytes_read_from_new_payload = requested_bytes - bytes_read_from_existing_payload;
             slice.extend_from_slice(&payload[..bytes_read_from_new_payload]);
@@ -80,7 +85,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         }
     }
 
-    fn handle_list<A: AsRef<str>>(
+    async fn handle_list<A: AsRef<str>>(
         &mut self,
         session: &mut ADBSession<T>,
         path: A,
@@ -99,18 +104,20 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             let mut path_bytes: Vec<u8> = Vec::from(path.as_ref().as_bytes());
             serialized_message.append(&mut path_bytes);
 
-            session.send_and_expect_okay(ADBTransportMessage::try_new(
-                MessageCommand::Write,
-                session.local_id(),
-                session.remote_id(),
-                &serialized_message,
-            )?)?;
+            session
+                .send_and_expect_okay(ADBTransportMessage::try_new(
+                    MessageCommand::Write,
+                    session.local_id(),
+                    session.remote_id(),
+                    &serialized_message,
+                )?)
+                .await?;
         }
 
         let mut list_items = Vec::new();
 
         let transport = self.get_transport_mut();
-        let mut payload = transport.read_message()?.into_payload();
+        let mut payload = transport.read_message().await?.into_payload();
         let mut current_index = 0;
         loop {
             // Loop though the response for all the entries
@@ -120,7 +127,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 STATUS_CODE_LENGTH_IN_BYTES,
                 &mut current_index,
                 &mut payload,
-            )?;
+            )
+            .await?;
             match str::from_utf8(&status_code)? {
                 "DENT" => {
                     // Read the file mode, size, mod time and name length in one go, since all their sizes are predictable
@@ -131,7 +139,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                         SIZE_OF_METADATA,
                         &mut current_index,
                         &mut payload,
-                    )?;
+                    )
+                    .await?;
                     let mode = metadata[..U32_SIZE_IN_BYTES].to_vec();
                     let size = metadata[U32_SIZE_IN_BYTES..2 * U32_SIZE_IN_BYTES].to_vec();
                     let time = metadata[2 * U32_SIZE_IN_BYTES..3 * U32_SIZE_IN_BYTES].to_vec();
@@ -147,7 +156,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                         name_len,
                         &mut current_index,
                         &mut payload,
-                    )?;
+                    )
+                    .await?;
                     let name = String::from_utf8(name_buf)?;
 
                     // First 9 bits are the file permissions

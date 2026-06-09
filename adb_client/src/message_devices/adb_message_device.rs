@@ -160,8 +160,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
     /// Open a new ADB session with the given local command.
     pub async fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
-        let mut rng = rand::rng();
-        let local_id: u32 = rng.random();
+        // Scope the (`!Send`) `ThreadRng` so it is dropped before any `.await`,
+        // keeping the returned future `Send` for multi-threaded runtimes.
+        let local_id: u32 = {
+            let mut rng = rand::rng();
+            rng.random()
+        };
 
         let message = ADBTransportMessage::try_new(
             MessageCommand::Open,

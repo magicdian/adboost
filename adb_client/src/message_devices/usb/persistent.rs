@@ -587,12 +587,12 @@ impl PersistentUsbConnection {
 
             let msg = match outcome {
                 ReadStep::Message(msg) => msg,
-                // Normal read timeout — the transport hit its per-read deadline.
-                // `nusb` surfaces this as `TransferError::Cancelled`, which the
-                // transport maps to `RustADBError::UsbTimeout`. Keep looping.
-                ReadStep::ReadTimeout => continue,
-                // A control message was applied (registry already mutated).
-                ReadStep::Control => continue,
+                // `ReadTimeout`: normal read timeout — the transport hit its
+                // per-read deadline. `nusb` surfaces this as
+                // `TransferError::Cancelled`, which the transport maps to
+                // `RustADBError::UsbTimeout`. `Control`: a control message was
+                // applied (registry already mutated). Both just keep looping.
+                ReadStep::ReadTimeout | ReadStep::Control => continue,
                 ReadStep::Closed => {
                     log::debug!("PersistentUsb reader: control channel closed, exiting");
                     break;
@@ -760,9 +760,23 @@ impl PersistentUsbConnection {
     /// Returns [`RustADBError::SendError`] if a background task is gone,
     /// [`RustADBError::ADBRequestFailed`] on a missing/late OKAY, or any
     /// transport error.
+    /// Best-effort unregister of a session id from the reader's session map.
+    ///
+    /// Used to undo a partial registration when opening a session fails; the
+    /// send is fire-and-forget since the only caller is already returning an
+    /// error.
+    async fn unregister_session(&self, local_id: u32) {
+        let _ = self
+            .control_tx
+            .send(ReaderControl::Unregister(local_id))
+            .await;
+    }
+
     pub async fn open_session(&self, cmd: &ADBLocalCommand) -> Result<MultiplexedSession> {
-        let mut rng = rand::rng();
-        let local_id: u32 = rng.random();
+        let local_id: u32 = {
+            let mut rng = rand::rng();
+            rng.random()
+        };
 
         // Create separate channels for data (WRTE/CLSE) and acks (OKAY)
         let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
@@ -806,32 +820,21 @@ impl PersistentUsbConnection {
             &service_bytes,
         )?;
         if self.writer.send_with_ack(open_msg).await.is_err() {
-            let _ = self
-                .control_tx
-                .send(ReaderControl::Unregister(local_id))
-                .await;
+            self.unregister_session(local_id).await;
             return Err(RustADBError::SendError);
         }
 
         // Wait for OKAY response on ack channel
-        let response = match tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await {
-            Ok(Some(msg)) => msg,
-            _ => {
-                let _ = self
-                    .control_tx
-                    .send(ReaderControl::Unregister(local_id))
-                    .await;
-                return Err(RustADBError::ADBRequestFailed(
-                    "open_session: timeout waiting for OKAY".into(),
-                ));
-            }
+        let Ok(Some(response)) = tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await
+        else {
+            self.unregister_session(local_id).await;
+            return Err(RustADBError::ADBRequestFailed(
+                "open_session: timeout waiting for OKAY".into(),
+            ));
         };
 
         if response.header().command() != MessageCommand::Okay {
-            let _ = self
-                .control_tx
-                .send(ReaderControl::Unregister(local_id))
-                .await;
+            self.unregister_session(local_id).await;
             return Err(RustADBError::ADBRequestFailed(format!(
                 "open_session: expected OKAY, got {}",
                 response.header().command()
@@ -1325,6 +1328,51 @@ fn poll_read_impl(
     }
 }
 
+/// Resolve an in-flight WRTE by polling its write-result oneshot.
+///
+/// The window debit (`record_sent`) lands here, AFTER the write is confirmed,
+/// in one synchronous (non-await) segment (decisions P1-1 and P1-3). Returns
+/// `Some(poll)` when there is an in-flight write to resolve (the caller
+/// short-circuits with it), or `None` when the writer is idle and the caller
+/// should proceed.
+fn poll_inflight_write(
+    cx: &mut Context<'_>,
+    shared: &Arc<SessionInner>,
+    send_flow: &mut FlowControl,
+    write_state: &mut WriteState,
+) -> Option<Poll<io::Result<usize>>> {
+    let WriteState::Sending { ack, chunk_size } = write_state else {
+        return None;
+    };
+    Some(match Pin::new(ack).poll(cx) {
+        Poll::Ready(Ok(Ok(()))) => {
+            let n = *chunk_size;
+            send_flow.record_sent(n);
+            *write_state = WriteState::Idle;
+            log::trace!(
+                "PersistentUsb: session {} sent WRTE size={n}, window={:?}",
+                shared.local_id,
+                send_flow.available_bytes()
+            );
+            Poll::Ready(Ok(n))
+        }
+        Poll::Ready(Ok(Err(e))) => {
+            *write_state = WriteState::Idle;
+            shared.mark_closed();
+            Poll::Ready(Err(e))
+        }
+        Poll::Ready(Err(_canceled)) => {
+            *write_state = WriteState::Idle;
+            shared.mark_closed();
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer dropped ack",
+            )))
+        }
+        Poll::Pending => Poll::Pending,
+    })
+}
+
 /// Drive the shared `poll_write` state machine — the SINGLE send-side
 /// flow-control policy, shared by both write paths.
 ///
@@ -1344,37 +1392,9 @@ fn poll_write_impl(
     write_state: &mut WriteState,
     buf: &[u8],
 ) -> Poll<io::Result<usize>> {
-    // 1. Resolve any in-flight WRTE first: poll its write-result oneshot. The
-    //    window debit lands here, AFTER the write is confirmed, in one
-    //    synchronous (non-await) segment (P1-① / P1-③).
-    if let WriteState::Sending { ack, chunk_size } = write_state {
-        match Pin::new(ack).poll(cx) {
-            Poll::Ready(Ok(Ok(()))) => {
-                let n = *chunk_size;
-                send_flow.record_sent(n);
-                *write_state = WriteState::Idle;
-                log::trace!(
-                    "PersistentUsb: session {} sent WRTE size={n}, window={:?}",
-                    shared.local_id,
-                    send_flow.available_bytes()
-                );
-                return Poll::Ready(Ok(n));
-            }
-            Poll::Ready(Ok(Err(e))) => {
-                *write_state = WriteState::Idle;
-                shared.mark_closed();
-                return Poll::Ready(Err(e));
-            }
-            Poll::Ready(Err(_canceled)) => {
-                *write_state = WriteState::Idle;
-                shared.mark_closed();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "writer dropped ack",
-                )));
-            }
-            Poll::Pending => return Poll::Pending,
-        }
+    // 1. Resolve any in-flight WRTE first (window debit lands on confirmation).
+    if let Some(poll) = poll_inflight_write(cx, shared, send_flow, write_state) {
+        return poll;
     }
 
     if buf.is_empty() {
@@ -1469,32 +1489,7 @@ fn poll_write_impl(
     };
 
     // Poll the just-created ack once so a synchronously-ready write completes now.
-    if let WriteState::Sending { ack, chunk_size } = write_state {
-        match Pin::new(ack).poll(cx) {
-            Poll::Ready(Ok(Ok(()))) => {
-                let n = *chunk_size;
-                send_flow.record_sent(n);
-                *write_state = WriteState::Idle;
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(Ok(Err(e))) => {
-                *write_state = WriteState::Idle;
-                shared.mark_closed();
-                Poll::Ready(Err(e))
-            }
-            Poll::Ready(Err(_canceled)) => {
-                *write_state = WriteState::Idle;
-                shared.mark_closed();
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "writer dropped ack",
-                )))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    } else {
-        Poll::Pending
-    }
+    poll_inflight_write(cx, shared, send_flow, write_state).unwrap_or(Poll::Pending)
 }
 
 impl AsyncRead for SessionReadHalf {

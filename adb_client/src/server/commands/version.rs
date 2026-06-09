@@ -6,10 +6,12 @@ use crate::{
 
 impl ADBServer {
     /// Gets server's internal version number.
-    pub fn version(&mut self) -> Result<AdbVersion> {
+    pub async fn version(&mut self) -> Result<AdbVersion> {
         let version = self
-            .connect()?
-            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Version), true)?;
+            .connect()
+            .await?
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::Version), true)
+            .await?;
 
         AdbVersion::try_from(version)
     }

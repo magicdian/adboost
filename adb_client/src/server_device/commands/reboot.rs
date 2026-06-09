@@ -6,14 +6,15 @@ use crate::{
 
 impl ADBServerDevice {
     /// Reboots the device
-    pub fn reboot(&mut self, reboot_type: RebootType) -> Result<()> {
-        self.set_serial_transport()?;
+    pub async fn reboot(&mut self, reboot_type: RebootType) -> Result<()> {
+        self.set_serial_transport().await?;
 
         self.transport
             .proxy_connection(
                 &ADBCommand::Local(ADBLocalCommand::Reboot(reboot_type)),
                 false,
             )
+            .await
             .map(|_| ())
     }
 }
