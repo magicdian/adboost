@@ -1463,7 +1463,10 @@ fn poll_write_impl(
             )));
         }
     }
-    *write_state = WriteState::Sending { ack: rx, chunk_size };
+    *write_state = WriteState::Sending {
+        ack: rx,
+        chunk_size,
+    };
 
     // Poll the just-created ack once so a synchronously-ready write completes now.
     if let WriteState::Sending { ack, chunk_size } = write_state {
@@ -1780,13 +1783,20 @@ mod tests {
 
         let mut buf = [0u8; 5];
         session.read_exact(&mut buf).await.expect("read payload");
-        assert_eq!(&buf, b"hello", "WRTE payload must be delivered to the reader");
+        assert_eq!(
+            &buf, b"hello",
+            "WRTE payload must be delivered to the reader"
+        );
 
         // The session must have enqueued the crediting OKAY (windowed: 5 as i32 LE).
         let okay = writer_rx.recv().await.expect("OKAY enqueued");
         match okay {
             OutboundFrame::FireForget(m) => {
-                assert_eq!(m.header().command(), MessageCommand::Okay, "credit is an OKAY");
+                assert_eq!(
+                    m.header().command(),
+                    MessageCommand::Okay,
+                    "credit is an OKAY"
+                );
                 assert_eq!(
                     m.payload(),
                     &5_i32.to_le_bytes(),
@@ -1800,18 +1810,23 @@ mod tests {
     #[tokio::test]
     async fn write_goes_through_writer_task_with_ack() {
         // Windowed with a credited window so the write is not blocked.
-        let (mut session, _data_tx, _ack_tx, mut writer_rx, _ctl) = MultiplexedSession::new_for_test(
-            10,
-            20,
-            true,
-            FlowControl::new_windowed(INITIAL_DELAYED_ACK_BYTES),
-        );
+        let (mut session, _data_tx, _ack_tx, mut writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(
+                10,
+                20,
+                true,
+                FlowControl::new_windowed(INITIAL_DELAYED_ACK_BYTES),
+            );
 
         // Drive the write and the writer concurrently: poll_write enqueues a
         // WithAck frame and awaits its oneshot; the emulated writer replies Ok.
         let writer = tokio::spawn(async move {
             let frame = pump_writer(&mut writer_rx).await;
-            assert_eq!(frame.header().command(), MessageCommand::Write, "WRTE on the wire");
+            assert_eq!(
+                frame.header().command(),
+                MessageCommand::Write,
+                "WRTE on the wire"
+            );
             assert_eq!(frame.payload(), b"data", "payload must match");
         });
 
@@ -1847,7 +1862,11 @@ mod tests {
 
         // Now the writer task should see the WRTE; reply Ok so the write returns.
         let frame = pump_writer(&mut writer_rx).await;
-        assert_eq!(frame.payload(), b"abc", "credited write must flush the chunk");
+        assert_eq!(
+            frame.payload(),
+            b"abc",
+            "credited write must flush the chunk"
+        );
         let _session = write.await.expect("write task completes");
     }
 
@@ -1877,12 +1896,20 @@ mod tests {
         let frame = writer_rx.recv().await.expect("CLSE enqueued on drop");
         match frame {
             OutboundFrame::FireForget(m) => {
-                assert_eq!(m.header().command(), MessageCommand::Clse, "drop sends CLSE");
+                assert_eq!(
+                    m.header().command(),
+                    MessageCommand::Clse,
+                    "drop sends CLSE"
+                );
             }
             OutboundFrame::WithAck(..) => panic!("drop CLSE must be fire-and-forget"),
         }
         // ...and ask the reader to unregister the session id.
-        match control_rx.recv().await.expect("unregister enqueued on drop") {
+        match control_rx
+            .recv()
+            .await
+            .expect("unregister enqueued on drop")
+        {
             ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop unregisters the local id"),
             _ => panic!("drop must enqueue an Unregister"),
         }
@@ -1896,7 +1923,11 @@ mod tests {
         // Emulate the writer replying to the close's WithAck CLSE.
         let writer = tokio::spawn(async move {
             let frame = pump_writer(&mut writer_rx).await;
-            assert_eq!(frame.header().command(), MessageCommand::Clse, "close sends CLSE");
+            assert_eq!(
+                frame.header().command(),
+                MessageCommand::Clse,
+                "close sends CLSE"
+            );
             // No further frame must arrive (Drop must not duplicate the CLSE).
             assert!(
                 writer_rx.try_recv().is_err(),
@@ -1940,7 +1971,10 @@ mod tests {
             .await
             .expect("send WRTE");
         let mut buf = [0u8; 4];
-        session.read_exact(&mut buf).await.expect("read after cancel");
+        session
+            .read_exact(&mut buf)
+            .await
+            .expect("read after cancel");
         assert_eq!(&buf, b"data", "the WRTE survives the earlier cancellation");
 
         let okay = writer_rx.recv().await.expect("OKAY emitted once");

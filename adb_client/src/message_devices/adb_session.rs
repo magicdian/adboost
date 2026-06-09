@@ -1,9 +1,7 @@
-use std::{
-    io::{Cursor, Read, Seek},
-    time::Duration,
-};
+use std::io::{Cursor, Seek};
 
 use byteorder::ReadBytesExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     AdbStatResponse, BinaryDecodable, Result, RustADBError,
@@ -51,50 +49,60 @@ impl<T: ADBMessageTransport> ADBSession<T> {
     }
 
     /// Receive a message and acknowledge it by replying with an `OKAY` command
-    pub(crate) fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
-        let message = self.transport.read_message()?;
-        self.transport.write_message(ADBTransportMessage::try_new(
-            MessageCommand::Okay,
-            self.local_id,
-            self.remote_id,
-            &[],
-        )?)?;
+    pub(crate) async fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
+        let message = self.transport.read_message().await?;
+        self.transport
+            .write_message(ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                self.local_id,
+                self.remote_id,
+                &[],
+            )?)
+            .await?;
         Ok(message)
     }
 
     /// Expect a message with an `OKAY` command after sending a message.
-    pub(crate) fn send_and_expect_okay(
+    pub(crate) async fn send_and_expect_okay(
         &mut self,
         message: ADBTransportMessage,
     ) -> Result<ADBTransportMessage> {
-        self.transport.write_message(message)?;
+        self.transport.write_message(message).await?;
 
-        self.transport.read_message().and_then(|message| {
-            message.assert_command(MessageCommand::Okay)?;
-            Ok(message)
-        })
+        let message = self.transport.read_message().await?;
+        message.assert_command(MessageCommand::Okay)?;
+        Ok(message)
     }
 
-    pub(crate) fn recv_file<W: std::io::Write>(
+    pub(crate) async fn recv_file<W: AsyncWrite + Unpin>(
         &mut self,
         mut output: W,
     ) -> std::result::Result<(), RustADBError> {
         let mut len: Option<u64> = None;
         loop {
-            let payload = self.recv_and_reply_okay()?.into_payload();
+            let payload = self.recv_and_reply_okay().await?.into_payload();
+            // The header parsing below operates on an in-memory cursor — pure
+            // (sans-io) byte work, kept synchronous. Only the payload copy into
+            // the async sink is awaited.
             let mut rdr = Cursor::new(&payload);
             while rdr.position() != payload.len() as u64 {
                 match len.take() {
                     Some(0) | None => {
                         rdr.seek_relative(4)?;
-                        len.replace(u64::from(rdr.read_u32::<byteorder::LittleEndian>()?));
+                        len.replace(u64::from(
+                            ReadBytesExt::read_u32::<byteorder::LittleEndian>(&mut rdr)?,
+                        ));
                     }
                     Some(length) => {
                         let remaining_bytes = payload.len() as u64 - rdr.position();
+                        let copy_len = length.min(remaining_bytes);
+                        let start = usize::try_from(rdr.position())?;
+                        let end = start + usize::try_from(copy_len)?;
+                        output.write_all(&payload[start..end]).await?;
+                        rdr.seek_relative(i64::try_from(copy_len)?)?;
                         if length < remaining_bytes {
-                            std::io::copy(&mut rdr.by_ref().take(length), &mut output)?;
+                            // header for the next chunk follows in this payload
                         } else {
-                            std::io::copy(&mut rdr.take(remaining_bytes), &mut output)?;
                             len.replace(length - remaining_bytes);
                             // this payload is now exhausted
                             break;
@@ -102,9 +110,9 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                     }
                 }
             }
-            if Cursor::new(&payload[(payload.len() - 8)..(payload.len() - 4)])
-                .read_u32::<byteorder::LittleEndian>()?
-                == MessageSubcommand::Done as u32
+            if ReadBytesExt::read_u32::<byteorder::LittleEndian>(&mut Cursor::new(
+                &payload[(payload.len() - 8)..(payload.len() - 4)],
+            ))? == MessageSubcommand::Done as u32
             {
                 break;
             }
@@ -112,9 +120,9 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         Ok(())
     }
 
-    pub(crate) fn push_file<R: std::io::Read>(&mut self, mut reader: R) -> Result<()> {
+    pub(crate) async fn push_file<R: AsyncRead + Unpin>(&mut self, mut reader: R) -> Result<()> {
         let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
-        let amount_read = reader.read(&mut buffer)?;
+        let amount_read = reader.read(&mut buffer).await?;
         let subcommand_data = MessageSubcommand::Data.with_arg(u32::try_from(amount_read)?);
 
         let mut serialized_message = subcommand_data.encode();
@@ -127,12 +135,12 @@ impl<T: ADBMessageTransport> ADBSession<T> {
             &serialized_message,
         )?;
 
-        self.send_and_expect_okay(message)?;
+        self.send_and_expect_okay(message).await?;
 
         loop {
             let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
 
-            match reader.read(&mut buffer) {
+            match reader.read(&mut buffer).await {
                 Ok(0) => {
                     // Currently file mtime is not forwarded
                     let subcommand_data = MessageSubcommand::Done.with_arg(0);
@@ -144,10 +152,10 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                         &subcommand_data.encode(),
                     )?;
 
-                    self.send_and_expect_okay(message)?;
+                    self.send_and_expect_okay(message).await?;
 
                     // Command should end with a Write => Okay
-                    let received = self.transport.read_message()?;
+                    let received = self.transport.read_message().await?;
                     match received.header().command() {
                         MessageCommand::Write => return Ok(()),
                         c => {
@@ -170,7 +178,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                         &serialized_message,
                     )?;
 
-                    self.send_and_expect_okay(message)?;
+                    self.send_and_expect_okay(message).await?;
                 }
                 Err(e) => {
                     return Err(RustADBError::IOError(e));
@@ -179,7 +187,10 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         }
     }
 
-    pub(crate) fn stat_with_explicit_ids(&mut self, remote_path: &str) -> Result<AdbStatResponse> {
+    pub(crate) async fn stat_with_explicit_ids(
+        &mut self,
+        remote_path: &str,
+    ) -> Result<AdbStatResponse> {
         let stat_buffer = MessageSubcommand::Stat.with_arg(u32::try_from(remote_path.len())?);
         let message = ADBTransportMessage::try_new(
             MessageCommand::Write,
@@ -187,15 +198,16 @@ impl<T: ADBMessageTransport> ADBSession<T> {
             self.remote_id(),
             &stat_buffer.encode(),
         )?;
-        self.send_and_expect_okay(message)?;
+        self.send_and_expect_okay(message).await?;
         self.send_and_expect_okay(ADBTransportMessage::try_new(
             MessageCommand::Write,
             self.local_id(),
             self.remote_id(),
             remote_path.as_bytes(),
-        )?)?;
+        )?)
+        .await?;
 
-        let response = self.transport.read_message()?;
+        let response = self.transport.read_message().await?;
         // Skip first 4 bytes as this is the literal "STAT".
         // Interesting part starts right after
 
@@ -203,13 +215,11 @@ impl<T: ADBMessageTransport> ADBSession<T> {
     }
 }
 
-impl<T: ADBMessageTransport> Drop for ADBSession<T> {
-    fn drop(&mut self) {
-        // some devices will repeat the trailing CLSE command to ensure
-        // the client has acknowledged it. Read them quickly if present.
-        while let Ok(_discard_close_message) = self
-            .transport
-            .read_message_with_timeout(Duration::from_millis(20))
-        {}
-    }
-}
+// NOTE (async teardown, P0-②): the previous synchronous `Drop` drained a
+// trailing CLSE from the transport with a short blocking read. Under the async
+// rewrite there is no async `Drop` in stable Rust and the transport read is now
+// a future that cannot be awaited here. Session teardown is handled structurally
+// by the transport layer (the persistent USB multiplexer enqueues a fire-and-
+// forget CLSE on the writer task; the TCP transport closes the socket on drop),
+// so the trailing-CLSE drain is dropped. Callers needing graceful close should
+// use `end_transaction`, which reads the closing message explicitly.

@@ -24,8 +24,12 @@ pub struct ADBMessageDevice<T: ADBMessageTransport> {
 }
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
-    /// Instantiate a new [`ADBMessageTransport`]
-    pub fn new<P: AsRef<Path>>(transport: T, adb_private_key_path: P) -> Result<Self> {
+    /// Instantiate a new [`ADBMessageDevice`].
+    ///
+    /// The ADB handshake is network I/O, so the constructor is `async` (it
+    /// drives `connect` to completion). Per the async rewrite there is no
+    /// blocking constructor and no builder — callers `.await` this directly.
+    pub async fn new<P: AsRef<Path>>(transport: T, adb_private_key_path: P) -> Result<Self> {
         let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
             private_key
         } else {
@@ -37,7 +41,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         };
 
         let mut message_device = Self { transport };
-        message_device.connect(&private_key)?;
+        message_device.connect(&private_key).await?;
 
         Ok(message_device)
     }
@@ -47,8 +51,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     }
 
     /// Send initial connect
-    fn connect(&mut self, private_key: &ADBRsaKey) -> Result<()> {
-        self.get_transport_mut().connect()?;
+    async fn connect(&mut self, private_key: &ADBRsaKey) -> Result<()> {
+        self.get_transport_mut().connect().await?;
 
         let message = ADBTransportMessage::try_new(
             MessageCommand::Cnxn,
@@ -57,9 +61,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             format!("host::{}\0", env!("CARGO_PKG_NAME")).as_bytes(),
         )?;
 
-        self.get_transport_mut().write_message(message)?;
+        self.get_transport_mut().write_message(message).await?;
 
-        let message = self.get_transport_mut().read_message()?;
+        let message = self.get_transport_mut().read_message().await?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
@@ -70,8 +74,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                         1,
                         0,
                         &[],
-                    )?)?;
-                self.get_transport_mut().upgrade_connection()?;
+                    )?)
+                    .await?;
+                self.get_transport_mut().upgrade_connection().await?;
                 log::debug!("Connection successfully upgraded from TCP to TLS");
                 Ok(())
             }
@@ -81,7 +86,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             }
             MessageCommand::Auth => {
                 log::debug!("Authentication required");
-                self.auth_handshake(message, private_key)
+                self.auth_handshake(message, private_key).await
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
                 "Expected CNXN, STLS or AUTH command".to_string(),
@@ -90,7 +95,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         }
     }
 
-    fn auth_handshake(
+    async fn auth_handshake(
         &mut self,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
@@ -116,9 +121,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         let message = ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign)?;
 
-        self.transport.write_message(message)?;
+        self.transport.write_message(message).await?;
 
-        let received_response = self.transport.read_message()?;
+        let received_response = self.transport.read_message().await?;
 
         if received_response.header().command() == MessageCommand::Cnxn {
             log::info!(
@@ -134,15 +139,13 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let message =
             ADBTransportMessage::try_new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey)?;
 
-        self.transport.write_message(message)?;
+        self.transport.write_message(message).await?;
 
         let response = self
             .transport
             .read_message_with_timeout(Duration::from_secs(10))
-            .and_then(|message| {
-                message.assert_command(MessageCommand::Cnxn)?;
-                Ok(message)
-            })?;
+            .await?;
+        response.assert_command(MessageCommand::Cnxn)?;
 
         log::info!(
             "Authentication OK, device info {}",
@@ -151,12 +154,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         Ok(())
     }
 
-    pub(crate) fn open_synchronization_session(&mut self) -> Result<ADBSession<T>> {
-        self.open_session(&ADBLocalCommand::Sync)
+    pub(crate) async fn open_synchronization_session(&mut self) -> Result<ADBSession<T>> {
+        self.open_session(&ADBLocalCommand::Sync).await
     }
 
     /// Open a new ADB session with the given local command.
-    pub fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
+    pub async fn open_session(&mut self, cmd: &ADBLocalCommand) -> Result<ADBSession<T>> {
         let mut rng = rand::rng();
         let local_id: u32 = rng.random();
 
@@ -166,9 +169,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             0,
             cmd.to_string().as_bytes(),
         )?;
-        self.transport.write_message(message)?;
+        self.transport.write_message(message).await?;
 
-        let response = self.transport.read_message()?;
+        let response = self.transport.read_message().await?;
 
         if response.header().command() != MessageCommand::Okay {
             return Err(RustADBError::ADBRequestFailed(format!(
@@ -191,23 +194,25 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         ))
     }
 
-    pub(crate) fn end_transaction(&mut self, session: &mut ADBSession<T>) -> Result<()> {
+    pub(crate) async fn end_transaction(&mut self, session: &mut ADBSession<T>) -> Result<()> {
         let quit_buffer = MessageSubcommand::Quit.with_arg(0u32);
-        session.send_and_expect_okay(ADBTransportMessage::try_new(
-            MessageCommand::Write,
-            session.local_id(),
-            session.remote_id(),
-            &quit_buffer.encode(),
-        )?)?;
+        session
+            .send_and_expect_okay(ADBTransportMessage::try_new(
+                MessageCommand::Write,
+                session.local_id(),
+                session.remote_id(),
+                &quit_buffer.encode(),
+            )?)
+            .await?;
 
-        let _discard_close = self.transport.read_message()?;
+        let _discard_close = self.transport.read_message().await?;
         Ok(())
     }
 }
 
-impl<T: ADBMessageTransport> Drop for ADBMessageDevice<T> {
-    fn drop(&mut self) {
-        // Best effort here
-        let _ = self.get_transport_mut().disconnect();
-    }
-}
+// NOTE (async teardown, P0-②): `disconnect` is now an async transport method
+// and cannot be awaited in a stable-Rust `Drop`. Transport shutdown is handled
+// structurally by the transport itself (the persistent USB multiplexer aborts
+// its reader task and enqueues a fire-and-forget CLSE on drop; the TCP transport
+// closes its socket). Consumers wanting a graceful, awaited teardown should call
+// `disconnect` explicitly before dropping the device.

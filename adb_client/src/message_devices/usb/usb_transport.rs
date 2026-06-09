@@ -107,14 +107,13 @@ impl USBTransport {
 
     async fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
         let mut connection = self.write_connection.lock().await;
-        let max_packet_size =
-            connection
-                .write_info
-                .ok_or(RustADBError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "no write endpoint setup",
-                )))?
-                .max_packet_size;
+        let max_packet_size = connection
+            .write_info
+            .ok_or(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no write endpoint setup",
+            )))?
+            .max_packet_size;
         let endpoint = connection
             .write_endpoint
             .as_mut()
@@ -337,7 +336,10 @@ impl ADBMessageTransport for USBTransport {
         Ok(())
     }
 
-    async fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+    async fn read_message_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ADBTransportMessage> {
         let mut connection = self.connection.lock().await;
         let max_packet_size = connection
             .read_info

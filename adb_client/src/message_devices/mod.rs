@@ -16,7 +16,5 @@ pub(crate) mod message_commands;
 mod models;
 mod utils;
 
-pub mod session_stream;
-
 pub use adb_message_device::ADBMessageDevice;
 pub use utils::BinaryDecodable;

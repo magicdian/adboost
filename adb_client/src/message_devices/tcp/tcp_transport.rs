@@ -131,10 +131,11 @@ impl TcpTransport {
 /// Pull the live connection out of the guard, mapping the "no connection" case
 /// to an `io::ErrorKind::NotConnected` error.
 fn connection_mut(conn: &mut Option<CurrentConnection>) -> Result<&mut CurrentConnection> {
-    conn.as_mut().ok_or(RustADBError::IOError(std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "not connected",
-    )))
+    conn.as_mut()
+        .ok_or(RustADBError::IOError(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "not connected",
+        )))
 }
 
 impl ADBTransport for TcpTransport {
