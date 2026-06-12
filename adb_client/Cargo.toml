@@ -22,6 +22,11 @@ default = ["framebuffer"]
 mdns = ["dep:mdns-sd"]
 usb = ["dep:nusb"]
 framebuffer = ["dep:image"]
+# ADB **server** frontend: listen on TCP (default :5037), speak the smartsocket
+# host protocol to native `adb`/`scrcpy` clients, and bridge local services to a
+# device backend. The bundled `UsbDeviceBackend` rides on the `usb` stack, so
+# `server` implies `usb`. OFF by default — pure client users are unaffected.
+server = ["usb"]
 # Optional convenience initializer (`init_tracing_from_env`); OFF by default.
 # The library itself never installs a subscriber — it stays a pure emitter.
 tracing-init = ["dep:tracing-subscriber"]

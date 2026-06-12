@@ -20,9 +20,15 @@ mod models;
 
 /// Proxy client: connects to and proxies commands through an **external** ADB
 /// server daemon (the classic `adb` server on `:5037`). This is a client, not a
-/// server — for adboost's own ADB server frontend, see a future `server` module.
+/// server — for adboost's own ADB server frontend, see the [`server`] module.
 pub mod proxy;
 mod utils;
+
+/// ADB **server** frontend: listen on TCP and serve native `adb`/`scrcpy`
+/// clients, bridging to a device backend. Feature-gated (`server`).
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
+pub mod server;
 
 /// MDNS-related definitions
 #[cfg(feature = "mdns")]
