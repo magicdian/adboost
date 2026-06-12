@@ -20,6 +20,10 @@ directions of its own:
 
 - **USB backend migrated from `rusb` to [`nusb`](https://github.com/kevinmehall/nusb)**
   — a pure-Rust, async-friendly USB stack with no libusb C dependency.
+- **USB-backed ADB *server* mode** (feature `server`): adboost can act *as* an
+  adb server on `:5037`, speaking the smartsocket host protocol to native
+  `adb` / `scrcpy` clients and bridging to USB devices directly — no Google adb
+  server required. See [ADB server mode](#adb-server-mode).
 - Additional capabilities under active development (e.g. persistent-connection
   server features).
 
@@ -52,19 +56,77 @@ adboost is distributed under the terms of **`Apache-2.0 AND MIT`**:
 
 See [`NOTICE`](./NOTICE) for the complete attribution and the upstream MIT text.
 
+## ADB server mode
+
+adboost can run *as* an ADB server (feature `server`), so native `adb` and
+`scrcpy` clients connect to **adboost** on `:5037` instead of Google's adb
+server — which lets adboost own the USB device directly.
+
+```bash
+# start adboost as the adb server (background daemon)
+adboost_cli server start --address 127.0.0.1:5037
+#   --foreground   run in the foreground instead of daemonizing
+#   --pid-file P   PID file location (default: per-user runtime/home dir)
+#   --log-file P   daemon log location (default: next to the PID file)
+
+# now point any standard adb client at it
+ADB_SERVER_SOCKET=tcp:127.0.0.1:5037 adb devices
+ADB_SERVER_SOCKET=tcp:127.0.0.1:5037 adb -s <serial> shell
+
+# stop it
+adboost_cli server kill
+```
+
+> `server start` / `server kill` manage **adboost's own** server. They are
+> distinct from `host kill`, which tells an *external* adb daemon to quit.
+
+**Library API.** A zero-config USB server is a few lines; inject a custom
+[`DeviceBackend`] to weave in bespoke discovery / relay / auth without touching
+any protocol code:
+
+```rust,ignore
+// requires the `server` feature
+use std::sync::Arc;
+use adb_client::server::{AdbServerFrontend, UsbDeviceBackend};
+
+# async fn run() -> std::io::Result<()> {
+let backend = Arc::new(UsbDeviceBackend::new());
+AdbServerFrontend::builder(backend)
+    .addr("127.0.0.1:5037".parse().unwrap())
+    .serve()
+    .await
+# }
+```
+
+Supported today: `host:version`/`features`/`devices`/`devices-l`/`track-devices`,
+transport selection (`transport`/`transport-any`/`transport-id`/`tport`),
+`host-serial:*` queries, and the `shell:` (v1) / `tcp:` local services. Port
+`forward` and `shell_v2`/`sync` are not yet implemented.
+
+[`DeviceBackend`]: https://docs.rs/adb_client
+
 ## Workspace layout
 
 | Crate           | Description                                                        |
 | --------------- | ------------------------------------------------------------------ |
-| `adb_client`    | Core Rust library implementing the ADB server & device protocols.  |
+| `adb_client`    | Core Rust library: ADB client (`proxy` to an external daemon, direct `usb`/`tcp`) + ADB `server` frontend. |
 | `adboost_cli`   | CLI binary built on top of the library.                            |
 | `pyadb_client`  | Python bindings exposing the library to Python.                    |
 | `examples/mdns` | Example: mDNS device discovery.                                    |
 
+### Library module roles
+
+| Module | Role |
+| ------ | ---- |
+| `adb_client::proxy` | **Client** that proxies commands through an *external* adb server daemon (`ADBProxyServer` / `ADBProxyDevice`). Formerly `server` / `server_device`. |
+| `adb_client::usb` / `tcp` | Clients that connect **directly** to a device. |
+| `adb_client::server` | adboost acting **as** an ADB server (feature `server`). |
+
 ## TODO
 
-- [ ] Document features (server proxy mode, direct USB/TCP device connections, framebuffer, …)
 - [ ] Installation instructions (library, CLI, Python package)
-- [ ] Usage examples
-- [ ] Document the new persistent-connection capabilities
+- [ ] Document direct USB/TCP device connections + framebuffer
+- [ ] Document the persistent-connection capabilities
+- [ ] ADB server: port `forward` family + `shell_v2`/`sync`
+- [ ] Migrate `pyadb_client` / `examples` to the renamed `proxy` API
 - [ ] Finalize naming/branding once the planned refactor lands

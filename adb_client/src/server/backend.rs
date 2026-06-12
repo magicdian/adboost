@@ -83,7 +83,7 @@ impl DeviceState {
 ///
 /// All methods are `async`; [`trait_variant::make`] generates the `Send`
 /// variant so the backend can be driven from a multi-threaded tokio runtime
-/// (matching [`crate::ADBDeviceExt`] / [`crate::ADBTransport`]).
+/// (matching [`crate::ADBDeviceExt`] / the crate-internal `ADBTransport`).
 ///
 /// [`PersistentUsbConnection`]: crate::usb::PersistentUsbConnection
 /// [`UsbDeviceBackend`]: crate::server::UsbDeviceBackend

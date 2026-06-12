@@ -4,7 +4,7 @@
 //! server's host protocol — the part every adb server shares regardless of how
 //! it reaches devices. They are factored out as pure functions so the protocol's
 //! many easy-to-get-wrong reply framings can be unit-tested without a socket or
-//! a device (the [`tests`] module is the oracle).
+//! a device (the `tests` module is the oracle).
 //!
 //! # The framing, in one place
 //!
