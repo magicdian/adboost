@@ -6,6 +6,7 @@ mod local;
 mod opts;
 mod persistent;
 mod reboot_type;
+mod server;
 mod tcp;
 mod usb;
 
@@ -14,8 +15,9 @@ pub use device::DeviceCommands;
 pub use emu::{EmuCommand, EmulatorCommand};
 pub use host::{HostCommand, MdnsCommand};
 pub use local::{ForwardCommand, LocalCommand, LocalDeviceCommand, ReverseCommand};
-pub use opts::{MainCommand, Opts, ServerCommand};
+pub use opts::{MainCommand, Opts, ProxyCommand};
 pub use persistent::{PersistentCommand, PersistentSubcommand};
 pub use reboot_type::RebootTypeCommand;
+pub use server::ServerCommand;
 pub use tcp::TcpCommand;
 pub use usb::UsbCommand;

@@ -3,6 +3,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod adb_termios;
 
+mod daemon;
 mod handlers;
 mod models;
 mod utils;
@@ -22,7 +23,7 @@ use handlers::{
     handle_emulator_commands, handle_host_commands, handle_local_commands,
     handle_persistent_command,
 };
-use models::{DeviceCommands, LocalCommand, MainCommand, Opts};
+use models::{DeviceCommands, LocalCommand, MainCommand, Opts, ServerCommand};
 use std::collections::HashMap;
 use std::io::{Write, stdout};
 use std::process::ExitCode;
@@ -174,6 +175,15 @@ async fn inner_main() -> ADBCliResult<()> {
                 }
             }
         }
+        MainCommand::Server { command } => match command {
+            ServerCommand::Start {
+                address,
+                foreground,
+                pid_file,
+                log_file,
+            } => daemon::start(address, foreground, pid_file, log_file).await,
+            ServerCommand::Kill { pid_file } => daemon::kill(pid_file),
+        },
         MainCommand::Usb(usb_command) => handle_usb_command(usb_command).await,
         MainCommand::Tcp(tcp_command) => {
             let device = match tcp_command.path_to_private_key {

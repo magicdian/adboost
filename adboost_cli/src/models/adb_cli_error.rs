@@ -32,6 +32,13 @@ impl From<std::io::Error> for ADBCliError {
     }
 }
 
+impl From<String> for ADBCliError {
+    fn from(value: String) -> Self {
+        // A plain CLI-side message (e.g. daemon control failures) — not a bug.
+        Self::Standard(value.into())
+    }
+}
+
 impl From<adb_client::RustADBError> for ADBCliError {
     fn from(value: adb_client::RustADBError) -> Self {
         let value = Box::new(value);

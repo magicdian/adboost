@@ -14,7 +14,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-adb_client = { path = "../adb_client", features = ["mdns", "usb"] }
+adb_client = { path = "../adb_client", features = ["mdns", "usb", "server"] }
 clap = { version = "4.6.1", features = ["derive"] }
 tabwriter = { version = "1.4.1" }
 tokio = { version = "1", features = ["full"] }
@@ -24,6 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(unix)'.dependencies]
 termios = { version = "0.3.3" }
+# Daemon control on Unix: setsid (detach) on the spawned child + SIGTERM/`kill(0)`
+# liveness for `server kill`. Already in the dependency tree transitively.
+libc = { version = "0.2" }
 
 #####################################
 # Debian package build instructions #

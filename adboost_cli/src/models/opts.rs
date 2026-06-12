@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use crate::utils;
 
 use super::{
-    EmulatorCommand, HostCommand, LocalCommand, PersistentCommand, TcpCommand, UsbCommand,
+    EmulatorCommand, HostCommand, LocalCommand, PersistentCommand, ServerCommand, TcpCommand,
+    UsbCommand,
 };
 
 #[derive(Debug, Parser)]
@@ -19,10 +20,15 @@ pub struct Opts {
 
 #[derive(Debug, Parser)]
 pub enum MainCommand {
-    /// Server related commands
-    Host(ServerCommand<HostCommand>),
-    /// Device related commands using server
-    Local(ServerCommand<LocalCommand>),
+    /// Proxy commands sent to an external adb server daemon
+    Host(ProxyCommand<HostCommand>),
+    /// Device commands routed through an external adb server daemon
+    Local(ProxyCommand<LocalCommand>),
+    /// Run adboost's own USB-backed ADB server (start / kill)
+    Server {
+        #[clap(subcommand)]
+        command: ServerCommand,
+    },
     /// Emulator related commands
     Emu(EmulatorCommand),
     /// USB device related commands
@@ -38,8 +44,10 @@ pub enum MainCommand {
     Version,
 }
 
+/// Address + device-selector wrapper for commands that proxy through an
+/// **external** adb server daemon (`host` / `local`).
 #[derive(Debug, Parser)]
-pub struct ServerCommand<T: Subcommand> {
+pub struct ProxyCommand<T: Subcommand> {
     #[clap(short = 'a', long = "address", default_value = "127.0.0.1:5037")]
     pub address: SocketAddrV4,
     /// Serial id of a specific device. Every request will be sent to this device.
