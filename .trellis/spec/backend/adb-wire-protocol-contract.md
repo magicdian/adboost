@@ -160,6 +160,28 @@ checks magic.
   Allocating `vec![0; data_length]` from it without a bound is an OOM/DoS
   (`usb_transport.rs` / `tcp_transport.rs`).
 
+## CNXN banner payload must NOT be NUL-terminated
+
+The CNXN banner sent to adbd (`host::features=<csv>`) must contain **no trailing
+`\0`** in the payload. AOSP `adb.cpp send_connect` appends no NUL, and adbd's
+`StringToFeatureSet` splits the `features=` value on `,` **without trimming**. A
+trailing NUL therefore corrupts the **last** CSV feature token (`delayed_ack\0` !=
+`delayed_ack`) → adbd's `SupportsDelayedAck()` is false → it rejects our windowed
+`OPEN(arg1=32MiB)` with `A_CLSE(0, local_id)`. This was bug #3's TRUE root cause
+(device-confirmed on Android 16: removing the single NUL flips windowed OPEN from
+rejected → accepted with a 4-byte windowed OKAY grant).
+
+- `to_banner_string()` → `format!("host::features={}", csv)` — no `\0`.
+- The corruption only hit the LAST feature, so `shell_v2` (first) always worked and
+  masked the bug until #1/#2 let the handshake reach the OPEN.
+- adbd never trims/strips the CNXN banner (only the A_OPEN address gets
+  `StripTrailingNulls`). Any trailing junk on the banner's last feature is fatal.
+- Regression-locked: a test asserts the banner does not end in `\0` and the last
+  CSV token is exactly `delayed_ack`.
+- `adb_message_device.rs` legacy banner `host::{pkg}\0` is a DIFFERENT, feature-less
+  banner (no `features=`); its NUL corrupts no feature token. If it ever advertises
+  features it would need the same no-NUL fix.
+
 ## CLSE-rejection routing: `open_session` must race ack **and** data channels
 
 On OPEN rejection AOSP adbd sends `A_CLSE(arg0=0, arg1=host_local_id)`
@@ -199,11 +221,21 @@ returns more bytes than requested, not silently truncate. AOSP adbd writes the
 short packet terminating its transfer), so a compliant device never over-delivers;
 the guard surfaces non-compliant firmware loudly instead of desyncing.
 
-## Bug #3 status (honest)
+## Bug #3 status: RESOLVED (root cause found + device-verified)
 
-The CLSE-routing fix turns the windowed-OPEN **hang into a fast, diagnosable
-error**; it does NOT force a windowed OPEN to succeed. Root cause for *why* an
-Android-16 device might reject a windowed OPEN (vs accept) is not closed without a
-real-device usbmon/debug capture. The `read_exact`-drops-the-4-byte-OKAY theory
-(report hypothesis 2e) was **refuted** against AOSP (separate header/payload writes).
-Downstream `delayed_ack=false` workaround remains valid until a capture is obtained.
+The TRUE root cause was the **CNXN banner trailing NUL** (see the no-NUL section
+above): it made adbd's `SupportsDelayedAck()` false, so adbd rejected the windowed
+`OPEN(arg1=32MiB)` with `A_CLSE`. Removing the NUL was verified end-to-end on the
+real Android-16 device — windowed `open_session` now succeeds (12–18 ms) with a
+4-byte windowed OKAY grant `[00,00,00,02]` (32 MiB).
+
+Three complementary fixes shipped, all still valid:
+1. **The fix**: drop the CNXN banner trailing NUL (this makes windowed mode actually
+   work).
+2. CLSE-routing fast-fail (`open_session` races ack+data): turns any future OPEN
+   rejection into a 1–2 ms diagnosable error instead of a 10 s hang — this is what
+   made the root cause observable in the first place.
+3. `read_exact` desync guard: defensive; report hypothesis 2e (read_exact dropping
+   the 4-byte OKAY) was **refuted** against AOSP (separate header/payload writes).
+
+Downstream may now drop the `delayed_ack=false` workaround and use windowed mode.

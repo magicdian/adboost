@@ -126,14 +126,18 @@ impl DeviceFeatureSet {
         names
     }
 
-    /// Build the CNXN banner string `host::features=<csv>\0`.
+    /// Build the CNXN banner string `host::features=<csv>`.
     ///
-    /// The trailing NUL terminator matches what a real `adb` server sends and is
-    /// what the existing persistent connection wrote. With no features enabled
-    /// (the honest default) this is `"host::features=\0"`.
+    /// NO trailing NUL: the real AOSP `adb` host (`send_connect`) puts no NUL in
+    /// the CNXN payload, and adbd's feature parser (`StringToFeatureSet` →
+    /// `Split(",")`) does not trim, so a trailing NUL would corrupt the LAST CSV
+    /// feature token (e.g. `delayed_ack\0` != `delayed_ack`) and make adbd's
+    /// `SupportsDelayedAck()` false — which then makes it reject our windowed
+    /// `OPEN(arg1=32MiB)` with `A_CLSE`. With no features enabled this is
+    /// `"host::features="`.
     #[must_use]
     pub fn to_banner_string(&self) -> String {
-        format!("host::features={}\0", self.feature_names().join(","))
+        format!("host::features={}", self.feature_names().join(","))
     }
 }
 
@@ -145,7 +149,7 @@ mod tests {
     fn default_banner_advertises_shell_v2_and_delayed_ack() {
         let banner = DeviceFeatureSet::default().to_banner_string();
         assert_eq!(
-            banner, "host::features=shell_v2,delayed_ack\0",
+            banner, "host::features=shell_v2,delayed_ack",
             "the honest default advertises shell_v2 (Ask #5) and delayed_ack (Ask #1), in declaration order"
         );
     }
@@ -160,8 +164,8 @@ mod tests {
         };
         let banner = features.to_banner_string();
         assert_eq!(
-            banner, "host::features=shell_v2,cmd,delayed_ack\0",
-            "enabled features must be CSV-joined in declaration order with trailing NUL"
+            banner, "host::features=shell_v2,cmd,delayed_ack",
+            "enabled features must be CSV-joined in declaration order with no trailing NUL"
         );
     }
 
@@ -176,8 +180,35 @@ mod tests {
         };
         assert_eq!(
             features.to_banner_string(),
-            "host::features=shell_v2\0",
+            "host::features=shell_v2",
             "single enabled feature must not produce a trailing comma"
+        );
+    }
+
+    #[test]
+    fn banner_has_no_trailing_nul_so_last_feature_is_clean() {
+        // Bug #3 root-cause lock: adbd's `StringToFeatureSet` does
+        // `Split(value, ",")` with NO trimming, so a trailing NUL in the CNXN
+        // banner payload corrupts the LAST CSV feature token (it becomes
+        // `delayed_ack\0` != `delayed_ack`), making adbd's `SupportsDelayedAck()`
+        // false and causing it to reject our windowed `OPEN(arg1=32MiB)` with
+        // `A_CLSE`. The banner must therefore not end in NUL and the last feature
+        // token must be exactly `delayed_ack` (no embedded NUL).
+        let banner = DeviceFeatureSet::default().to_banner_string();
+        assert!(
+            !banner.ends_with('\0'),
+            "CNXN banner must not end with a NUL (would corrupt the last CSV feature token in adbd's no-trim Split)"
+        );
+        let value = banner
+            .strip_prefix("host::features=")
+            .expect("banner must start with host::features=");
+        let last_token = value
+            .split(',')
+            .next_back()
+            .expect("default banner has at least one feature");
+        assert_eq!(
+            last_token, FEATURE_DELAYED_ACK,
+            "the last comma-separated feature token must be exactly delayed_ack with no embedded NUL"
         );
     }
 }

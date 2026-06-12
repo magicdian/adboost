@@ -538,7 +538,9 @@ impl PersistentUsbConnection {
         }
 
         // Honest banner: advertise only features this end actually implements
-        // (see `DeviceFeatureSet`). The trailing NUL matches a real adb server.
+        // (see `DeviceFeatureSet`). No trailing NUL — the real AOSP adb host
+        // sends none, and a trailing NUL would corrupt the last CSV feature token
+        // in adbd's no-trim parser (see `to_banner_string`).
         let banner = features.to_banner_string();
 
         // The CNXN wire version must agree with the `delayed_ack` feature: AOSP
