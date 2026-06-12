@@ -305,3 +305,36 @@ User connected a real Android-16 device (adb/xdb servers killed) to capture grou
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: Library log->tracing migration (subtask A): emit-only, per-session local_id spans, RUST_LOG activation
+
+**Date**: 2026-06-12
+**Task**: Library log->tracing migration (subtask A): emit-only, per-session local_id spans, RUST_LOG activation
+**Branch**: `main`
+
+### Summary
+
+Brainstormed a capability feature (parent task) to close gaps exposed by bugs #1/#2/#3: (1) adb_cli closed-loop validation, (2) controllable library observability. Decisions: rebrand adb_cli->adboost_cli + full async migration + persistent USB exerciser (subtask B); library log->tracing migration (subtask A). 'adboost' bare name reserved for the library's future. Split into 2 subtasks. Completed subtask A: mechanical rewrite of 69 log:: -> tracing:: sites; Cargo drop log, add tracing+log feature (backward compat for env_logger consumers); hot-path spans (do_connect/do_auth/reader_loop/writer_loop/open_session/open_shell_v2/open_sync_session) carrying local_id so RUST_LOG=[session{local_id=N}]=trace narrows to one session; library stays pure emitter (tracing-subscriber optional behind off-by-default tracing-init feature gating init_tracing_from_env with try_init). trellis-check caught a real async-span footgun (sync span.enter() held across .await in open_session -> span leaks across tasks) and fixed it to #[instrument(fields(local_id))] + Span::record. spec logging-guidelines.md rewritten for tracing incl. the async-span rule. All gates green (build/clippy/test x3 feature combos, fmt). Subtask B (adboost_cli) is next, depends on A.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e4ed77d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
