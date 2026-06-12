@@ -18,7 +18,9 @@
 pub mod protocol;
 
 mod backend;
+mod capabilities;
 mod usb_backend;
 
 pub use backend::{DeviceBackend, DeviceEntry, DeviceState};
+pub use capabilities::{KillPolicy, ServerCapabilities};
 pub use usb_backend::UsbDeviceBackend;
