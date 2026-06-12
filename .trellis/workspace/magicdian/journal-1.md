@@ -338,3 +338,36 @@ Brainstormed a capability feature (parent task) to close gaps exposed by bugs #1
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: adboost_cli rebrand + async migration + persistent USB exerciser (subtask B) — real-device closed-loop verified
+
+**Date**: 2026-06-12
+**Task**: adboost_cli rebrand + async migration + persistent USB exerciser (subtask B) — real-device closed-loop verified
+**Branch**: `main`
+
+### Summary
+
+Completed subtask B (capability work). Rebranded adb_cli -> adboost_cli (git mv), migrated sync->async against the local workspace adb_client, added back to workspace members + release CI. ADBDeviceExt is now async (AFIT + trait_variant) and NOT dyn-compatible (boxed()/Box<dyn> removed), so the CLI's Box<dyn> dispatch was generic-ized to async fn run_command<D: ADBDeviceExt>. Byte streams bridged to tokio::io/tokio::fs. Dropped env_logger; CLI installs its own tracing-subscriber (RUST_LOG then --debug); library stays emit-only. Added a 'persistent' exerciser subcommand driving PersistentUsbConnection end-to-end with --no-delayed-ack (classic vs windowed, the bug-#3 control in one flag) + a negotiation self-check printing the first SESSION frame after OPEN (OKAY=accepted/CLSE=rejected) — formalizes the throwaway /tmp harness. Found+fixed a real library bug: adb_client's nusb dep lacked the 'tokio' feature, so real USB connect() panicked ('Awaiting blocking syscall without an async runtime'). trellis-check caught two rename-completeness misses (root README + rust-release.yml release pipeline still referencing -p adb_cli) and fixed them. Real-device verified on Android 16 (0e8d:201c): windowed -> delayed_ack negotiated=true, first frame OKAY payload_len=4, getprop->d02; classic -> negotiated=false, OKAY, getprop->d02. First-frame self-check initially mis-reported a buffered CNXN; fixed the subscribe_raw filter to session frames (Okay/Clse/Write) and re-verified on-device. spec directory-structure.md updated. Both subtasks (A tracing migration, B CLI) and the parent task are now complete + archived. All gates green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `19aa24a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
