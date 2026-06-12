@@ -180,28 +180,29 @@ impl ADBMessageTransport for TcpTransport {
 
         let header = ADBTransportMessageHeader::try_from(data)?;
 
-        if header.data_length() != 0 {
+        let payload = if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
             raw_connection
                 .read_exact_timeout(&mut msg_data, read_timeout)
                 .await?;
-            // raw_connection is not used anymore, let's drop the guard
-            drop(guard);
+            msg_data
+        } else {
+            vec![]
+        };
+        // raw_connection is not used anymore, let's drop the guard
+        drop(guard);
 
-            let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
 
-            // Check message integrity
-            if !message.check_message_integrity() {
-                return Err(RustADBError::InvalidIntegrity(
-                    ADBTransportMessageHeader::compute_crc32(message.payload()),
-                    message.header().data_crc32(),
-                ));
-            }
-
-            return Ok(message);
+        // Check message integrity (magic-only; runs for every frame, AOSP-faithful)
+        if !message.check_message_integrity() {
+            return Err(RustADBError::InvalidIntegrity(
+                ADBTransportMessageHeader::compute_magic(message.header().command()),
+                message.header().magic(),
+            ));
         }
 
-        Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+        Ok(message)
     }
 
     async fn write_message_with_timeout(

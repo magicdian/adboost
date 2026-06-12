@@ -25,6 +25,7 @@ Read the relevant guideline before writing code in that area:
 - **Touching errors / `Result` / panics**: [Error Handling](./error-handling.md)
 - **Adding `log` calls**: [Logging Guidelines](./logging-guidelines.md)
 - **Persistence / RSA key / session state**: [Persistence & External State](./database-guidelines.md)
+- **CNXN version / `delayed_ack` / message integrity (crc/magic)**: [ADB Wire Protocol Contract](./adb-wire-protocol-contract.md)
 - **Importing an upstream `.patch`**: [Upstream Patch Import](./upstream-patch-import.md)
 
 ---
@@ -38,6 +39,7 @@ Read the relevant guideline before writing code in that area:
 | [Error Handling](./error-handling.md) | `RustADBError` (thiserror), `Result` alias, CLI `ADBCliError`, PyO3 `anyhow` mapping | Filled |
 | [Quality Guidelines](./quality-guidelines.md) | clippy pedantic, MSRV, features, testing style, quality gate | Filled |
 | [Logging Guidelines](./logging-guidelines.md) | `log` facade, `log::<level>!` style, level conventions | Filled |
+| [ADB Wire Protocol Contract](./adb-wire-protocol-contract.md) | CNXN version ↔ `delayed_ack` ↔ `data_check` coupling; magic-only receive integrity; AOSP version constants | Filled |
 | [Upstream Patch Import](./upstream-patch-import.md) | How to import patches into this fork (skip Cargo.toml, handle version drift) | Filled |
 
 ---

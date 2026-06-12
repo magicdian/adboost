@@ -105,8 +105,8 @@ pub enum RustADBError {
     /// No descriptor found
     #[error("No USB descriptor found")]
     USBNoDescriptorFound,
-    /// Integrity of the received message cannot be validated
-    #[error("Invalid integrity. Expected CRC32 {0}, got {1}")]
+    /// Integrity of the received message cannot be validated (magic mismatch)
+    #[error("Invalid integrity. Expected magic {0:#010x}, got {1:#010x}")]
     InvalidIntegrity(u32, u32),
     /// Error while decoding base64 data
     #[error(transparent)]

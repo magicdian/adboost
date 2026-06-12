@@ -362,24 +362,25 @@ impl ADBMessageTransport for USBTransport {
         let header = ADBTransportMessageHeader::try_from(data)?;
         log::trace!("received header {header:?}");
 
-        if header.data_length() != 0 {
+        let payload = if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
             read_exact(endpoint, &mut msg_data, max_packet_size, timeout).await?;
+            msg_data
+        } else {
+            vec![]
+        };
 
-            let message = ADBTransportMessage::from_header_and_payload(header, msg_data);
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
 
-            // Check message integrity
-            if !message.check_message_integrity() {
-                return Err(RustADBError::InvalidIntegrity(
-                    ADBTransportMessageHeader::compute_crc32(message.payload()),
-                    message.header().data_crc32(),
-                ));
-            }
-
-            return Ok(message);
+        // Check message integrity (magic-only; runs for every frame, AOSP-faithful)
+        if !message.check_message_integrity() {
+            return Err(RustADBError::InvalidIntegrity(
+                ADBTransportMessageHeader::compute_magic(message.header().command()),
+                message.header().magic(),
+            ));
         }
 
-        Ok(ADBTransportMessage::from_header_and_payload(header, vec![]))
+        Ok(message)
     }
 }
 

@@ -63,11 +63,17 @@ impl ADBTransportMessageHeader {
         self.data_crc32
     }
 
+    #[must_use]
+    pub const fn magic(&self) -> u32 {
+        self.magic
+    }
+
     pub(crate) fn compute_crc32(data: &[u8]) -> u32 {
         data.iter().map(|&x| u32::from(x)).sum()
     }
 
-    const fn compute_magic(command: MessageCommand) -> u32 {
+    #[must_use]
+    pub const fn compute_magic(command: MessageCommand) -> u32 {
         let command_u32 = command as u32;
         command_u32 ^ 0xFFFF_FFFF
     }
@@ -128,10 +134,18 @@ impl ADBTransportMessage {
         Self { header, payload }
     }
 
+    /// Validate the integrity of a received message.
+    ///
+    /// Only the `magic` field (`command ^ 0xffffffff`) is verified. AOSP `adb`
+    /// never validates the apacket `data_check` (crc) field on receive in any
+    /// protocol version — it is vestigial and is sent as `0` once the negotiated
+    /// version is `>= A_VERSION_SKIP_CHECKSUM` (0x01000001), so comparing it would
+    /// reject every payload-bearing frame from a skip-checksum peer. `magic` is the
+    /// version-independent integrity field; the underlying USB (hardware CRC16) and
+    /// TCP transports already guarantee payload integrity.
     #[must_use]
     pub fn check_message_integrity(&self) -> bool {
         ADBTransportMessageHeader::compute_magic(self.header.command) == self.header.magic
-            && ADBTransportMessageHeader::compute_crc32(&self.payload) == self.header.data_crc32
     }
 
     pub fn assert_command(&self, expected_command: MessageCommand) -> Result<()> {
@@ -167,5 +181,104 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
 
     fn try_from(value: [u8; 24]) -> Result<Self> {
         Self::decode(&value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ADBTransportMessage, ADBTransportMessageHeader};
+    use crate::message_devices::message_commands::MessageCommand;
+
+    /// Build a raw 24-byte header buffer with explicit `data_crc32` and `magic`
+    /// fields, mirroring the on-wire layout decoded by `TryFrom<[u8; 24]>`. This
+    /// is the cleanest sans-io way to forge headers (the struct fields are
+    /// private), e.g. to emulate a skip-checksum peer that sends crc as 0.
+    fn build_header_buffer(
+        command: MessageCommand,
+        data_length: u32,
+        data_crc32: u32,
+        magic: u32,
+    ) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0..4].copy_from_slice(&(command as u32).to_le_bytes());
+        // arg0 / arg1 left as 0
+        buf[12..16].copy_from_slice(&data_length.to_le_bytes());
+        buf[16..20].copy_from_slice(&data_crc32.to_le_bytes());
+        buf[20..24].copy_from_slice(&magic.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn integrity_passes_with_zero_crc_skip_checksum_peer() {
+        // Exact bug #2 regression-lock: a skip-checksum peer sends a non-empty
+        // payload with data_crc32 = 0 and correct magic. It must pass.
+        let payload = b"host::features=cmd,shell_v2,delayed_ack".to_vec();
+        let header = ADBTransportMessageHeader::try_from(build_header_buffer(
+            MessageCommand::Cnxn,
+            u32::try_from(payload.len()).expect("payload length fits in u32"),
+            0,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Cnxn),
+        ))
+        .expect("hand-built header decodes");
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
+        assert!(
+            message.check_message_integrity(),
+            "non-empty payload with crc=0 and correct magic must pass (skip-checksum peer)"
+        );
+    }
+
+    #[test]
+    fn integrity_passes_with_zero_payload() {
+        // Zero-payload control frame (e.g. OKAY) with correct magic passes.
+        let header = ADBTransportMessageHeader::try_from(build_header_buffer(
+            MessageCommand::Okay,
+            0,
+            0,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Okay),
+        ))
+        .expect("hand-built header decodes");
+        let message = ADBTransportMessage::from_header_and_payload(header, vec![]);
+        assert!(
+            message.check_message_integrity(),
+            "zero-payload frame with correct magic must pass"
+        );
+    }
+
+    #[test]
+    fn integrity_fails_on_magic_mismatch() {
+        // A corrupted magic must still be rejected (the only integrity field left).
+        let payload = b"data".to_vec();
+        let header = ADBTransportMessageHeader::try_from(build_header_buffer(
+            MessageCommand::Write,
+            u32::try_from(payload.len()).expect("payload length fits in u32"),
+            ADBTransportMessageHeader::compute_crc32(&payload),
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Write) ^ 0x1,
+        ))
+        .expect("hand-built header decodes");
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
+        assert!(
+            !message.check_message_integrity(),
+            "wrong magic must fail integrity check"
+        );
+    }
+
+    #[test]
+    fn integrity_ignores_wrong_crc() {
+        // Correct magic but a data_crc32 that does NOT match the byte-sum: still
+        // passes, proving crc is no longer consulted on receive.
+        let payload = b"some payload bytes".to_vec();
+        let bogus_crc = ADBTransportMessageHeader::compute_crc32(&payload).wrapping_add(12345);
+        let header = ADBTransportMessageHeader::try_from(build_header_buffer(
+            MessageCommand::Write,
+            u32::try_from(payload.len()).expect("payload length fits in u32"),
+            bogus_crc,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Write),
+        ))
+        .expect("hand-built header decodes");
+        let message = ADBTransportMessage::from_header_and_payload(header, payload);
+        assert!(
+            message.check_message_integrity(),
+            "wrong crc with correct magic must pass (crc no longer consulted)"
+        );
     }
 }
