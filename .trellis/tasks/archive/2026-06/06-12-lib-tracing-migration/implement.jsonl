@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/06-12-adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability/research/logging-approach.md", "reason": "the tracing-migration design: log->tracing rewrite, log feature for compat, hot-path spans on local_id, emit-only + tracing-init helper, RUST_LOG/EnvFilter activation"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "existing log-level conventions to preserve when swapping to tracing"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, feature-flag layout, test conventions"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "the hot paths (do_connect/open_session/reader_loop) and local_id context that spans must carry"}

@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/06-12-adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability/research/logging-approach.md", "reason": "verify the implementation matches the chosen tracing design (emit-only, log feature, spans, init helper)"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "verify clippy/feature-gating/tests; no subscriber in default deps"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "verify log-level semantics preserved post-migration"}
