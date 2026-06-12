@@ -16,7 +16,9 @@ use crate::{
     adb_transport::ADBTransport,
     message_devices::{
         adb_message_transport::ADBMessageTransport,
-        adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
+        adb_transport_message::{
+            ADBTransportMessage, ADBTransportMessageHeader, MAX_PAYLOAD, payload_len_within_bound,
+        },
         message_commands::MessageCommand,
     },
 };
@@ -179,6 +181,16 @@ impl ADBMessageTransport for TcpTransport {
             .await?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
+
+        // Bound the wire data_length BEFORE allocating (AOSP check_header clause:
+        // reject data_length > MAX_PAYLOAD before reading the payload). A hostile or
+        // corrupt 24-byte header could otherwise drive a ~4 GiB allocation.
+        if !payload_len_within_bound(header.data_length()) {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "frame data_length {} exceeds MAX_PAYLOAD {MAX_PAYLOAD}",
+                header.data_length()
+            )));
+        }
 
         let payload = if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];

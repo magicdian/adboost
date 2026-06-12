@@ -141,3 +141,69 @@ fn check(&self) -> bool { compute_magic(command) == magic }
   bumps it to `0x0100_0001`, the magic-only receive check already covers it.
 - Do **not** replace the byte-sum `compute_crc32` with a real CRC32 — would
   diverge from AOSP and break the legacy byte-sum interop on the send side.
+
+---
+
+## `check_header` is TWO clauses: magic **and** `data_length <= MAX_PAYLOAD`
+
+AOSP `transport.cpp::check_header` validates magic AND rejects
+`data_length > max_payload` BEFORE reading the payload. adboost must do both. The
+receive path reads a fixed 24-byte header, then **must bound `data_length` before
+allocating** the payload buffer, then reads exactly `data_length` bytes, then
+checks magic.
+
+- `MAX_PAYLOAD` (1 MiB) lives in `adb_transport_message.rs` (always compiled; the
+  TCP path can't see the `usb` module without the `usb` feature). `usb/flow_control.rs`
+  re-exports it. Bound via the pure `payload_len_within_bound(data_length)` shared by
+  both USB and TCP read paths.
+- **Why**: `data_length` is an attacker/corruption-controlled `u32` (up to ~4 GiB).
+  Allocating `vec![0; data_length]` from it without a bound is an OOM/DoS
+  (`usb_transport.rs` / `tcp_transport.rs`).
+
+## CLSE-rejection routing: `open_session` must race ack **and** data channels
+
+On OPEN rejection AOSP adbd sends `A_CLSE(arg0=0, arg1=host_local_id)`
+(`adb.cpp: send_close(0, p->msg.arg0, t)`). The reader's `classify_message` keys on
+`arg1`, finds the registered session, and routes any non-OKAY (incl. this CLSE) to
+the **data** channel. So `open_session` must `tokio::select!` (biased toward OKAY)
+over BOTH `ack_rx` (OKAY → proceed) and `data_rx` (early CLSE → fail fast with
+`"OPEN rejected by device (CLSE)"`). Waiting only on `ack_rx` → silent 10 s timeout
+(bug #3). Recognize rejection by `Clse`-on-data-channel; do **not** require a
+specific `arg0` (it's 0).
+
+## Reader resync invariant: only post-payload-read errors may be skipped
+
+The persistent reader loop must NOT tear down all sessions on a single bad frame —
+but it may only `continue` (drop-frame-and-keep-serving) for errors that leave the
+stream **frame-aligned**. The framing rule, from the read order
+(header decode → `data_length` bound → payload read → magic check):
+
+- `InvalidIntegrity` (bad magic): raised **after** the full payload is read →
+  stream aligned → **recoverable** (`continue`).
+- `ConversionError` (unknown command in header decode) and the oversize-`data_length`
+  bound error: raised **before** the payload is read → the `data_length` payload
+  bytes are still pending on the wire → skipping desyncs the next header read →
+  **fatal** (`break`).
+- All IO / disconnect errors: **fatal**.
+
+> **Gotcha**: "it's just a malformed frame, skip it" is only safe if the entire
+> frame (header + `data_length` payload) has already been consumed. A pre-payload
+> error that you `continue` past leaves orphaned payload bytes that desync every
+> subsequent frame. When unsure an error preserves framing, keep it fatal.
+
+## read_exact must not silently discard
+
+`read_exact` must error (`"USB frame desync: ..."`) if a single bulk completion
+returns more bytes than requested, not silently truncate. AOSP adbd writes the
+24-byte header and the payload as **separate** bulk writes (the 24-byte header is a
+short packet terminating its transfer), so a compliant device never over-delivers;
+the guard surfaces non-compliant firmware loudly instead of desyncing.
+
+## Bug #3 status (honest)
+
+The CLSE-routing fix turns the windowed-OPEN **hang into a fast, diagnosable
+error**; it does NOT force a windowed OPEN to succeed. Root cause for *why* an
+Android-16 device might reject a windowed OPEN (vs accept) is not closed without a
+real-device usbmon/debug capture. The `read_exact`-drops-the-4-byte-OKAY theory
+(report hypothesis 2e) was **refuted** against AOSP (separate header/payload writes).
+Downstream `delayed_ack=false` workaround remains valid until a capture is obtained.

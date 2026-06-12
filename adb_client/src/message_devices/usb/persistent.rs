@@ -202,6 +202,52 @@ fn classify_message(
     }
 }
 
+/// Timeout for the OPEN → first-response handshake.
+const OPEN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Await the device's first response to an OPEN, racing the session's ACK and
+/// DATA channels (within [`OPEN_RESPONSE_TIMEOUT`]).
+///
+/// Returns the OKAY message (success) on `ack_rx`, or a fast, actionable error
+/// when the device instead routes a frame to `data_rx` — which, before the
+/// first OKAY, can only be a CLSE rejecting the OPEN. On rejection AOSP adbd
+/// sends `A_CLSE(arg0=0, arg1=local_id)` (`send_close(0, p->msg.arg0, t)`); the
+/// reader routes it to `data_rx` (its command is not OKAY), so waiting only on
+/// `ack_rx` would never observe it and the open would burn the full timeout
+/// (bug #3). `biased` prefers a genuine OKAY when both are simultaneously ready.
+///
+/// I/O-free over the channels for unit testing (D1): drive a message into the
+/// respective sender and assert the decision.
+async fn await_open_response(
+    ack_rx: &mut mpsc::Receiver<ADBTransportMessage>,
+    data_rx: &mut mpsc::Receiver<ADBTransportMessage>,
+) -> Result<ADBTransportMessage> {
+    let raced = tokio::time::timeout(OPEN_RESPONSE_TIMEOUT, async {
+        tokio::select! {
+            biased;
+            ack = ack_rx.recv() => match ack {
+                Some(m) => Ok(m),
+                None => Err(RustADBError::SendError),
+            },
+            _data = data_rx.recv() => {
+                // arg1 == our local_id is already guaranteed by the reader's
+                // routing; arg0 is 0 per AOSP and must NOT be required.
+                Err(RustADBError::ADBRequestFailed(
+                    "open_session: OPEN rejected by device (CLSE)".into(),
+                ))
+            }
+        }
+    })
+    .await;
+
+    match raced {
+        Ok(inner) => inner,
+        Err(_) => Err(RustADBError::ADBRequestFailed(
+            "open_session: timeout waiting for OKAY".into(),
+        )),
+    }
+}
+
 /// Whether a device CNXN banner advertises the `delayed_ack` feature.
 ///
 /// An ADB banner looks like `device::ro.product.name=...;features=shell_v2,cmd,delayed_ack,...`.
@@ -645,7 +691,31 @@ impl PersistentUsbConnection {
                     break;
                 }
                 ReadStep::ReadError(e) => {
-                    log::warn!("PersistentUsb reader error: {e}");
+                    // Distinguish a recoverable, frame-classifiable error from a fatal
+                    // transport error. ONLY `InvalidIntegrity` (bad magic) is proven
+                    // frame-aligned: the read path reads the fixed 24-byte header AND
+                    // exactly `data_length` payload bytes BEFORE the magic check
+                    // (`read_message_with_timeout`: header decode → bound check →
+                    // payload read → integrity check), so when the integrity check
+                    // fails the entire frame has already been consumed off the wire and
+                    // the next header read is still aligned. Drop just that frame and
+                    // keep serving the other multiplexed sessions.
+                    //
+                    // `ConversionError` is deliberately NOT recoverable: it is raised by
+                    // the header decode (`TryFrom<[u8; 24]>`) — e.g. an unknown command
+                    // — which runs BEFORE `data_length` is known and BEFORE the payload
+                    // is read. The frame's payload bytes are therefore still pending on
+                    // the wire, so skipping the frame would desync the next header read.
+                    // Likewise the oversize-`data_length` bound error (an
+                    // `ADBRequestFailed` returned before the payload read) leaves the
+                    // refused payload on the wire. Anything not proven frame-aligned
+                    // (header-decode errors, the bound error, all IO / disconnect
+                    // errors) stays fatal.
+                    if matches!(e, RustADBError::InvalidIntegrity(..)) {
+                        log::warn!("PersistentUsb reader: skipping malformed frame: {e}");
+                        continue;
+                    }
+                    log::warn!("PersistentUsb reader error (fatal): {e}");
                     break;
                 }
             };
@@ -825,8 +895,11 @@ impl PersistentUsbConnection {
             rng.random()
         };
 
-        // Create separate channels for data (WRTE/CLSE) and acks (OKAY)
-        let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        // Create separate channels for data (WRTE/CLSE) and acks (OKAY).
+        // `data_rx` is `mut` because we borrow it during the open handshake to
+        // observe an early CLSE (OPEN rejection) before moving it into the
+        // returned `MultiplexedSession`.
+        let (data_tx, mut data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
         let (ack_tx, mut ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
 
         // Register in the reader's session map BEFORE sending OPEN (the reader
@@ -871,15 +944,21 @@ impl PersistentUsbConnection {
             return Err(RustADBError::SendError);
         }
 
-        // Wait for OKAY response on ack channel
-        let Ok(Some(response)) = tokio::time::timeout(Duration::from_secs(10), ack_rx.recv()).await
-        else {
-            self.unregister_session(local_id).await;
-            return Err(RustADBError::ADBRequestFailed(
-                "open_session: timeout waiting for OKAY".into(),
-            ));
+        // Wait for the device's first response, racing the ACK channel (OKAY →
+        // proceed) against the DATA channel (an early CLSE → OPEN rejected, fail
+        // fast). Waiting only on `ack_rx` would never observe the rejection CLSE
+        // (routed to `data_rx`) and the call would burn the full timeout (bug #3).
+        let response = match await_open_response(&mut ack_rx, &mut data_rx).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.unregister_session(local_id).await;
+                return Err(e);
+            }
         };
 
+        // Defensive: only the ack channel yields `response` here, and the reader
+        // only routes OKAY frames to it — but keep the check in case routing
+        // changes.
         if response.header().command() != MessageCommand::Okay {
             self.unregister_session(local_id).await;
             return Err(RustADBError::ADBRequestFailed(format!(
@@ -1729,6 +1808,52 @@ mod tests {
             RouteDecision::Unknown,
             "non-OPEN message to an unknown session id must be dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn open_response_okay_on_ack_channel_succeeds() {
+        // Classic / windowed success path: device sends OKAY → it lands on the
+        // ack channel → await_open_response returns the OKAY message.
+        let (ack_tx, mut ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (_data_tx, mut data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        ack_tx
+            .send(msg(MessageCommand::Okay, 7, 42, &[]))
+            .await
+            .expect("send OKAY");
+
+        let resp = await_open_response(&mut ack_rx, &mut data_rx)
+            .await
+            .expect("OKAY on ack channel must succeed");
+        assert_eq!(
+            resp.header().command(),
+            MessageCommand::Okay,
+            "the ack-channel OKAY must be returned to proceed with the open"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_response_clse_on_data_channel_fails_fast() {
+        // Bug #3: OPEN rejection arrives as A_CLSE(arg0=0, arg1=local_id) on the
+        // DATA channel (command != OKAY). await_open_response must fail fast with
+        // the rejection error instead of waiting for an OKAY that never comes.
+        let (_ack_tx, mut ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (data_tx, mut data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        // arg0 = 0 exactly as AOSP send_close(0, ...) does.
+        data_tx
+            .send(msg(MessageCommand::Clse, 0, 42, &[]))
+            .await
+            .expect("send CLSE");
+
+        let err = await_open_response(&mut ack_rx, &mut data_rx)
+            .await
+            .expect_err("CLSE on data channel must fail the open");
+        match err {
+            RustADBError::ADBRequestFailed(m) => assert!(
+                m.contains("OPEN rejected by device (CLSE)"),
+                "rejection error must be distinct and actionable, got: {m}"
+            ),
+            other => panic!("expected ADBRequestFailed rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

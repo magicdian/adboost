@@ -12,7 +12,9 @@ use crate::{
     adb_transport::ADBTransport,
     message_devices::{
         adb_message_transport::ADBMessageTransport,
-        adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
+        adb_transport_message::{
+            ADBTransportMessage, ADBTransportMessageHeader, MAX_PAYLOAD, payload_len_within_bound,
+        },
         message_commands::MessageCommand,
     },
 };
@@ -362,6 +364,16 @@ impl ADBMessageTransport for USBTransport {
         let header = ADBTransportMessageHeader::try_from(data)?;
         log::trace!("received header {header:?}");
 
+        // Bound the wire data_length BEFORE allocating (AOSP check_header clause:
+        // reject data_length > MAX_PAYLOAD before reading the payload). A hostile or
+        // corrupt 24-byte header could otherwise drive a ~4 GiB allocation.
+        if !payload_len_within_bound(header.data_length()) {
+            return Err(RustADBError::ADBRequestFailed(format!(
+                "frame data_length {} exceeds MAX_PAYLOAD {MAX_PAYLOAD}",
+                header.data_length()
+            )));
+        }
+
         let payload = if header.data_length() != 0 {
             let mut msg_data = vec![0_u8; header.data_length() as usize];
             read_exact(endpoint, &mut msg_data, max_packet_size, timeout).await?;
@@ -414,7 +426,18 @@ async fn read_exact(
             )));
         }
 
-        let copy_len = received.len().min(remaining);
+        // AOSP adbd writes the 24-byte apacket header and the payload as SEPARATE
+        // bulk writes (the header is a short packet that terminates its own
+        // transfer), so a single completion never carries more than we requested.
+        // Surface a non-compliant device/firmware loudly rather than silently
+        // discarding the overflow and desyncing the framed stream. This guard
+        // should never fire against a spec-compliant device.
+        if received.len() > remaining {
+            return Err(RustADBError::ADBRequestFailed(
+                "USB frame desync: bulk transfer returned more bytes than requested".into(),
+            ));
+        }
+        let copy_len = received.len(); // == received.len().min(remaining), now guarded
         out[offset..offset + copy_len].copy_from_slice(&received[..copy_len]);
         offset += copy_len;
     }

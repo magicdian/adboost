@@ -23,7 +23,12 @@
 
 /// Maximum bytes in a single WRTE payload (AOSP `MAX_PAYLOAD`, 1 MiB). The
 /// per-chunk cap, decoupled from the in-flight window size.
-pub const MAX_PAYLOAD: usize = 1024 * 1024;
+///
+/// Re-exported from the always-compiled `adb_transport_message` module so the
+/// USB chunk clamp and both transport read-path bound checks share one
+/// definition (the TCP read path cannot see the `usb` module without the `usb`
+/// feature).
+pub use crate::message_devices::adb_transport_message::MAX_PAYLOAD;
 
 /// Initial in-flight window granted per stream when `delayed_ack` is negotiated
 /// (AOSP `INITIAL_DELAYED_ACK_BYTES`, 32 MiB).

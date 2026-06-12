@@ -9,6 +9,26 @@ pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
 pub const AUTH_RSAPUBLICKEY: u32 = 3;
 
+/// Maximum bytes in a single ADB payload (AOSP `MAX_PAYLOAD`, 1 MiB).
+///
+/// This is a protocol constant, not a USB-specific value: AOSP
+/// `transport.cpp::check_header` rejects any frame whose `data_length` exceeds
+/// it BEFORE reading the payload. It lives here (always compiled) so both the
+/// USB and the always-compiled TCP read paths can bound `data_length` against
+/// it; the `usb/flow_control.rs` chunk clamp re-exports this single definition.
+pub const MAX_PAYLOAD: usize = 1024 * 1024;
+
+/// Whether a wire `data_length` is within the allowed payload bound.
+///
+/// Pure helper shared by both transport read paths (USB + TCP) to reject an
+/// oversize/hostile `data_length` (an attacker- or corruption-controlled `u32`,
+/// up to ~4 GiB) BEFORE allocating the payload buffer — mirroring AOSP
+/// `check_header`'s `data_length <= MAX_PAYLOAD` clause.
+#[must_use]
+pub const fn payload_len_within_bound(data_length: u32) -> bool {
+    data_length as usize <= MAX_PAYLOAD
+}
+
 #[derive(Debug, Clone)]
 pub struct ADBTransportMessage {
     header: ADBTransportMessageHeader,
@@ -186,8 +206,50 @@ impl TryFrom<[u8; 24]> for ADBTransportMessageHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::{ADBTransportMessage, ADBTransportMessageHeader};
+    use super::{
+        ADBTransportMessage, ADBTransportMessageHeader, MAX_PAYLOAD, payload_len_within_bound,
+    };
     use crate::message_devices::message_commands::MessageCommand;
+
+    #[test]
+    fn payload_len_within_bound_rejects_oversize() {
+        assert!(
+            payload_len_within_bound(0),
+            "zero-length payload is within bound"
+        );
+        assert!(
+            payload_len_within_bound(u32::try_from(MAX_PAYLOAD).expect("MAX_PAYLOAD fits u32")),
+            "exactly MAX_PAYLOAD is within bound"
+        );
+        assert!(
+            !payload_len_within_bound(
+                u32::try_from(MAX_PAYLOAD).expect("MAX_PAYLOAD fits u32") + 1
+            ),
+            "MAX_PAYLOAD + 1 is rejected"
+        );
+        assert!(
+            !payload_len_within_bound(u32::MAX),
+            "a hostile 4 GiB data_length is rejected before any allocation"
+        );
+    }
+
+    #[test]
+    fn oversize_header_buffer_decodes_but_fails_bound_check() {
+        // A 24-byte header with a 4 GiB data_length still decodes into a header
+        // (the bound is enforced by the read path, not the decoder), but the
+        // shared bound helper rejects it before the read path allocates.
+        let header = ADBTransportMessageHeader::try_from(build_header_buffer(
+            MessageCommand::Write,
+            u32::MAX,
+            0,
+            ADBTransportMessageHeader::compute_magic(MessageCommand::Write),
+        ))
+        .expect("hand-built header decodes");
+        assert!(
+            !payload_len_within_bound(header.data_length()),
+            "oversize data_length must be rejected before allocating the payload"
+        );
+    }
 
     /// Build a raw 24-byte header buffer with explicit `data_crc32` and `magic`
     /// fields, mirroring the on-wire layout decoded by `TryFrom<[u8; 24]>`. This
