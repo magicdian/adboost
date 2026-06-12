@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "review 时核对 forward 双 OKAY、sync/shell-v2 framing、reverse 编排是否符合 AOSP 协议契约；诚实 banner（未实现不通告 sync_v2/shell_v2）"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 backend 新方法 unsupported 错误、frontend FAIL 回落、CLI/selftest 的 ADBCliError + ExitCode 是否符合分层错误策略"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核对 pedantic clippy 全绿、rustfmt、MSRV、测试覆盖（pure helper + MockBackend）是否达标"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "本任务横跨 frontend↔backend↔PersistentUsbConnection、库↔CLI、selftest 两通道——核对跨层数据流（能力协商、session 桥接、forward 注册表生命周期）无遗漏"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核对是否复用既有 session/连接能力与测试用例，未引入重复实现"}

@@ -129,6 +129,22 @@ pub fn okay_twice() -> Vec<u8> {
     b"OKAYOKAY".to_vec()
 }
 
+/// Bytes for a `forward` success that resolved an OS-assigned local port:
+/// two bare OKAYs followed by `%04x`+the port in ASCII **decimal**.
+///
+/// Per AOSP `adb.cpp` (`SendOkay`×2 then `SendProtocolString(StringPrintf("%d",
+/// resolved_tcp_port))`): the client reads the two OKAYs as connect+status, then
+/// an optional length-prefixed resolved-port string. The `%04x` measures the
+/// digit count of the decimal port, not a fixed 4.
+#[must_use]
+pub fn okay_twice_with_port(port: u16) -> Vec<u8> {
+    let port_str = port.to_string();
+    let mut out = b"OKAYOKAY".to_vec();
+    // The decimal port string is at most 5 chars, so encode_framed never fails.
+    out.extend_from_slice(&encode_framed(&port_str).unwrap_or_else(|| b"0000".to_vec()));
+    out
+}
+
 /// Bytes for the `host:tport:*` reply: `OKAY` + the transport-id as 8 bytes LE.
 ///
 /// Modern clients read **exactly** 8 bytes after this OKAY. The legacy
@@ -216,6 +232,15 @@ mod tests {
         // forward-family success: 1st OKAY = connect, 2nd = status.
         assert_eq!(okay_twice(), b"OKAYOKAY");
         assert_eq!(okay_twice().len(), 8);
+    }
+
+    #[test]
+    fn okay_twice_with_port_appends_decimal_port_framed() {
+        // forward auto-assign: OKAY OKAY then %04x + ASCII decimal port.
+        let bytes = okay_twice_with_port(38271);
+        assert_eq!(&bytes[..8], b"OKAYOKAY");
+        assert_eq!(&bytes[8..12], b"0005", "len prefix = digit count (5)");
+        assert_eq!(&bytes[12..], b"38271", "port is ASCII decimal, not hex/LE");
     }
 
     #[test]

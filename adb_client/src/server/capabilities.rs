@@ -22,6 +22,8 @@
 //!
 //! [`DeviceFeatureSet`]: crate::DeviceFeatureSet
 
+use super::backend::BackendCapabilities;
+
 /// Honest-minimal client-facing features. Every one is safe to advertise with
 /// the v1 `shell:`/`tcp:` bridge — none changes the client's wire framing in a
 /// way the bridge cannot satisfy.
@@ -74,6 +76,14 @@ impl ServerCapabilities {
         &self.version_hex
     }
 
+    /// Whether `feature` is currently advertised. The frontend uses this to gate
+    /// optional local services (e.g. only bridge `sync:` when `sync_v2` is
+    /// advertised) so it never accepts a service it did not promise.
+    #[must_use]
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
     /// The configured `host:kill` policy.
     #[must_use]
     pub fn kill_policy(&self) -> KillPolicy {
@@ -114,6 +124,27 @@ impl ServerCapabilities {
         self.kill_policy = policy;
         self
     }
+
+    /// Return a copy whose advertised features are widened to include the
+    /// optional features the backend genuinely implements.
+    ///
+    /// This is the honest-banner negotiation: the frontend calls it once at
+    /// serve time with the backend's [`BackendCapabilities`]. A feature is added
+    /// only when the backend reports it (`sync` → `sync_v2`,
+    /// `shell_v2` → `shell_v2`); features already present are not duplicated.
+    /// Features are never *removed* — an operator who explicitly opted into a
+    /// feature via the builder keeps it (their responsibility), but the default
+    /// path never over-claims because the defaults exclude these.
+    #[must_use]
+    pub fn negotiated_with(mut self, backend: BackendCapabilities) -> Self {
+        if backend.sync {
+            self = self.with_feature("sync_v2");
+        }
+        if backend.shell_v2 {
+            self = self.with_feature("shell_v2");
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -138,13 +169,60 @@ mod tests {
 
     #[test]
     fn with_shell_v2_appends_once() {
-        let caps = ServerCapabilities::default().with_shell_v2().with_shell_v2();
+        let caps = ServerCapabilities::default()
+            .with_shell_v2()
+            .with_shell_v2();
         let csv = caps.features_csv();
         assert!(csv.ends_with(",shell_v2"));
         assert_eq!(
             csv.matches("shell_v2").count(),
             1,
             "with_shell_v2 must be idempotent (no duplicate token)"
+        );
+    }
+
+    #[test]
+    fn negotiated_with_adds_only_backend_supported_features() {
+        // Backend supports both → both appended exactly once, on top of defaults.
+        let caps = ServerCapabilities::default().negotiated_with(BackendCapabilities {
+            sync: true,
+            shell_v2: true,
+        });
+        let csv = caps.features_csv();
+        assert!(
+            csv.contains("sync_v2"),
+            "sync backend must advertise sync_v2"
+        );
+        assert!(
+            csv.contains("shell_v2"),
+            "shell_v2 backend must advertise shell_v2"
+        );
+        assert_eq!(csv.matches("sync_v2").count(), 1, "no duplicate sync_v2");
+        assert_eq!(csv.matches("shell_v2").count(), 1, "no duplicate shell_v2");
+    }
+
+    #[test]
+    fn negotiated_with_default_backend_stays_honest_minimal() {
+        // A backend that implements nothing optional must NOT widen the banner.
+        let caps = ServerCapabilities::default().negotiated_with(BackendCapabilities::default());
+        assert_eq!(
+            caps.features_csv(),
+            "cmd,stat_v2,fixed_push_mkdir,apex",
+            "all-false backend caps must leave the honest-minimal default untouched"
+        );
+    }
+
+    #[test]
+    fn negotiated_with_only_sync_does_not_add_shell_v2() {
+        let caps = ServerCapabilities::default().negotiated_with(BackendCapabilities {
+            sync: true,
+            shell_v2: false,
+        });
+        let csv = caps.features_csv();
+        assert!(csv.contains("sync_v2"), "sync backend advertises sync_v2");
+        assert!(
+            !csv.contains("shell_v2"),
+            "a sync-only backend must NOT advertise shell_v2"
         );
     }
 

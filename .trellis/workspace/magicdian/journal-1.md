@@ -411,3 +411,66 @@ Implemented USB-backed ADB server in adb_client (feature 'server', phases 1-4): 
 ### Next Steps
 
 - None - task complete
+
+---
+
+## 2026-06-12 — adboost server capability expansion (P1-P4) + CLI self-test harness
+
+**Task**: `06-12-adboost-server-capability-expansion-forward-sync-shell-v2-reverse-cli-self-test-harness`
+
+### Summary
+
+Expanded the adboost ADB server frontend per the follow-up capabilities FR, and
+added an interactive device-backed self-test CLI. Six logical PRs, all validated
+against two real devices (XPENG d02 + Qualcomm SA8155P) and the official `adb`
+client:
+
+- **PR1** — `DeviceBackend` trait extended with backward-compatible defaulted
+  methods (`capabilities()`, `open_sync_session`, `open_shell_v2`); honest
+  capability negotiation: `host:features` advertises `sync_v2`/`shell_v2` only
+  when the backend reports it implements them. (trait_variant 0.1.2 quirk: default
+  bodies must be wrapped in `async move {}` since `make(Send)` rewrites
+  `async fn` → `fn -> impl Future`.)
+- **PR2** — `host:forward` family (forward/killforward/killforward-all/
+  list-forward), AOSP-exact framing (two bare OKAYs; `tcp:0` → `%04x`+decimal
+  port; list-forward = single OKAY + body; single FAIL on error). New
+  `server/forward.rs` (pure parse + ForwardRegistry). Three entry points: `host:`,
+  `host-serial:`, post-transport (our ProxyDevice path).
+- **PR3** — `sync:` + `shell,v2` bridged **verbatim** (server is a byte pipe;
+  client/device speak the sub-protocol end-to-end). New `ADBLocalCommand::Raw`
+  pass-through. Gated on the negotiated banner.
+- **PR4** — reverse: honest staged degradation (explicit FAIL "reverse not
+  supported by this server", never advertised). End-to-end deferred: needs a
+  host-side acceptor API for device-initiated OPENs that doesn't exist + would
+  need unvalidated acceptor-role flow control. Rationale in
+  research/p4-reverse-staging-decision.md.
+- **PR5** — `adboost_cli selftest` + gtest-style reporter. Two channels: usb_direct
+  (PersistentUsbConnection — multiplexes + clean CLSE on drop) and through_server
+  (in-process frontend on ephemeral port + ADBProxyDevice client). Official-adb
+  parity auto-detected. tcpip pre-wired SKIPPED. Multi-device by serial.
+- **PR6** — interactive phase: USB replug + reboot recovery (120s timeout,
+  excludes tcpip). README + server capability-matrix docs.
+
+### Key finding (hardware)
+
+The non-persistent `ADBUSBDevice` does not cleanly tear down adbd's USB endpoint
+on drop, so rapid re-open reads stale frames (even across separate CLI processes).
+usb_direct therefore uses `PersistentUsbConnection` (CLSE on drop + multiplexing).
+USB single-exclusive-claim also forced phase ordering: all usb_direct first, then
+the server's cached claims. Live result: 18 passed / 3 skipped on both devices.
+
+### Testing
+
+- [OK] adb_client: 135 unit + 4 doctests (default + `--features server`)
+- [OK] adboost_cli: 16 unit
+- [OK] clippy pedantic clean: default, `--features server`, `--features usb`
+- [OK] live `adboost_cli selftest`: 18 passed / 3 skipped on 2 real devices + official-adb parity
+
+### Notes
+
+- Pre-existing fmt drift in persistent.rs / proxy/commands/devices.rs / daemon.rs /
+  main.rs left untouched (not this task's to sweep); all new files are fmt-clean.
+
+### Status
+
+[OK] **Completed** — pending user acceptance.

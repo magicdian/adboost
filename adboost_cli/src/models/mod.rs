@@ -6,6 +6,7 @@ mod local;
 mod opts;
 mod persistent;
 mod reboot_type;
+mod selftest;
 mod server;
 mod tcp;
 mod usb;
@@ -18,6 +19,7 @@ pub use local::{ForwardCommand, LocalCommand, LocalDeviceCommand, ReverseCommand
 pub use opts::{MainCommand, Opts, ProxyCommand};
 pub use persistent::{PersistentCommand, PersistentSubcommand};
 pub use reboot_type::RebootTypeCommand;
+pub use selftest::SelftestCommand;
 pub use server::ServerCommand;
 pub use tcp::TcpCommand;
 pub use usb::UsbCommand;

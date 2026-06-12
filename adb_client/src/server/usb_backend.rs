@@ -13,9 +13,12 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
-use super::backend::{DeviceBackend, DeviceEntry};
+use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry};
 use crate::models::ADBLocalCommand;
-use crate::usb::{MultiplexedSession, PersistentUsbConnection, find_all_connected_adb_devices};
+use crate::usb::{
+    MultiplexedSession, PersistentUsbConnection, ShellV2Session, SyncSession,
+    find_all_connected_adb_devices,
+};
 use crate::{Result, RustADBError};
 
 /// Channel depth for the `subscribe_changes` snapshot stream. Small: only the
@@ -139,11 +142,13 @@ impl DeviceBackend for UsbDeviceBackend {
         cmd: &ADBLocalCommand,
     ) -> Result<MultiplexedSession> {
         // Reject services the bridge does not support BEFORE opening a session,
-        // with a stable reason (mirrors the frontend's pre-open guard). Only
-        // `shell:` (v1) and `tcp:` are bridged today.
+        // with a stable reason (mirrors the frontend's pre-open guard). Bridged:
+        // `shell:` v1 (empty-args ShellCommand), `tcp:`, and the verbatim `Raw`
+        // pass-through (the frontend uses `Raw` for `sync:` / `shell,v2`, which
+        // it has already capability-gated).
         match cmd {
             ADBLocalCommand::ShellCommand(_, args) if args.is_empty() => {}
-            ADBLocalCommand::TcpConnect(_) => {}
+            ADBLocalCommand::TcpConnect(_) | ADBLocalCommand::Raw(_) => {}
             other => {
                 return Err(RustADBError::ADBRequestFailed(format!(
                     "UsbDeviceBackend: unsupported local service: {other}"
@@ -152,5 +157,26 @@ impl DeviceBackend for UsbDeviceBackend {
         }
         let conn = self.get_or_open(serial).await?;
         conn.open_session(cmd).await
+    }
+
+    async fn capabilities(&self) -> BackendCapabilities {
+        // The persistent USB connection genuinely bridges both SYNC v1 and
+        // shell-v2 (see `open_sync_session` / `open_shell_v2` below), so we
+        // advertise both — the frontend turns these into honest
+        // `sync_v2` / `shell_v2` host-feature claims.
+        BackendCapabilities {
+            sync: true,
+            shell_v2: true,
+        }
+    }
+
+    async fn open_sync_session(&self, serial: &str) -> Result<SyncSession> {
+        let conn = self.get_or_open(serial).await?;
+        conn.open_sync_session().await
+    }
+
+    async fn open_shell_v2(&self, serial: &str, cmd: &str) -> Result<ShellV2Session> {
+        let conn = self.get_or_open(serial).await?;
+        conn.open_shell_v2(cmd).await
     }
 }

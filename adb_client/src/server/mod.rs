@@ -2,9 +2,25 @@
 //!
 //! This module is adboost acting *as* an ADB server: it listens on TCP
 //! (default `:5037`), speaks the smartsocket **host protocol** to native `adb`
-//! and `scrcpy` clients, and bridges their local services (`shell:` / `tcp:`)
-//! onto a [device backend][crate::server::DeviceBackend]. It is the mirror image
-//! of [`crate::proxy`], which is a *client* that talks to someone else's adb server.
+//! and `scrcpy` clients, and bridges their local services onto a
+//! [device backend][crate::server::DeviceBackend]. It is the mirror image of
+//! [`crate::proxy`], which is a *client* that talks to someone else's adb server.
+//!
+//! # Supported services
+//!
+//! | Service | Layer | Status |
+//! |---|---|---|
+//! | `shell:` (v1) | local (backend) | ✅ bridged |
+//! | `tcp:<port>` | local (backend) | ✅ bridged |
+//! | `sync:` (push/pull) | local (backend) | ✅ bridged verbatim, advertised as `sync_v2` only when the backend implements it |
+//! | `shell,v2` | local (backend) | ✅ bridged verbatim, advertised as `shell_v2` only when the backend implements it |
+//! | `host:forward` / `killforward` / `killforward-all` / `list-forward` | host (frontend) | ✅ host-side listener + per-conn bridge, AOSP double-OKAY framing, `tcp:0` auto-assign |
+//! | `reverse:*` | local + frontend | ⛔ recognized, returns an explicit FAIL (no host-side acceptor API yet); never advertised |
+//!
+//! Optional features (`sync_v2` / `shell_v2`) are advertised in `host:features`
+//! **only** when the injected backend reports it implements them
+//! ([`BackendCapabilities`][crate::server::BackendCapabilities]) — the honest
+//! banner: the server never offers a richer wire framing it cannot satisfy.
 //!
 //! # Layers
 //!
@@ -19,10 +35,11 @@ pub mod protocol;
 
 mod backend;
 mod capabilities;
+mod forward;
 mod frontend;
 mod usb_backend;
 
-pub use backend::{DeviceBackend, DeviceEntry, DeviceState};
+pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState};
 pub use capabilities::{KillPolicy, ServerCapabilities};
 pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
 pub use usb_backend::UsbDeviceBackend;

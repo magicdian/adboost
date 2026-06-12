@@ -16,6 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::backend::{DeviceBackend, DeviceEntry};
 use super::capabilities::{KillPolicy, ServerCapabilities};
+use super::forward::{ForwardRegistry, parse_forward, parse_killforward};
 use super::protocol;
 use crate::models::ADBLocalCommand;
 
@@ -48,6 +49,7 @@ impl<B: DeviceBackend> AdbServerFrontendBuilder<B> {
             backend: self.backend,
             addr: self.addr,
             caps: self.caps,
+            forwards: Arc::new(ForwardRegistry::default()),
         }
     }
 }
@@ -58,6 +60,10 @@ pub struct AdbServerFrontend<B: DeviceBackend> {
     backend: Arc<B>,
     addr: SocketAddr,
     caps: ServerCapabilities,
+    /// Server-global registry of active `host:forward` rules (host-side
+    /// listeners). Shared because forward rules outlive the client socket that
+    /// created them.
+    forwards: Arc<ForwardRegistry>,
 }
 
 /// Outcome of dispatching the first (host) request on a client socket.
@@ -97,10 +103,20 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     /// # Errors
     ///
     /// Returns the bind error if the listener cannot be created.
-    pub async fn serve(self) -> std::io::Result<()> {
+    pub async fn serve(mut self) -> std::io::Result<()> {
+        // Negotiate optional host-features against what the backend can actually
+        // bridge. This is the honest-banner step: we only advertise `sync_v2` /
+        // `shell_v2` if the backend reports it implements them, so a client never
+        // negotiates a richer wire framing the bridge cannot satisfy.
+        let backend_caps = self.backend.capabilities().await;
+        self.caps = self.caps.negotiated_with(backend_caps);
+
         let listener = TcpListener::bind(self.addr).await?;
         let actual = listener.local_addr().unwrap_or(self.addr);
-        tracing::info!("adb server frontend listening on {actual}");
+        tracing::info!(
+            "adb server frontend listening on {actual} (features: {})",
+            self.caps.features_csv()
+        );
         let shared = Arc::new(self);
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -131,6 +147,20 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 let Some(local) = read_request(&mut stream).await? else {
                     return Ok(()); // client selected a transport then hung up
                 };
+                // After selecting a transport, a client may issue a forward-family
+                // *host* request (this is how our own `ADBProxyDevice::forward`
+                // works: `host:transport:<serial>` then `host:forward:...`). Route
+                // those to the forward handler against the already-chosen serial
+                // rather than treating them as a local service to bridge.
+                if let Some(svc) = local.strip_prefix("host:")
+                    && is_forward_family(svc)
+                {
+                    return match svc {
+                        "list-forward" => self.serve_list_forward(&mut stream).await,
+                        "killforward-all" => self.serve_killforward_all(&mut stream).await,
+                        _ => self.serve_forward_family(&mut stream, svc, &serial).await,
+                    };
+                }
                 self.serve_local_service(stream, &local, &serial).await
             }
         }
@@ -225,14 +255,13 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 let serial = svc["transport:".len()..].to_string();
                 self.select_transport_by_serial(stream, serial).await
             }
-            _ if svc.starts_with("tport:") => self.select_tport(stream, &svc["tport:".len()..]).await,
-            _ if svc.starts_with("forward:") || svc.starts_with("killforward") => {
-                // Real port-forward management (host-side listener + per-conn
-                // bridge, double-OKAY framing, port-0 alloc) is a self-contained
-                // follow-up — see task. Fail cleanly rather than half-implement.
-                stream
-                    .write_all(&protocol::fail("forward not supported yet"))
-                    .await?;
+            _ if svc.starts_with("tport:") => {
+                self.select_tport(stream, &svc["tport:".len()..]).await
+            }
+            _ if is_forward_family(svc) => {
+                // `host:*forward*` with no explicit serial: resolve against the
+                // single connected device (transport-any semantics).
+                self.serve_host_forward(stream, svc).await?;
                 Ok(HostOutcome::Close)
             }
             other => {
@@ -272,9 +301,28 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     )))
                     .await?;
             }
+            "list-forward" => {
+                self.serve_list_forward(stream).await?;
+            }
+            "killforward-all" => {
+                self.serve_killforward_all(stream).await?;
+            }
+            _ if sub.starts_with("forward:") || sub.starts_with("killforward:") => {
+                // `host-serial:<serial>:forward:...` — the serial is explicit, so
+                // it must actually exist before we bind anything.
+                if entry.is_none() {
+                    stream
+                        .write_all(&protocol::fail("device not found"))
+                        .await?;
+                    return Ok(HostOutcome::Close);
+                }
+                self.serve_forward_family(stream, sub, serial).await?;
+            }
             _ if sub.starts_with("transport") || sub == "tport" => {
                 // `host-serial:<serial>:transport` selects that device.
-                return self.select_transport_by_serial(stream, serial.to_string()).await;
+                return self
+                    .select_transport_by_serial(stream, serial.to_string())
+                    .await;
             }
             other => {
                 stream
@@ -287,12 +335,146 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         Ok(HostOutcome::Close)
     }
 
-    /// `host:transport-any` — select the single connected device (error if none
-    /// or more than one).
-    async fn select_transport_any(
+    /// Handle a `host:`-prefixed forward-family service that carries no explicit
+    /// serial. `list-forward` / `killforward-all` are device-independent; the
+    /// per-rule `forward:` / `killforward:` resolve against the single device.
+    async fn serve_host_forward(&self, stream: &mut TcpStream, svc: &str) -> std::io::Result<()> {
+        match svc {
+            "list-forward" => self.serve_list_forward(stream).await,
+            "killforward-all" => self.serve_killforward_all(stream).await,
+            _ => {
+                let serial = match self.resolve_single_serial().await {
+                    Ok(s) => s,
+                    Err(reason) => return stream.write_all(&protocol::fail(&reason)).await,
+                };
+                self.serve_forward_family(stream, svc, &serial).await
+            }
+        }
+    }
+
+    /// Resolve the single connected device's serial (transport-any semantics),
+    /// or an AOSP-style failure reason when there are zero or multiple devices.
+    async fn resolve_single_serial(&self) -> Result<String, String> {
+        let devices = self.backend.list_devices().await;
+        match devices.as_slice() {
+            [] => Err("no devices".to_string()),
+            [one] => Ok(one.serial.clone()),
+            _ => Err("more than one device".to_string()),
+        }
+    }
+
+    /// Dispatch a forward-family service (`forward:...` / `killforward:...`) for
+    /// an already-resolved `serial`. `svc` is the service *without* the `host:`
+    /// or `host-serial:<serial>:` prefix.
+    async fn serve_forward_family(
         &self,
         stream: &mut TcpStream,
-    ) -> std::io::Result<HostOutcome> {
+        svc: &str,
+        serial: &str,
+    ) -> std::io::Result<()> {
+        if let Some(arg) = svc.strip_prefix("forward:") {
+            self.serve_forward_add(stream, arg, serial).await
+        } else if let Some(arg) = svc.strip_prefix("killforward:") {
+            self.serve_killforward(stream, arg).await
+        } else {
+            // Unreachable given the call sites' guards, but fail cleanly.
+            stream
+                .write_all(&protocol::fail(&format!("bad forward service: {svc}")))
+                .await
+        }
+    }
+
+    /// `forward:[norebind:]tcp:<local>;tcp:<remote>` — bind a host listener and
+    /// register the rule. Success replies two OKAYs (plus the resolved port when
+    /// the local port was `0`); errors reply a single FAIL.
+    async fn serve_forward_add(
+        &self,
+        stream: &mut TcpStream,
+        arg: &str,
+        serial: &str,
+    ) -> std::io::Result<()> {
+        let req = match parse_forward(arg) {
+            Ok(r) => r,
+            Err(reason) => return stream.write_all(&protocol::fail(&reason)).await,
+        };
+
+        // Enforce `norebind` against an existing rule BEFORE binding.
+        if req.norebind && self.forwards.contains(req.local_port).await {
+            return stream
+                .write_all(&protocol::fail("cannot rebind existing socket"))
+                .await;
+        }
+
+        // Bind the host-side listener (port 0 ⇒ OS auto-assign).
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], req.local_port));
+        let listener = match TcpListener::bind(bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                return stream
+                    .write_all(&protocol::fail(&format!("cannot bind listener: {e}")))
+                    .await;
+            }
+        };
+        let resolved_port = listener.local_addr().map_or(req.local_port, |a| a.port());
+
+        // Spawn the accept loop: each inbound connection opens `tcp:<remote>` on
+        // the device and bridges the two byte streams.
+        let backend = Arc::clone(&self.backend);
+        let serial_owned = serial.to_string();
+        let remote_port = req.remote_port;
+        let task = tokio::spawn(async move {
+            run_forward_listener(listener, backend, serial_owned, remote_port).await;
+        });
+
+        self.forwards
+            .insert(resolved_port, req.remote_port, serial.to_string(), task)
+            .await;
+
+        // Reply: two OKAYs, plus the resolved port iff the client asked for tcp:0.
+        if req.local_is_zero {
+            stream
+                .write_all(&protocol::okay_twice_with_port(resolved_port))
+                .await
+        } else {
+            stream.write_all(&protocol::okay_twice()).await
+        }
+    }
+
+    /// `killforward:tcp:<local>` — remove a rule (aborting its listener).
+    async fn serve_killforward(&self, stream: &mut TcpStream, arg: &str) -> std::io::Result<()> {
+        let local_port = match parse_killforward(arg) {
+            Ok(p) => p,
+            Err(reason) => return stream.write_all(&protocol::fail(&reason)).await,
+        };
+        if self.forwards.remove(local_port).await {
+            stream.write_all(&protocol::okay_twice()).await
+        } else {
+            stream
+                .write_all(&protocol::fail(&format!(
+                    "listener 'tcp:{local_port}' not found"
+                )))
+                .await
+        }
+    }
+
+    /// `killforward-all` — remove every rule.
+    async fn serve_killforward_all(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+        self.forwards.remove_all().await;
+        stream.write_all(&protocol::okay_twice()).await
+    }
+
+    /// `list-forward` — a SINGLE OKAY + framed body (the forward-family
+    /// exception; see the AOSP framing research).
+    async fn serve_list_forward(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+        let body = self.forwards.list().await;
+        stream
+            .write_all(&reply_or_overflow(protocol::okay_data(&body)))
+            .await
+    }
+
+    /// `host:transport-any` — select the single connected device (error if none
+    /// or more than one).
+    async fn select_transport_any(&self, stream: &mut TcpStream) -> std::io::Result<HostOutcome> {
         let devices = self.backend.list_devices().await;
         match devices.as_slice() {
             [] => {
@@ -369,7 +551,10 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 [one] => Some(one.serial.clone()),
                 _ => None,
             }
-        } else if let Some(id_str) = rest.strip_prefix("id:").or_else(|| rest.strip_prefix("-id:")) {
+        } else if let Some(id_str) = rest
+            .strip_prefix("id:")
+            .or_else(|| rest.strip_prefix("-id:"))
+        {
             id_str
                 .parse::<u64>()
                 .ok()
@@ -424,47 +609,24 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     }
 
     /// Map a post-transport local service to a bridged session, or FAIL.
+    ///
+    /// The server is a transparent byte pipe for local services: `sync:` and
+    /// `shell,v2` are bridged verbatim (the client and device speak the SYNC /
+    /// shell-v2 sub-protocol end-to-end; the server only relays bytes). They are
+    /// gated on the negotiated `host:features` so we never accept a richer
+    /// framing we did not advertise (honest banner).
     async fn serve_local_service(
         &self,
         mut stream: TcpStream,
         service: &str,
         serial: &str,
     ) -> std::io::Result<()> {
-        // Known-unsupported services get a stable FAIL BEFORE opening anything.
-        let unsupported = service.starts_with("sync:")
-            || service.starts_with("shell,") // shell,v2
-            || service.starts_with("reverse:")
-            || service.starts_with("jdwp")
-            || service.starts_with("localabstract:");
-        if unsupported {
-            stream
-                .write_all(&protocol::fail(&format!(
-                    "service not supported: {service}"
-                )))
-                .await?;
-            return Ok(());
-        }
-
-        // Map smartsocket service → ADBLocalCommand. Bare `shell:` is v1
-        // (ShellCommand with empty args), NOT v2.
-        let cmd = if let Some(shell_cmd) = service.strip_prefix("shell:") {
-            ADBLocalCommand::ShellCommand(shell_cmd.to_string(), vec![])
-        } else if let Some(port_str) = service.strip_prefix("tcp:") {
-            if let Ok(port) = port_str.parse::<u16>() {
-                ADBLocalCommand::TcpConnect(port)
-            } else {
-                stream
-                    .write_all(&protocol::fail(&format!("invalid tcp port: {port_str}")))
-                    .await?;
+        let cmd = match self.map_local_service(service) {
+            Ok(cmd) => cmd,
+            Err(reason) => {
+                stream.write_all(&protocol::fail(&reason)).await?;
                 return Ok(());
             }
-        } else {
-            stream
-                .write_all(&protocol::fail(&format!(
-                    "service not supported: {service}"
-                )))
-                .await?;
-            return Ok(());
         };
 
         // Open via the injected backend (reuses PersistentUsbConnection).
@@ -483,6 +645,62 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         bridge_session(stream, session).await;
         Ok(())
     }
+
+    /// Pure mapping from a post-transport service string to the
+    /// [`ADBLocalCommand`] to open, or an AOSP-style FAIL reason. Capability
+    /// gating (sync/shell-v2) is consulted here so an un-advertised service is
+    /// rejected before any device session is opened.
+    fn map_local_service(&self, service: &str) -> Result<ADBLocalCommand, String> {
+        // `sync:` — bridged verbatim, only when `sync_v2` was advertised.
+        if service == "sync:" {
+            return if self.caps.has_feature("sync_v2") {
+                Ok(ADBLocalCommand::Raw(service.to_string()))
+            } else {
+                Err(format!("service not supported: {service}"))
+            };
+        }
+        // `shell,...` (shell-v2 and its modifiers) — verbatim, only when
+        // `shell_v2` was advertised. Bare `shell:` (v1) is handled below.
+        if service.starts_with("shell,") {
+            return if self.caps.has_feature("shell_v2") {
+                Ok(ADBLocalCommand::Raw(service.to_string()))
+            } else {
+                Err(format!("service not supported: {service}"))
+            };
+        }
+        // Bare `shell:` is v1 (ShellCommand with empty args), NOT v2.
+        if let Some(shell_cmd) = service.strip_prefix("shell:") {
+            return Ok(ADBLocalCommand::ShellCommand(shell_cmd.to_string(), vec![]));
+        }
+        if let Some(port_str) = service.strip_prefix("tcp:") {
+            return port_str
+                .parse::<u16>()
+                .map(ADBLocalCommand::TcpConnect)
+                .map_err(|_| format!("invalid tcp port: {port_str}"));
+        }
+        // `reverse:*` is recognized but intentionally NOT served end-to-end: it
+        // needs host-side servicing of device-initiated OPENs (an acceptor API
+        // that does not exist yet) and unvalidated acceptor-role flow control.
+        // We give a DISTINCT, explicit FAIL rather than half-implement (which
+        // would make clients believe reverse succeeded while the tunnel is dead)
+        // and never advertise a reverse capability. See the task's
+        // research/p4-reverse-staging-decision.md for the completion plan.
+        if service.starts_with("reverse:") {
+            return Err("reverse not supported by this server".to_string());
+        }
+        // jdwp/localabstract are not bridged. Everything else is a stable FAIL.
+        Err(format!("service not supported: {service}"))
+    }
+}
+
+/// Whether a (prefix-stripped) service is a member of the forward family:
+/// `forward:` / `killforward:` (per-rule) or `list-forward` / `killforward-all`
+/// (device-independent).
+fn is_forward_family(svc: &str) -> bool {
+    svc == "list-forward"
+        || svc == "killforward-all"
+        || svc.starts_with("forward:")
+        || svc.starts_with("killforward:")
 }
 
 /// Read one smartsocket request: 4 ASCII hex length, then that many UTF-8 bytes.
@@ -504,9 +722,9 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<String>>
     };
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
-    String::from_utf8(body)
-        .map(Some)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF8 service string"))
+    String::from_utf8(body).map(Some).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF8 service string")
+    })
 }
 
 /// Render a device list as `host:devices` (short) or `host:devices-l` (long).
@@ -541,6 +759,42 @@ fn format_devices(devices: &[DeviceEntry], long: bool) -> String {
 /// payloads) overflow, degrade to a FAIL rather than panic.
 fn reply_or_overflow(reply: Option<Vec<u8>>) -> Vec<u8> {
     reply.unwrap_or_else(|| protocol::fail("reply too large"))
+}
+
+/// Host-side `forward` accept loop: for every inbound TCP connection on
+/// `listener`, open `tcp:<remote_port>` on the device `serial` via `backend`
+/// and bridge the two byte streams. Runs until the task is aborted (rule removed
+/// / server shutdown) or the listener errors fatally.
+///
+/// A failure to open the device service for one inbound connection drops only
+/// that connection (logged) — the listener keeps serving, matching adb's
+/// per-connection forward semantics.
+async fn run_forward_listener<B: DeviceBackend>(
+    listener: TcpListener,
+    backend: Arc<B>,
+    serial: String,
+    remote_port: u16,
+) {
+    loop {
+        let (client, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("forward listener accept failed: {e}");
+                continue;
+            }
+        };
+        let backend = Arc::clone(&backend);
+        let serial = serial.clone();
+        tokio::spawn(async move {
+            let cmd = ADBLocalCommand::TcpConnect(remote_port);
+            match backend.open_local_service(&serial, &cmd).await {
+                Ok(session) => bridge_session(client, session).await,
+                Err(e) => {
+                    tracing::debug!("forward {peer}→tcp:{remote_port} open failed: {e}");
+                }
+            }
+        });
+    }
 }
 
 /// Bridge a client TCP socket to a device [`MultiplexedSession`] bidirectionally.
@@ -615,7 +869,10 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
         let framed = format!("{:04x}{request}", request.len());
-        client.write_all(framed.as_bytes()).await.expect("write req");
+        client
+            .write_all(framed.as_bytes())
+            .await
+            .expect("write req");
         client.flush().await.expect("flush");
 
         let mut buf = Vec::new();
@@ -639,7 +896,10 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("OKAY"));
         assert!(body.contains("cmd,stat_v2,fixed_push_mkdir,apex"));
-        assert!(!body.contains("shell_v2"), "default must not advertise shell_v2");
+        assert!(
+            !body.contains("shell_v2"),
+            "default must not advertise shell_v2"
+        );
     }
 
     #[tokio::test]
@@ -711,7 +971,10 @@ mod tests {
         client.flush().await.expect("flush");
 
         let mut resp = [0u8; 12];
-        client.read_exact(&mut resp).await.expect("read 12-byte tport reply");
+        client
+            .read_exact(&mut resp)
+            .await
+            .expect("read 12-byte tport reply");
         assert_eq!(&resp[..4], b"OKAY");
         assert_eq!(&resp[4..], &1u64.to_le_bytes(), "single device -> id 1");
 
@@ -766,5 +1029,171 @@ mod tests {
             format_devices(&devices, true),
             "s1\tdevice product:prod model:mod device:dev transport_id:1"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_no_device_fails() {
+        // `host:forward:` with no device resolves transport-any → "no devices".
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:forward:tcp:0;tcp:5555").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn forward_auto_assign_replies_two_okays_plus_port_and_lists() {
+        // Single device → forward binds a real OS port (tcp:0) and replies
+        // OKAY OKAY + %04x + decimal port. The rule then shows in list-forward.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f.clone(), "host:forward:tcp:0;tcp:5555").await;
+        assert_eq!(&resp[..8], b"OKAYOKAY", "forward success is two bare OKAYs");
+        // Remainder is %04x + ASCII decimal resolved port.
+        let len = usize::from_str_radix(std::str::from_utf8(&resp[8..12]).unwrap(), 16).unwrap();
+        let port_str = std::str::from_utf8(&resp[12..12 + len]).unwrap();
+        let resolved: u16 = port_str.parse().expect("decimal port");
+        assert_ne!(resolved, 0, "tcp:0 must resolve to a real OS-assigned port");
+
+        // list-forward reflects the rule: single OKAY + framed body.
+        let listing = round_trip(f, "host:list-forward").await;
+        assert_eq!(&listing[..4], b"OKAY");
+        let body = String::from_utf8(listing[8..].to_vec()).unwrap();
+        assert!(
+            body.contains(&format!("solo tcp:{resolved} tcp:5555")),
+            "list-forward body must contain the rule, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn killforward_unknown_rule_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:killforward:tcp:9999").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("not found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn killforward_all_always_okays_twice() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:killforward-all").await;
+        assert_eq!(resp, b"OKAYOKAY", "killforward-all success is two OKAYs");
+    }
+
+    #[tokio::test]
+    async fn forward_norebind_conflict_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        // First forward binds a real port; capture it.
+        let resp = round_trip(f.clone(), "host:forward:tcp:0;tcp:5555").await;
+        let len = usize::from_str_radix(std::str::from_utf8(&resp[8..12]).unwrap(), 16).unwrap();
+        let resolved: u16 = std::str::from_utf8(&resp[12..12 + len])
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // norebind on the SAME local port must fail with the AOSP reason.
+        let req = format!("host:forward:norebind:tcp:{resolved};tcp:6000");
+        let resp2 = round_trip(f, &req).await;
+        let body = String::from_utf8(resp2).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(
+            body.contains("cannot rebind existing socket"),
+            "got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_via_host_serial_form() {
+        // `host-serial:<serial>:forward:...` — explicit serial path.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = round_trip(f, "host-serial:dev1:forward:tcp:0;tcp:7777").await;
+        assert_eq!(
+            &resp[..8],
+            b"OKAYOKAY",
+            "host-serial forward replies two OKAYs"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_via_host_serial_unknown_device_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = round_trip(f, "host-serial:ghost:forward:tcp:0;tcp:7777").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("device not found"), "got: {body}");
+    }
+
+    /// Build a frontend whose advertised capabilities are explicitly set (the
+    /// builder path; `serve()` would normally negotiate these from the backend).
+    fn frontend_with_caps(caps: ServerCapabilities) -> AdbServerFrontend<MockBackend> {
+        AdbServerFrontend::builder(Arc::new(MockBackend { devices: vec![] }))
+            .capabilities(caps)
+            .build()
+    }
+
+    #[test]
+    fn map_local_service_shell_v1_and_tcp_always_ok() {
+        let f = frontend_with_caps(ServerCapabilities::default());
+        assert!(matches!(
+            f.map_local_service("shell:ls").unwrap(),
+            ADBLocalCommand::ShellCommand(c, args) if c == "ls" && args.is_empty()
+        ));
+        assert!(matches!(
+            f.map_local_service("tcp:5555").unwrap(),
+            ADBLocalCommand::TcpConnect(5555)
+        ));
+        assert!(f.map_local_service("tcp:notaport").is_err());
+    }
+
+    #[test]
+    fn map_local_service_sync_gated_on_sync_v2_feature() {
+        // Default caps do NOT advertise sync_v2 → sync: must be rejected.
+        let f = frontend_with_caps(ServerCapabilities::default());
+        assert!(
+            f.map_local_service("sync:").is_err(),
+            "sync: must FAIL when sync_v2 is not advertised (honest banner)"
+        );
+
+        // With sync_v2 advertised → sync: is bridged verbatim via Raw.
+        let f = frontend_with_caps(ServerCapabilities::default().with_feature("sync_v2"));
+        assert!(matches!(
+            f.map_local_service("sync:").unwrap(),
+            ADBLocalCommand::Raw(s) if s == "sync:"
+        ));
+    }
+
+    #[test]
+    fn map_local_service_shell_v2_gated_on_shell_v2_feature() {
+        // Default caps do NOT advertise shell_v2 → shell,v2 must be rejected.
+        let f = frontend_with_caps(ServerCapabilities::default());
+        assert!(
+            f.map_local_service("shell,v2,raw:ls").is_err(),
+            "shell,v2 must FAIL when shell_v2 is not advertised"
+        );
+
+        // With shell_v2 advertised → bridged verbatim (modifiers preserved).
+        let f = frontend_with_caps(ServerCapabilities::default().with_shell_v2());
+        assert!(matches!(
+            f.map_local_service("shell,v2,TERM=xterm,raw:ls").unwrap(),
+            ADBLocalCommand::Raw(s) if s == "shell,v2,TERM=xterm,raw:ls"
+        ));
+    }
+
+    #[test]
+    fn map_local_service_reverse_and_jdwp_unsupported() {
+        let f = frontend_with_caps(
+            ServerCapabilities::default()
+                .with_feature("sync_v2")
+                .with_shell_v2(),
+        );
+        // reverse gets a DISTINCT, explicit reason (honest staged degradation),
+        // not the generic "service not supported". `ADBLocalCommand` has no
+        // `Debug`, so match the Result rather than using `expect_err`.
+        match f.map_local_service("reverse:forward:tcp:1;tcp:2") {
+            Err(reason) => assert_eq!(reason, "reverse not supported by this server"),
+            Ok(_) => panic!("reverse must FAIL (staged, not implemented end-to-end)"),
+        }
+        assert!(f.map_local_service("jdwp:1234").is_err());
+        assert!(f.map_local_service("localabstract:foo").is_err());
     }
 }

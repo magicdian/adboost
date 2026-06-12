@@ -26,6 +26,13 @@ pub enum ADBLocalCommand {
     Root,
     /// Open a TCP connection to a port on the device (formats to "tcp:<port>")
     TcpConnect(u16),
+    /// A verbatim local-service string, formatted as-is (no transformation).
+    ///
+    /// Used by the server frontend to transparently bridge a client's exact
+    /// service string (e.g. `sync:`, `shell,v2,raw:ls`) onto the device: the
+    /// server is a byte pipe for these sub-protocols, so it must forward the
+    /// service string the client sent without re-encoding it.
+    Raw(String),
 
     #[cfg(feature = "framebuffer")]
     FrameBuffer,
@@ -87,6 +94,7 @@ impl Display for ADBLocalCommand {
             Self::Usb => write!(f, "usb:"),
             Self::Root => write!(f, "root:"),
             Self::TcpConnect(port) => write!(f, "tcp:{port}"),
+            Self::Raw(service) => write!(f, "{service}"),
 
             #[cfg(feature = "framebuffer")]
             Self::FrameBuffer => write!(f, "framebuffer:"),
@@ -106,4 +114,18 @@ fn test_reverse_remove_command() {
     let command = ADBLocalCommand::ReverseRemove("tcp:7100".to_string());
 
     assert_eq!(command.to_string(), "reverse:killforward:tcp:7100");
+}
+
+#[test]
+fn test_raw_command_is_verbatim() {
+    // Raw formats the service string with no transformation — this is what lets
+    // the server bridge a client's exact `sync:` / `shell,v2,raw:` verbatim.
+    assert_eq!(
+        ADBLocalCommand::Raw("sync:".to_string()).to_string(),
+        "sync:"
+    );
+    assert_eq!(
+        ADBLocalCommand::Raw("shell,v2,TERM=xterm,raw:ls".to_string()).to_string(),
+        "shell,v2,TERM=xterm,raw:ls"
+    );
 }

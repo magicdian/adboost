@@ -6,6 +6,7 @@ mod adb_termios;
 mod daemon;
 mod handlers;
 mod models;
+mod selftest;
 mod utils;
 
 use adb_client::ADBDeviceExt;
@@ -198,6 +199,7 @@ async fn inner_main() -> ADBCliResult<()> {
             handle_persistent_command(persistent_command).await
         }
         MainCommand::Mdns => handle_mdns_command(),
+        MainCommand::Selftest(selftest_command) => selftest::run(selftest_command).await,
         MainCommand::Version => {
             println!("{} {}", env!("CARGO_PKG_NAME"), utils::long_version());
             Ok(())

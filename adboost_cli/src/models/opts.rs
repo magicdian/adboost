@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use crate::utils;
 
 use super::{
-    EmulatorCommand, HostCommand, LocalCommand, PersistentCommand, ServerCommand, TcpCommand,
-    UsbCommand,
+    EmulatorCommand, HostCommand, LocalCommand, PersistentCommand, SelftestCommand, ServerCommand,
+    TcpCommand, UsbCommand,
 };
 
 #[derive(Debug, Parser)]
@@ -40,6 +40,8 @@ pub enum MainCommand {
     Persistent(PersistentCommand),
     /// MDNS discovery related commands
     Mdns,
+    /// Run the interactive, device-backed self-test suite
+    Selftest(SelftestCommand),
     /// Display various version information
     Version,
 }

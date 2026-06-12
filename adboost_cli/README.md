@@ -99,6 +99,56 @@ adboost_cli persistent --no-delayed-ack shell getprop
 `--no-delayed-ack` reproduces the classic path; the default reproduces the
 windowed path (now working after the bug-#3 fix).
 
+## Self-test (`selftest`)
+
+The `selftest` subcommand is an interactive, device-backed regression harness.
+It exercises adboost against the **real** ADB devices connected to the host and
+reports results in a gtest-style format; the process exit code reflects success
+(so it is CI/script friendly).
+
+It runs two automated channels per device, then an optional interactive phase:
+
+- **`usb_direct`** — drives a `PersistentUsbConnection` straight to the device
+  (no adb server in the path): `shell`, `shell,v2` (separated stdout + exit
+  code), and a SYNC `push`→`pull` round-trip. Validates the library's own stack.
+- **`through_server`** — stands up adboost's **own** ADB server frontend on an
+  ephemeral loopback port (so it never disturbs a real `:5037`) and connects to
+  it as a client: `shell`, `push`/`pull`, `list`, `stat`, and a `forward`
+  add/remove round-trip. Validates the server frontend end-to-end.
+- **`parity`** *(auto-detected)* — if an official `adb` binary is on `PATH`,
+  drives the SAME adboost server with `adb -P <port>` to prove a real adb client
+  interoperates. SKIPPED when `adb` is absent.
+- **`tcpip`** — pre-wired placeholder, reported SKIPPED (pending an emulator
+  debug environment).
+- **`interactive`** — USB unplug/replug recovery and reboot recovery (120 s
+  timeout). Each is gated behind a prompt; reboot recovery excludes tcpip
+  devices (their post-reboot reconnect is a separate scenario).
+
+Multiple devices are handled automatically: each addressable device is tested by
+serial (the `-s <serial>` equivalent).
+
+### Prerequisites
+
+`usb_direct` opens the USB device **directly**, so nothing else may hold the USB
+interface during that phase:
+
+```bash
+adb kill-server     # stop any running Google adb server so adboost can claim USB
+# connect + authorize at least one device over USB
+```
+
+### Run it
+
+```bash
+# full run (automated + interactive)
+adboost_cli selftest
+
+# automated only (unattended / CI)
+adboost_cli selftest --no-interactive
+```
+
+Example summary line: `[  PASSED  ] 18 tests.` / `[ SKIPPED  ] 3 tests.`
+
 ## Logging / `RUST_LOG`
 
 The CLI installs a `tracing` subscriber (the library stays a pure emitter).

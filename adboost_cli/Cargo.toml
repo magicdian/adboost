@@ -22,6 +22,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[dev-dependencies]
+# Only needed so the self-test unit tests can implement the framebuffer arm of
+# `ADBDeviceExt` (default `framebuffer` feature) on their hardware-free fake
+# device. Mirrors adb_client's image version/features.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
 [target.'cfg(unix)'.dependencies]
 termios = { version = "0.3.3" }
 # Daemon control on Unix: setsid (detach) on the spawned child + SIGTERM/`kill(0)`

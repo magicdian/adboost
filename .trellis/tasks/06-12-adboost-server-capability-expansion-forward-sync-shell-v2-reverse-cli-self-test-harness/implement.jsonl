@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "横跨 adb_client 库 + adboost_cli 两 crate；新增 server 能力与 selftest 子命令需遵循既有 crate 职责边界与文件组织（server 模块、message_devices、CLI handlers/models）"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "P1-P4 全是 ADB wire 协议工作（host:forward 双 OKAY、sync: SYNC 子协议、shell,v2 内层 framing、reverse 设备发起 stream），CNXN/delayed_ack/data_check 耦合是协议正确性底线"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "frontend 放行后失败需回落 FAIL；backend 新方法返回 RustADBError unsupported；selftest/CLI 用 ADBCliError + ExitCode。两层错误策略不同，需对齐"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "新代码需过 pedantic clippy + 默认 rustfmt + MSRV 1.88.0；测试风格（pure helper 单测 + MockBackend）需遵循既有约定"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "P2/P3 复用既有 SyncSession/ShellV2Session/PersistentUsbConnection；forward 复用 open_local_service(TcpConnect)；selftest 两通道复用同组测试用例——避免重复实现"}
