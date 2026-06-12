@@ -57,7 +57,7 @@ See [`NOTICE`](./NOTICE) for the complete attribution and the upstream MIT text.
 | Crate           | Description                                                        |
 | --------------- | ------------------------------------------------------------------ |
 | `adb_client`    | Core Rust library implementing the ADB server & device protocols.  |
-| `adb_cli`       | CLI binary built on top of the library.                            |
+| `adboost_cli`   | CLI binary built on top of the library.                            |
 | `pyadb_client`  | Python bindings exposing the library to Python.                    |
 | `examples/mdns` | Example: mDNS device discovery.                                    |
 

@@ -31,21 +31,21 @@ jobs:
       - name: Publish crates
         run: |
           cargo publish -p adb_client --token ${CRATES_IO_TOKEN}
-          cargo publish -p adb_cli --token ${CRATES_IO_TOKEN}
+          cargo publish -p adboost_cli --token ${CRATES_IO_TOKEN}
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
       - name: Build release
-        run: cargo build -p adb_cli --release
+        run: cargo build -p adboost_cli --release
 
       - name: Rename binary
-        run: cp target/release/adb_cli target/release/adb_cli-linux
+        run: cp target/release/adboost_cli target/release/adboost_cli-linux
 
       - name: Build DEB package
-        run: cargo deb -p adb_cli
+        run: cargo deb -p adboost_cli
 
       - name: Build RPM package
-        run: cargo generate-rpm -p adb_cli
+        run: cargo generate-rpm -p adboost_cli
 
       - name: Upload Linux artifacts
         uses: softprops/action-gh-release@v2
@@ -53,7 +53,7 @@ jobs:
           files: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
-            target/release/adb_cli-linux
+            target/release/adboost_cli-linux
 
   release-macos:
     name: macOS - Build Binary
@@ -69,15 +69,15 @@ jobs:
           override: true
 
       - name: Build release
-        run: cargo build -p adb_cli --release
+        run: cargo build -p adboost_cli --release
 
       - name: Rename binary
-        run: cp target/release/adb_cli target/release/adb_cli-macos
+        run: cp target/release/adboost_cli target/release/adboost_cli-macos
 
       - name: Upload macOS binary
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/adb_cli-macos
+          files: target/release/adboost_cli-macos
 
   release-windows:
     name: Windows - Build Binary
@@ -98,12 +98,12 @@ jobs:
           python-version: "3.10"
 
       - name: Build release
-        run: cargo build -p adb_cli --release
+        run: cargo build -p adboost_cli --release
 
       - name: Rename binary
-        run: Rename-Item -Path target/release/adb_cli.exe -NewName adb_cli-windows.exe
+        run: Rename-Item -Path target/release/adboost_cli.exe -NewName adboost_cli-windows.exe
 
       - name: Upload Windows binary
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/adb_cli-windows.exe
+          files: target/release/adboost_cli-windows.exe

@@ -1,9 +1,8 @@
 [workspace]
-# Async rewrite (phase 0): temporarily narrowed to `adb_client` only.
-# `adb_cli`, `pyadb_client`, and `examples/mdns` depend on the old sync API and
-# will not compile until they are migrated in a later, separate task. They stay
-# on disk but are excluded from this round's build/CI.
-members = ["adb_client"]
+# Async rewrite: `adb_client` (library) + `adboost_cli` (async CLI, migrated).
+# `pyadb_client` and `examples/mdns` still depend on the old sync API and stay
+# excluded until they are migrated in a later, separate task.
+members = ["adb_client", "adboost_cli"]
 resolver = "2"
 
 [workspace.package]

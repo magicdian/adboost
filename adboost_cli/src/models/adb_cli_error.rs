@@ -72,6 +72,8 @@ impl From<adb_client::RustADBError> for ADBCliError {
             | RustADBError::UnknownTransport(_)
             | RustADBError::RemountError(_)
             | RustADBError::StatResponseError(_)
+            | RustADBError::TaskJoinError(_)
+            | RustADBError::TaskCancelled(_)
             | RustADBError::ParseDateError(_) => Self::MayNeedAnIssue(value),
             // List of [`RustADBError`] that may occur in standard contexts and therefore do not require for issues
             RustADBError::ADBDeviceNotPaired

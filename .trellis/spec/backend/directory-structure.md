@@ -7,15 +7,16 @@
 
 ## Overview
 
-This is a Cargo **workspace** (edition **2024**, MSRV **1.88.0**, resolver `2`)
-with four members declared in `Cargo.toml:2`:
+This is a Cargo **workspace** (edition **2024**, MSRV **1.88.0**, resolver `2`).
+Active `members` (root `Cargo.toml`): **`adb_client`** + **`adboost_cli`**. Other
+crates exist on disk but are excluded from this round's build/CI.
 
 | Crate | Path | Type | Role |
 |-------|------|------|------|
-| `adb_client` | `adb_client/` | lib | Core ADB client library. Implements both ADB protocols (server + end-device) over USB / TCP. |
-| `adb_cli` | `adb_cli/` | bin | CLI front-end over `adb_client` (enables `mdns` + `usb`). |
-| `pyadb_client` | `pyadb_client/` | cdylib + rlib | Python bindings via PyO3 (`abi3-py310`). Enables `usb`. |
-| `mdns` | `examples/mdns/` | bin (example) | Standalone example exercising `mdns` + `usb`. Single `main.rs`. |
+| `adb_client` | `adb_client/` | lib | Core ADB client library (async/tokio). Implements both ADB protocols (server + end-device) over USB / TCP. Pure log **emitter** (`tracing`). The bare name `adboost` is **reserved for this library's future rename**. |
+| `adboost_cli` | `adboost_cli/` | bin | Async CLI front-end over the **local** `adb_client` (path dep; `mdns` + `usb`). Owns the `tracing` subscriber install. Hosts the `persistent` exerciser (closed-loop validation of the async USB / windowed path). Renamed from `adb_cli` — it no longer tracks upstream's CLI (upstream patches re-import into the library only). |
+| `pyadb_client` | `pyadb_client/` | cdylib + rlib | Python bindings via PyO3. On disk; **excluded** from the workspace this round. |
+| `mdns` | `examples/mdns/` | bin (example) | Standalone `mdns` + `usb` example. On disk; **excluded** this round. |
 
 Shared package metadata (`authors` / `edition` / `license` / `version` /
 `workspace.lints`) lives in `[workspace.package]` at the root `Cargo.toml` and

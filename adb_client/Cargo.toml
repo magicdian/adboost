@@ -73,7 +73,7 @@ mdns-sd = { version = "0.19.2", default-features = false, features = [
 #########
 #########
 # USB-only dependencies
-nusb = { version = "0.2", optional = true }
+nusb = { version = "0.2", features = ["tokio"], optional = true }
 num_enum = { version = "0.7.6" }
 #########
 

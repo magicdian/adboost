@@ -4,7 +4,7 @@ description = "Rust ADB (Android Debug Bridge) CLI"
 edition.workspace = true
 keywords.workspace = true
 license.workspace = true
-name = "adb_cli"
+name = "adboost_cli"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
@@ -14,11 +14,13 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-adb_client = { version = "^3.2.1", features = ["mdns", "usb"] }
+adb_client = { path = "../adb_client", features = ["mdns", "usb"] }
 clap = { version = "4.6.1", features = ["derive"] }
-env_logger = { version = "0.11.10" }
-log = { version = "0.4.30" }
 tabwriter = { version = "1.4.1" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(unix)'.dependencies]
 termios = { version = "0.3.3" }
@@ -28,7 +30,7 @@ termios = { version = "0.3.3" }
 #####################################
 [package.metadata.deb]
 assets = [
-    { source = "target/release/adb_cli", dest = "usr/bin/", mode = "755" },
+    { source = "target/release/adboost_cli", dest = "usr/bin/", mode = "755" },
 ]
 priority = "optional"
 section = "utility"
@@ -38,6 +40,6 @@ section = "utility"
 ##################################
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/adb_cli", dest = "/usr/bin/adb_cli", mode = "755" },
+    { source = "target/release/adboost_cli", dest = "/usr/bin/adboost_cli", mode = "755" },
 ]
 license = "Apache-2.0 AND MIT"

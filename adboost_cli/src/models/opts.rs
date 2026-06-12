@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 
 use crate::utils;
 
-use super::{EmulatorCommand, HostCommand, LocalCommand, TcpCommand, UsbCommand};
+use super::{
+    EmulatorCommand, HostCommand, LocalCommand, PersistentCommand, TcpCommand, UsbCommand,
+};
 
 #[derive(Debug, Parser)]
 #[clap(about, long_version = utils::long_version(), author)]
@@ -27,6 +29,9 @@ pub enum MainCommand {
     Usb(UsbCommand),
     /// TCP device related commands
     Tcp(TcpCommand),
+    /// Persistent-USB exerciser: one-command reproducer for the async USB /
+    /// windowed `delayed_ack` path (prints a negotiation self-check + runs a shell command)
+    Persistent(PersistentCommand),
     /// MDNS discovery related commands
     Mdns,
     /// Display various version information
