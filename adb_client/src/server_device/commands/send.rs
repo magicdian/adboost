@@ -19,7 +19,7 @@ impl ADBServerDevice {
         stream: R,
         path: A,
     ) -> Result<()> {
-        log::info!("Sending data to {}", path.as_ref());
+        tracing::info!("Sending data to {}", path.as_ref());
         self.set_serial_transport().await?;
 
         // Set device in SYNC mode

@@ -134,11 +134,11 @@ impl USBTransport {
             let write_amount = completion.actual_len;
             offset += write_amount;
 
-            log::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
+            tracing::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
         }
 
         if offset % max_packet_size == 0 {
-            log::trace!("must send final zero-length packet");
+            tracing::trace!("must send final zero-length packet");
             let completion = transfer_with_timeout(endpoint, Buffer::from(&[][..]), timeout).await;
             map_transfer_status(completion.status)?;
         }
@@ -270,10 +270,10 @@ impl ADBTransport for USBTransport {
         };
 
         let read_ep = interface.endpoint::<Bulk, In>(read_endpoint.address)?;
-        log::debug!("got read endpoint: {read_endpoint:?}");
+        tracing::debug!("got read endpoint: {read_endpoint:?}");
 
         let write_ep = interface.endpoint::<Bulk, Out>(write_endpoint.address)?;
-        log::debug!("got write endpoint: {write_endpoint:?}");
+        tracing::debug!("got write endpoint: {write_endpoint:?}");
 
         {
             let mut write_connection = self.write_connection.lock().await;
@@ -300,7 +300,7 @@ impl ADBTransport for USBTransport {
 
         let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
         if let Err(e) = self.write_message(message).await {
-            log::error!("error while sending CLSE message: {e}");
+            tracing::error!("error while sending CLSE message: {e}");
         }
 
         // Dropping the endpoints and the interface releases the claim. This is
@@ -312,7 +312,7 @@ impl ADBTransport for USBTransport {
         let mut connection = self.connection.lock().await;
         connection.read_endpoint = None;
         connection.interface = None;
-        log::debug!("succesfully released interface");
+        tracing::debug!("succesfully released interface");
 
         Ok(())
     }
@@ -327,12 +327,12 @@ impl ADBMessageTransport for USBTransport {
         let message_bytes = message.header().as_bytes();
         self.write_bulk_data(&message_bytes, timeout).await?;
 
-        log::trace!("successfully write header: {} bytes", message_bytes.len());
+        tracing::trace!("successfully write header: {} bytes", message_bytes.len());
 
         let payload = message.into_payload();
         if !payload.is_empty() {
             self.write_bulk_data(&payload, timeout).await?;
-            log::trace!("successfully write payload: {} bytes", payload.len());
+            tracing::trace!("successfully write payload: {} bytes", payload.len());
         }
 
         Ok(())
@@ -362,7 +362,7 @@ impl ADBMessageTransport for USBTransport {
         read_exact(endpoint, &mut data, max_packet_size, timeout).await?;
 
         let header = ADBTransportMessageHeader::try_from(data)?;
-        log::trace!("received header {header:?}");
+        tracing::trace!("received header {header:?}");
 
         // Bound the wire data_length BEFORE allocating (AOSP check_header clause:
         // reject data_length > MAX_PAYLOAD before reading the payload). A hostile or

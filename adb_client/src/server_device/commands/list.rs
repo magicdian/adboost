@@ -77,7 +77,7 @@ impl ADBServerDevice {
                 "DONE" => {
                     return Ok(list_items);
                 }
-                x => log::error!("Got an unknown response {x}"),
+                x => tracing::error!("Got an unknown response {x}"),
             }
         }
     }

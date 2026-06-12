@@ -69,10 +69,10 @@ impl ADBServer {
         match child {
             Ok(mut child) => {
                 if let Err(e) = child.wait() {
-                    log::error!("error while starting adb server: {e}");
+                    tracing::error!("error while starting adb server: {e}");
                 }
             }
-            Err(e) => log::error!("error while starting adb server: {e}"),
+            Err(e) => tracing::error!("error while starting adb server: {e}"),
         }
     }
 

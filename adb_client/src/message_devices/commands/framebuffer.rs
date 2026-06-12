@@ -43,7 +43,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
                     framebuffer_data.extend_from_slice(&response.into_payload());
 
-                    log::debug!(
+                    tracing::debug!(
                         "received framebuffer data. new size {}",
                         framebuffer_data.len()
                     );
@@ -76,7 +76,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
                     framebuffer_data.extend_from_slice(&response.into_payload());
 
-                    log::debug!(
+                    tracing::debug!(
                         "received framebuffer data. new size {}",
                         framebuffer_data.len()
                     );

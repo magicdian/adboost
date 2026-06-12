@@ -41,7 +41,7 @@ impl MDNSDiscoveryService {
                             Ok(device) => {
                                 sender.send(device).map_err(|_| RustADBError::SendError)?;
                             }
-                            Err(e) => log::error!("got error with device: {e}"),
+                            Err(e) => tracing::error!("got error with device: {e}"),
                         }
                     }
                 }

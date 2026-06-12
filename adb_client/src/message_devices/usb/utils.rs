@@ -58,7 +58,7 @@ pub fn get_single_connected_adb_device() -> Result<Option<ADBDeviceInfo>> {
     match (found_devices.first(), found_devices.get(1)) {
         (None, _) => Ok(None),
         (Some(device_info), None) => {
-            log::debug!(
+            tracing::debug!(
                 "Autodetect device {:04x}:{:04x} - {}",
                 device_info.vendor_id,
                 device_info.product_id,

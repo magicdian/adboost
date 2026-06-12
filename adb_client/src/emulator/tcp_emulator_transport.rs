@@ -96,7 +96,7 @@ impl ADBTransport for TCPEmulatorTransport {
         if let Some(conn) = &mut self.tcp_stream {
             let peer = conn.peer_addr()?;
             conn.shutdown().await?;
-            log::trace!("Disconnected from {peer}");
+            tracing::trace!("Disconnected from {peer}");
         }
 
         Ok(())
@@ -107,7 +107,7 @@ impl ADBTransport for TCPEmulatorTransport {
         if self.tcp_stream.is_none() {
             let stream = TcpStream::connect(self.socket_addr).await?;
 
-            log::trace!("Successfully connected to {}", self.socket_addr);
+            tracing::trace!("Successfully connected to {}", self.socket_addr);
 
             self.tcp_stream = Some(stream);
 
@@ -125,7 +125,7 @@ impl ADBTransport for TCPEmulatorTransport {
 
             self.authenticate().await?;
 
-            log::trace!("Authentication successful");
+            tracing::trace!("Authentication successful");
         }
 
         Ok(())

@@ -164,7 +164,7 @@ impl SyncSession {
         if !payload.is_empty() {
             self.inner.write_all(payload).await?;
         }
-        log::trace!(
+        tracing::trace!(
             "PersistentUsb: sync wrote frame id={sub:?} len={}",
             payload.len()
         );

@@ -46,7 +46,7 @@ impl ADBServerDevice {
 
         match &data[0..read_amount] {
             b"Success\n" => {
-                log::info!(
+                tracing::info!(
                     "APK file {} successfully installed",
                     apk_path.as_ref().display()
                 );

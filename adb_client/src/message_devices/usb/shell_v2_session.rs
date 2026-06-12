@@ -156,7 +156,7 @@ impl ShellV2Session {
                 payload_len,
             } = decode_frame_header(header)?;
 
-            log::trace!(
+            tracing::trace!(
                 "PersistentUsb: shell-v2 frame channel={channel:?} payload_len={payload_len}"
             );
 

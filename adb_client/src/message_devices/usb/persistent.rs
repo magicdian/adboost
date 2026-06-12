@@ -14,7 +14,7 @@
 //!   in over a control channel and are applied between reads. The routing
 //!   decision is the I/O-free [`classify_message`] (unit-tested without
 //!   hardware). The reader NEVER blocks — all sends use `try_send`; on overflow
-//!   it drops and `log::warn!`s so the loss is observable.
+//!   it drops and `tracing::warn!`s so the loss is observable.
 //! - **writer task**: the single owner of the bulk-OUT endpoint. Every outbound
 //!   frame (OPEN / OKAY / WRTE / CLSE / raw) is delivered to it over one mpsc
 //!   channel as an [`OutboundFrame`]. It serializes the writes:
@@ -340,7 +340,7 @@ impl PersistentUsbConnection {
         let private_key = if let Some(k) = read_adb_private_key(&key_path)? {
             k
         } else {
-            log::warn!(
+            tracing::warn!(
                 "No private key found at {}. Generating random.",
                 key_path.display()
             );
@@ -361,7 +361,7 @@ impl PersistentUsbConnection {
         // here is the effective min of the two ends.
         let delayed_ack_negotiated =
             negotiate_delayed_ack(features.delayed_ack, &device_banner, device_version);
-        log::debug!(
+        tracing::debug!(
             "PersistentUsb: delayed_ack negotiated = {delayed_ack_negotiated} (local={}, device_banner_has_it={}, device_version={device_version:#010x})",
             features.delayed_ack,
             banner_advertises_delayed_ack(&device_banner)
@@ -521,6 +521,7 @@ impl PersistentUsbConnection {
     /// CNXN response header (`arg0`) so the caller can gate `delayed_ack`
     /// windowing on the negotiated version (windowing is only valid at
     /// `>= A_VERSION_SKIP_CHECKSUM`).
+    #[tracing::instrument(name = "connect", skip(transport, private_key, features))]
     async fn do_connect(
         transport: &mut USBTransport,
         private_key: &ADBRsaKey,
@@ -531,7 +532,7 @@ impl PersistentUsbConnection {
             .read_message_with_timeout(Duration::from_millis(100))
             .await
         {
-            log::trace!(
+            tracing::trace!(
                 "PersistentUsb: drained stale message: cmd={}",
                 msg.header().command()
             );
@@ -569,13 +570,13 @@ impl PersistentUsbConnection {
             match response.header().command() {
                 MessageCommand::Cnxn => {
                     let dev_banner = String::from_utf8_lossy(response.payload()).into_owned();
-                    log::debug!(
+                    tracing::debug!(
                         "PersistentUsb: unencrypted connection established, device banner: {dev_banner:?}"
                     );
                     return Ok((response.header().arg0(), dev_banner));
                 }
                 MessageCommand::Auth => {
-                    log::debug!("PersistentUsb: authentication required");
+                    tracing::debug!("PersistentUsb: authentication required");
                     return Self::do_auth(transport, response, private_key).await;
                 }
                 MessageCommand::Stls => {
@@ -585,7 +586,7 @@ impl PersistentUsbConnection {
                 }
                 MessageCommand::Clse => {
                     // Stale CLSE from previous session — retry
-                    log::debug!("PersistentUsb: got stale CLSE on attempt {attempt}, retrying");
+                    tracing::debug!("PersistentUsb: got stale CLSE on attempt {attempt}, retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 _ => {
@@ -603,6 +604,7 @@ impl PersistentUsbConnection {
 
     /// Returns `(device_protocol_version, device_banner)` from the accepted CNXN
     /// response — see [`Self::do_connect`].
+    #[tracing::instrument(name = "auth", skip(transport, message, private_key))]
     async fn do_auth(
         transport: &mut USBTransport,
         message: ADBTransportMessage,
@@ -622,7 +624,9 @@ impl PersistentUsbConnection {
         let received = transport.read_message().await?;
         if received.header().command() == MessageCommand::Cnxn {
             let banner = String::from_utf8_lossy(received.payload()).into_owned();
-            log::info!("PersistentUsb: auth OK (signature accepted), device banner: {banner:?}");
+            tracing::info!(
+                "PersistentUsb: auth OK (signature accepted), device banner: {banner:?}"
+            );
             return Ok((received.header().arg0(), banner));
         }
 
@@ -638,7 +642,7 @@ impl PersistentUsbConnection {
             .await?;
         final_resp.assert_command(MessageCommand::Cnxn)?;
         let banner = String::from_utf8_lossy(final_resp.payload()).into_owned();
-        log::info!("PersistentUsb: auth OK (public key accepted), device banner: {banner:?}");
+        tracing::info!("PersistentUsb: auth OK (public key accepted), device banner: {banner:?}");
         Ok((final_resp.header().arg0(), banner))
     }
 
@@ -656,8 +660,12 @@ impl PersistentUsbConnection {
     /// across a USB `.await`.
     ///
     /// The reader must NEVER block: blocking on a full queue would stall every
-    /// session. All sends use `try_send`; on overflow we drop and `log::warn!`
+    /// session. All sends use `try_send`; on overflow we drop and `tracing::warn!`
     /// so the loss is observable (never a silent drop).
+    // Not per-session: this task demuxes ALL sessions, so the span is just a
+    // task label (no single `local_id`). Every routed-frame event emitted inside
+    // inherits the `reader` label so interleaved lines are attributable to the task.
+    #[tracing::instrument(name = "reader", skip(transport, control_rx, pending_opens_tx))]
     async fn reader_loop(
         mut transport: USBTransport,
         mut control_rx: mpsc::Receiver<ReaderControl>,
@@ -689,7 +697,7 @@ impl PersistentUsbConnection {
                 // applied (registry already mutated). Both just keep looping.
                 ReadStep::ReadTimeout | ReadStep::Control => continue,
                 ReadStep::Closed => {
-                    log::debug!("PersistentUsb reader: control channel closed, exiting");
+                    tracing::debug!("PersistentUsb reader: control channel closed, exiting");
                     break;
                 }
                 ReadStep::ReadError(e) => {
@@ -714,15 +722,15 @@ impl PersistentUsbConnection {
                     // (header-decode errors, the bound error, all IO / disconnect
                     // errors) stays fatal.
                     if matches!(e, RustADBError::InvalidIntegrity(..)) {
-                        log::warn!("PersistentUsb reader: skipping malformed frame: {e}");
+                        tracing::warn!("PersistentUsb reader: skipping malformed frame: {e}");
                         continue;
                     }
-                    log::warn!("PersistentUsb reader error (fatal): {e}");
+                    tracing::warn!("PersistentUsb reader error (fatal): {e}");
                     break;
                 }
             };
 
-            log::trace!(
+            tracing::trace!(
                 "PersistentUsb reader: cmd={} arg0={} arg1={} payload_len={}",
                 msg.header().command(),
                 msg.header().arg0(),
@@ -747,7 +755,7 @@ impl PersistentUsbConnection {
                         if target.try_send(msg).is_err() {
                             // Bounded queue full. Do NOT block (would stall all
                             // sessions). Drop with an observable warning.
-                            log::warn!(
+                            tracing::warn!(
                                 "PersistentUsb: session {id} queue full, dropped {cmd} message"
                             );
                         }
@@ -757,13 +765,13 @@ impl PersistentUsbConnection {
                     // Bounded queue, overflow policy = drop the incoming OPEN
                     // (the reader can never block on a full queue).
                     if pending_opens_tx.try_send(msg).is_err() {
-                        log::warn!(
+                        tracing::warn!(
                             "PersistentUsb: incoming-OPEN queue full, dropped device-originated OPEN"
                         );
                     }
                 }
                 RouteDecision::Unknown => {
-                    log::trace!(
+                    tracing::trace!(
                         "PersistentUsb: message for unknown session {} (cmd={}, dropping)",
                         msg.header().arg1(),
                         msg.header().command()
@@ -771,7 +779,7 @@ impl PersistentUsbConnection {
                 }
             }
         }
-        log::debug!("PersistentUsb reader task exiting");
+        tracing::debug!("PersistentUsb reader task exiting");
     }
 
     /// Await either the next USB frame or the next reader-control message,
@@ -815,6 +823,8 @@ impl PersistentUsbConnection {
     /// CLSE / OPEN / raw (`FireForget`) are written best-effort and logged on
     /// failure. The task exits when every sender (the connection + all session
     /// halves) has been dropped, draining the channel first.
+    // Task-label span (single bulk-OUT pump for all sessions; no per-session id).
+    #[tracing::instrument(name = "writer", skip(transport, writer_rx))]
     async fn writer_loop(
         mut transport: USBTransport,
         mut writer_rx: mpsc::Receiver<OutboundFrame>,
@@ -823,7 +833,7 @@ impl PersistentUsbConnection {
             match frame {
                 OutboundFrame::FireForget(msg) => {
                     if let Err(e) = transport.write_message(msg).await {
-                        log::warn!("PersistentUsb writer: fire-and-forget write failed: {e}");
+                        tracing::warn!("PersistentUsb writer: fire-and-forget write failed: {e}");
                     }
                 }
                 OutboundFrame::WithAck(msg, ack) => {
@@ -836,7 +846,7 @@ impl PersistentUsbConnection {
                 }
             }
         }
-        log::debug!("PersistentUsb writer task exiting");
+        tracing::debug!("PersistentUsb writer task exiting");
     }
 
     /// Tee a received message to every raw subscriber whose filter matches.
@@ -851,7 +861,7 @@ impl PersistentUsbConnection {
                 match sub.tx.try_send(msg.clone()) {
                     Ok(()) => true,
                     Err(TrySendError::Full(_)) => {
-                        log::warn!(
+                        tracing::warn!(
                             "PersistentUsb: raw subscriber queue full, dropped {} message",
                             msg.header().command()
                         );
@@ -891,11 +901,22 @@ impl PersistentUsbConnection {
             .await;
     }
 
+    // Per-session span: every OPEN/OKAY/CLSE/negotiation event emitted during this
+    // handshake inherits `local_id`, so a `[session{local_id=...}]` `RUST_LOG`
+    // filter narrows to one session. `#[instrument]` instruments the returned
+    // FUTURE (async-correct: the span is entered/exited around every `.await`
+    // resume, never held as a sync guard across a yield). `local_id` is generated
+    // in the body, so it is declared as an empty span field here and recorded once
+    // it exists. The returned `MultiplexedSession` outlives this fn; its own
+    // `local_id` is carried explicitly on per-frame events in
+    // `MultiplexedSession`/`SessionInner`.
+    #[tracing::instrument(name = "session", skip(self, cmd), fields(local_id))]
     pub async fn open_session(&self, cmd: &ADBLocalCommand) -> Result<MultiplexedSession> {
         let local_id: u32 = {
             let mut rng = rand::rng();
             rng.random()
         };
+        tracing::Span::current().record("local_id", local_id);
 
         // Create separate channels for data (WRTE/CLSE) and acks (OKAY).
         // `data_rx` is `mut` because we borrow it during the open handshake to
@@ -928,7 +949,7 @@ impl PersistentUsbConnection {
         } else {
             0
         };
-        log::debug!(
+        tracing::debug!(
             "PersistentUsb: OPEN local_id={} service={:?} delayed_ack={} window_grant={}",
             local_id,
             String::from_utf8_lossy(&service_bytes),
@@ -1041,6 +1062,9 @@ impl PersistentUsbConnection {
     /// # Errors
     ///
     /// Propagates any error from [`Self::open_session`].
+    // No `local_id` yet at this point (it's generated inside `open_session`); a
+    // labeled span here lets `open_session`'s per-session span nest under it.
+    #[tracing::instrument(name = "open_sync_session", skip(self))]
     pub async fn open_sync_session(&self) -> Result<SyncSession> {
         let session = self.open_session(&ADBLocalCommand::Sync).await?;
         Ok(SyncSession::new(session))
@@ -1055,6 +1079,8 @@ impl PersistentUsbConnection {
     /// # Errors
     ///
     /// Propagates any error from [`Self::open_session`].
+    // Labeled span (the per-session `local_id` span is entered inside `open_session`).
+    #[tracing::instrument(name = "open_shell_v2", skip(self))]
     pub async fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> {
         // Non-empty args ⇒ `ADBLocalCommand` formats the service as
         // `shell,v2,raw:<cmd>` (shell-v2), vs the empty-args `shell:<cmd>` (v1).
@@ -1140,7 +1166,7 @@ impl Drop for PersistentUsbConnection {
             // connection-level CLSE could not be delivered. The `abort` below
             // still tears the connection down, but the device may keep the
             // stream open until it times out — log it so the leak is observable.
-            log::warn!("PersistentUsb: could not enqueue connection CLSE on drop: {e}");
+            tracing::warn!("PersistentUsb: could not enqueue connection CLSE on drop: {e}");
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -1191,7 +1217,7 @@ impl Drop for SessionInner {
             // Best-effort contract: a full/closed writer queue means this
             // session's CLSE was dropped, so the remote may leak the stream
             // until it times out. Surface it rather than swallowing silently.
-            log::warn!(
+            tracing::warn!(
                 "PersistentUsb: could not enqueue CLSE for session {} on drop: {e}",
                 self.local_id
             );
@@ -1380,7 +1406,7 @@ fn apply_ack(
             if !send_flow.on_okay_payload(msg.payload()) {
                 // Malformed OKAY payload (len not in {0,4}). AOSP drops the
                 // packet; we log and keep the window unchanged rather than fail.
-                log::warn!(
+                tracing::warn!(
                     "PersistentUsb: ignoring OKAY with invalid payload len {}",
                     msg.payload().len()
                 );
@@ -1502,7 +1528,7 @@ fn poll_inflight_write(
             let n = *chunk_size;
             send_flow.record_sent(n);
             *write_state = WriteState::Idle;
-            log::trace!(
+            tracing::trace!(
                 "PersistentUsb: session {} sent WRTE size={n}, window={:?}",
                 shared.local_id,
                 send_flow.available_bytes()
@@ -2324,5 +2350,70 @@ mod tests {
             ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop unregisters the local id"),
             _ => panic!("drop must unregister the session id"),
         }
+    }
+
+    /// The per-session span carries `local_id` as a field, so an event emitted
+    /// while the span is entered is attributable to one session. This is the
+    /// mechanism a `RUST_LOG=[session{local_id=...}]` filter relies on.
+    ///
+    /// Gated on `tracing-init` because the assertion needs `tracing-subscriber`
+    /// (the only build that pulls it in); the library default stays a pure emitter.
+    #[cfg(feature = "tracing-init")]
+    #[test]
+    fn session_span_records_local_id_field() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::{Layer, Registry};
+
+        #[derive(Default)]
+        struct Captured(Arc<Mutex<Option<u64>>>);
+
+        impl Visit for Captured {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "local_id" {
+                    *self.0.lock().expect("capture lock") = Some(value);
+                }
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                if field.name() == "local_id" {
+                    *self.0.lock().expect("capture lock") =
+                        Some(u64::try_from(value).expect("local_id non-negative"));
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        struct CaptureLayer(Arc<Mutex<Option<u64>>>);
+
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "session" {
+                    let mut visitor = Captured(self.0.clone());
+                    attrs.record(&mut visitor);
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let subscriber = Registry::default().with(CaptureLayer(captured.clone()));
+
+        let local_id: u32 = 4242;
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("session", local_id);
+            let _enter = span.enter();
+        });
+
+        assert_eq!(
+            *captured.lock().expect("capture lock"),
+            Some(u64::from(local_id)),
+            "the `session` span must record `local_id` so per-session RUST_LOG filtering works"
+        );
     }
 }

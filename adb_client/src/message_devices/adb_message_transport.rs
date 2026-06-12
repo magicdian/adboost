@@ -27,7 +27,7 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
     /// Some transports may not need this feature, a blanket implementation is provided as default implementation.
     fn upgrade_connection(&mut self) -> impl Future<Output = Result<()>> + Send {
         async {
-            log::trace!("not upgrade needed fot this transport");
+            tracing::trace!("not upgrade needed fot this transport");
             Ok(())
         }
     }

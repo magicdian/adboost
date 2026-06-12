@@ -22,13 +22,15 @@ default = ["framebuffer"]
 mdns = ["dep:mdns-sd"]
 usb = ["dep:nusb"]
 framebuffer = ["dep:image"]
+# Optional convenience initializer (`init_tracing_from_env`); OFF by default.
+# The library itself never installs a subscriber — it stays a pure emitter.
+tracing-init = ["dep:tracing-subscriber"]
 
 [dependencies]
 base64 = { version = "0.22.1" }
 byteorder = { version = "1.5.0" }
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
-log = { version = "0.4.30" }
 num-bigint = { version = "0.8.6", package = "num-bigint-dig" }
 num-traits = { version = "0.2.19" }
 quick-protobuf = { version = "0.8.1" }
@@ -55,6 +57,12 @@ tokio = { version = "1", features = [
 ] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+# `log` feature: every tracing event also emits a `log` record, so existing
+# `log`/`env_logger` consumers (and the not-yet-migrated CLI) keep seeing output.
+tracing = { version = "0.1", features = ["log"] }
+# Optional, feature-gated subscriber for `init_tracing_from_env` only — never a
+# default dependency; the library remains a pure emitter.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 trait-variant = { version = "0.1.2" }
 
 #########

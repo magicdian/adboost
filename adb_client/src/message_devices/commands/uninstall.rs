@@ -22,7 +22,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         match final_status.into_payload().as_slice() {
             b"Success\n" => {
-                log::info!("Package {} successfully uninstalled", package_name.as_ref());
+                tracing::info!("Package {} successfully uninstalled", package_name.as_ref());
                 Ok(())
             }
             d => Err(crate::RustADBError::ADBRequestFailed(String::from_utf8(

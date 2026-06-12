@@ -15,7 +15,7 @@ pub fn check_extension_is_apk<P: AsRef<Path>>(path: P) -> Result<()> {
         )));
     }
 
-    log::debug!("Given file is an APK");
+    tracing::debug!("Given file is an APK");
 
     Ok(())
 }

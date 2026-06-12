@@ -164,7 +164,7 @@ impl ADBTransport for TCPServerTransport {
         if let Some(conn) = &mut self.tcp_stream {
             let peer = conn.peer_addr()?;
             conn.shutdown().await?;
-            log::trace!("Disconnected from {peer}");
+            tracing::trace!("Disconnected from {peer}");
         }
 
         Ok(())
@@ -178,7 +178,7 @@ impl ADBTransport for TCPServerTransport {
         let tcp_stream = TcpStream::connect(self.socket_addr).await?;
         tcp_stream.set_nodelay(true)?;
         self.tcp_stream = Some(tcp_stream);
-        log::trace!("Successfully connected to {}", self.socket_addr);
+        tracing::trace!("Successfully connected to {}", self.socket_addr);
 
         Ok(())
     }

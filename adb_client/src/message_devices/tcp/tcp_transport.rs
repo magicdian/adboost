@@ -148,7 +148,7 @@ impl ADBTransport for TcpTransport {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        log::debug!("disconnecting...");
+        tracing::debug!("disconnecting...");
         if let Some(current_connection) = &self.current_connection {
             let mut lock = current_connection.lock().await;
             match lock.as_mut() {
@@ -294,7 +294,7 @@ impl ADBMessageTransport for TcpTransport {
         match message.header().command() {
             MessageCommand::Cnxn => {
                 let device_infos = String::from_utf8(message.into_payload())?;
-                log::debug!("received device info: {device_infos}");
+                tracing::debug!("received device info: {device_infos}");
                 Ok(())
             }
             c => Err(RustADBError::ADBRequestFailed(format!(

@@ -50,7 +50,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         match final_status.into_payload().as_slice() {
             b"Success\n" => {
-                log::info!(
+                tracing::info!(
                     "APK file {} successfully installed",
                     apk_path.as_ref().display()
                 );

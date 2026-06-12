@@ -168,8 +168,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             // thread and never observed this. Preserve that interactive
             // semantic (input EOF drives the return value) but make the reader
             // outcome observable instead of silently discarded.
-            Ok(Err(e)) => log::debug!("shell reader task ended: {e}"),
-            Err(join_err) => log::warn!("shell reader task did not join cleanly: {join_err}"),
+            Ok(Err(e)) => tracing::debug!("shell reader task ended: {e}"),
+            Err(join_err) => tracing::warn!("shell reader task did not join cleanly: {join_err}"),
         }
 
         copy_result

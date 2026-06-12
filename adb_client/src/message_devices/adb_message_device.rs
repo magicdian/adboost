@@ -33,7 +33,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let private_key = if let Some(private_key) = read_adb_private_key(&adb_private_key_path)? {
             private_key
         } else {
-            log::warn!(
+            tracing::warn!(
                 "No private key found at path {}. Generating a new random.",
                 adb_private_key_path.as_ref().display()
             );
@@ -77,15 +77,15 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                     )?)
                     .await?;
                 self.get_transport_mut().upgrade_connection().await?;
-                log::debug!("Connection successfully upgraded from TCP to TLS");
+                tracing::debug!("Connection successfully upgraded from TCP to TLS");
                 Ok(())
             }
             MessageCommand::Cnxn => {
-                log::debug!("Unencrypted connection established");
+                tracing::debug!("Unencrypted connection established");
                 Ok(())
             }
             MessageCommand::Auth => {
-                log::debug!("Authentication required");
+                tracing::debug!("Authentication required");
                 self.auth_handshake(message, private_key).await
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
@@ -102,7 +102,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     ) -> Result<()> {
         match message.header().command() {
             MessageCommand::Auth => {
-                log::debug!("Authentication required");
+                tracing::debug!("Authentication required");
             }
             _ => return Ok(()),
         }
@@ -126,7 +126,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let received_response = self.transport.read_message().await?;
 
         if received_response.header().command() == MessageCommand::Cnxn {
-            log::info!(
+            tracing::info!(
                 "Authentication OK, device info {}",
                 String::from_utf8(received_response.into_payload())?
             );
@@ -147,7 +147,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             .await?;
         response.assert_command(MessageCommand::Cnxn)?;
 
-        log::info!(
+        tracing::info!(
             "Authentication OK, device info {}",
             String::from_utf8(response.into_payload())?
         );
