@@ -173,3 +173,36 @@ Courteous relicensing of the adb_client v3.2.2 fork. Replaced LICENSE with Apach
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Fix delayed_ack/CNXN version contradiction (Android 16 USB hang)
+
+**Date**: 2026-06-12
+**Task**: Fix delayed_ack/CNXN version contradiction (Android 16 USB hang)
+**Branch**: `main`
+
+### Summary
+
+External bug report: PersistentUsbConnection advertised delayed_ack while connecting CNXN at legacy version 0x0100_0000, but AOSP requires >= A_VERSION_SKIP_CHECKSUM (0x0100_0001) for windowed flow control. Android 16 adbd ignored the windowed OPEN -> open_session timed out after 10s. Fix (A)+(B): CNXN now connects at A_VERSION_SKIP_CHECKSUM iff features.delayed_ack; do_connect/do_auth return (device_version, banner) and negotiation is gated through new pure negotiate_delayed_ack() helper on device_version >= threshold. Added 5 sans-io regression tests. All quality gates green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `46d674f` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
