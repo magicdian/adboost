@@ -26,7 +26,7 @@ framebuffer = ["dep:image"]
 # host protocol to native `adb`/`scrcpy` clients, and bridge local services to a
 # device backend. The bundled `UsbDeviceBackend` rides on the `usb` stack, so
 # `server` implies `usb`. OFF by default — pure client users are unaffected.
-server = ["usb"]
+server = ["usb", "dep:futures-util"]
 # Optional convenience initializer (`init_tracing_from_env`); OFF by default.
 # The library itself never installs a subscriber — it stays a pure emitter.
 tracing-init = ["dep:tracing-subscriber"]
@@ -80,6 +80,13 @@ mdns-sd = { version = "0.19.2", default-features = false, features = [
 # USB-only dependencies
 nusb = { version = "0.2", features = ["tokio"], optional = true }
 num_enum = { version = "0.7.6" }
+#########
+#########
+# `server` feature-specific dependencies
+# `futures-util` drives nusb's hotplug `Stream` (StreamExt::next) in the default
+# USB backend's device-change subscription. Already in the tree (transitive); we
+# depend on it explicitly only when `server` is on.
+futures-util = { version = "0.3", default-features = false, optional = true }
 #########
 
 [dev-dependencies]
