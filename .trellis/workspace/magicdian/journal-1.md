@@ -206,3 +206,36 @@ External bug report: PersistentUsbConnection advertised delayed_ack while connec
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: Fix #2: magic-only message integrity (skip vestigial data_check at skip-checksum version)
+
+**Date**: 2026-06-12
+**Task**: Fix #2: magic-only message integrity (skip vestigial data_check at skip-checksum version)
+**Branch**: `main`
+
+### Summary
+
+External bug report #2: CRITICAL regression from 46d674f. Bumping USB CNXN to A_VERSION_SKIP_CHECKSUM (0x01000001) for delayed_ack activated the peer's skip-checksum mode (data_check sent as 0), but check_message_integrity() still compared data_crc32 -> every payload-bearing inbound frame failed 'Invalid integrity ... got 0', killing CNXN for all delayed_ack devices. Deep analysis (parallel code map + AOSP source verification + latent-bug hunt) confirmed AOSP never validates data_check on receive in any version and found the same defect would kill live-session WRTE/windowed-OKAY, AUTH, and reverse/OPEN frames (whole connection dies, not just CNXN). Fix: magic-only integrity check (AOSP-faithful), runs for every frame incl. zero-payload (closing a pre-existing magic-skip gap). One core change covers all receive paths; no version flag needed. Send path unchanged. Added 4 sans-io regression tests + new adb-wire-protocol-contract.md spec documenting the version/delayed_ack/data_check coupling behind both regressions. All quality gates green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `09ca21e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
+- **Total Sessions**: 7
 - **Last Active**: 2026-06-12
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~208 | Active |
+| `journal-1.md` | ~241 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-06-12 | Fix #2: magic-only message integrity (skip vestigial data_check at skip-checksum version) | `09ca21e` | `main` |
 | 6 | 2026-06-12 | Fix delayed_ack/CNXN version contradiction (Android 16 USB hang) | `46d674f` | `main` |
 | 5 | 2026-06-08 | Relicense fork to Apache-2.0 with upstream MIT attribution | `64d7186` | `main` |
 | 4 | 2026-06-05 | persistent.rs server capabilities: 6 Asks (delayed_ack, device-OPEN, raw channel, SYNC mux, shell-v2, honest banner) | `8e91437`, `c55edad` | `feat/persistent-server-capabilities` |
