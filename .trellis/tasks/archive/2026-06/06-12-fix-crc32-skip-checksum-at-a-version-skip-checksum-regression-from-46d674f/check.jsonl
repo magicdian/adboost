@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "verify sans-io test coverage, naming, comment density against the new magic-only contract"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify InvalidIntegrity still correct, no dead code, error-style compliance"}
