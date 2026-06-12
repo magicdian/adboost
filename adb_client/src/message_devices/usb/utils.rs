@@ -21,6 +21,11 @@ pub struct ADBDeviceInfo {
     pub product_id: u16,
     /// Textual description of the device
     pub device_description: String,
+    /// USB serial number (the device's iSerial descriptor) — this is the same
+    /// identifier `adb devices` shows. `None` when the device does not report a
+    /// serial. Required to disambiguate two devices sharing the same
+    /// `vendor_id`/`product_id`; see [`super::USBTransport::new_by_serial`].
+    pub serial: Option<String>,
 }
 
 /// Find and return a list of all connected Android devices with known interface class and subclass values
@@ -43,6 +48,9 @@ pub fn find_all_connected_adb_devices() -> Result<Vec<ADBDeviceInfo>> {
             vendor_id: device.vendor_id(),
             product_id: device.product_id(),
             device_description: format!("{manufacturer} {product}"),
+            // The iSerial descriptor is cached on the enumerated `DeviceInfo`
+            // (no device open needed), and is the identifier `adb devices` reports.
+            serial: device.serial_number().map(str::to_owned),
         });
     }
 

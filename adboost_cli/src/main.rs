@@ -200,8 +200,8 @@ async fn handle_usb_command(usb_command: models::UsbCommand) -> ADBCliResult<()>
         let devices = find_all_connected_adb_devices()?;
 
         let mut writer = TabWriter::new(stdout()).alignment(tabwriter::Alignment::Center);
-        writeln!(writer, "Index\tVendor ID\tProduct ID\tDevice Description")?;
-        writeln!(writer, "-----\t---------\t----------\t----------------")?;
+        writeln!(writer, "Index\tVendor ID\tProduct ID\tSerial\tDevice Description")?;
+        writeln!(writer, "-----\t---------\t----------\t------\t----------------")?;
 
         for (
             index,
@@ -209,12 +209,14 @@ async fn handle_usb_command(usb_command: models::UsbCommand) -> ADBCliResult<()>
                 vendor_id,
                 product_id,
                 device_description,
+                serial,
             },
         ) in devices.iter().enumerate()
         {
+            let serial = serial.as_deref().unwrap_or("-");
             writeln!(
                 writer,
-                "#{index}\t{vendor_id:04x}\t{product_id:04x}\t{device_description}",
+                "#{index}\t{vendor_id:04x}\t{product_id:04x}\t{serial}\t{device_description}",
             )?;
         }
 

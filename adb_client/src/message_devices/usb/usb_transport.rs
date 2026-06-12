@@ -87,6 +87,24 @@ impl USBTransport {
         )))
     }
 
+    /// Instantiate a new [`USBTransport`] selected by its USB serial number.
+    ///
+    /// Unlike [`Self::new`] (which matches on `vendor_id`/`product_id` and
+    /// returns the *first* match), this matches the device's iSerial descriptor
+    /// — the identifier `adb devices` shows — so it unambiguously selects one
+    /// device even when several share the same `vendor_id`/`product_id`.
+    pub async fn new_by_serial(serial: &str) -> Result<Self> {
+        for device_info in nusb::list_devices().await? {
+            if device_info.serial_number() == Some(serial) {
+                return Ok(Self::new_from_device(device_info));
+            }
+        }
+
+        Err(RustADBError::DeviceNotFound(format!(
+            "cannot find USB device with serial={serial}",
+        )))
+    }
+
     /// Instantiate a new [`USBTransport`] from a [`nusb::DeviceInfo`].
     ///
     /// Devices can be enumerated using [`nusb::list_devices()`] and then filtered out to get desired device.

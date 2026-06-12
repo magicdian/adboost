@@ -426,6 +426,21 @@ impl PersistentUsbConnection {
         Self::new_with_features(transport, private_key_path, features).await
     }
 
+    /// Create a persistent connection to the device with the given USB serial.
+    ///
+    /// Unlike [`Self::new_from_ids`], the serial unambiguously selects one
+    /// device even when several share the same `vendor_id`/`product_id` — it is
+    /// the identifier `adb devices` shows (see
+    /// [`USBTransport::new_by_serial`]). Advertises the honest
+    /// [`DeviceFeatureSet::default`] banner.
+    pub async fn new_from_serial(
+        serial: &str,
+        private_key_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let transport = USBTransport::new_by_serial(serial).await?;
+        Self::new(transport, private_key_path).await
+    }
+
     /// The feature set advertised to the device in the CNXN banner.
     #[must_use]
     pub fn device_features(&self) -> &DeviceFeatureSet {
