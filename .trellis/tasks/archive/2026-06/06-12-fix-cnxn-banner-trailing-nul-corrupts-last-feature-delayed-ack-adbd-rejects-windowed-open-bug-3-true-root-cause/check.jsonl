@@ -1,0 +1,2 @@
+{"file": "research/device-capture-and-aosp.md", "reason": "verify fix matches AOSP send_connect (no NUL) and the device capture"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "verify test updates + regression lock + comment correctness"}
