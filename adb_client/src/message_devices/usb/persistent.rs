@@ -77,6 +77,12 @@ const WRITER_CHANNEL_SIZE: usize = 256;
 /// Channel buffer size for the reader task's session-registry control queue.
 const CONTROL_CHANNEL_SIZE: usize = 64;
 
+/// Legacy ADB wire version; predates `delayed_ack` windowed flow control.
+const A_VERSION_LEGACY: u32 = 0x0100_0000;
+/// First ADB wire version that permits `delayed_ack` windowing
+/// (AOSP `A_VERSION_SKIP_CHECKSUM`). Windowing MUST NOT be enabled below this.
+const A_VERSION_SKIP_CHECKSUM: u32 = 0x0100_0001;
+
 /// Boxed predicate used to filter raw-tee'd messages for a subscriber.
 type RawFilter = Box<dyn Fn(&ADBTransportMessage) -> bool + Send>;
 
@@ -211,6 +217,26 @@ fn banner_advertises_delayed_ack(banner: &str) -> bool {
         .any(|features| features.split(',').any(|f| f.trim() == FEATURE_DELAYED_ACK))
 }
 
+/// Decide whether `delayed_ack` windowed flow control may be enabled.
+///
+/// Windowing requires agreement on BOTH the feature and the wire version:
+/// our end must advertise `delayed_ack` (`local_delayed_ack`), the device's
+/// CNXN banner must advertise it, and the negotiated wire version must be
+/// `>= A_VERSION_SKIP_CHECKSUM`. We connect at that version iff we advertise
+/// the feature, so `device_version` here is the effective min of both ends.
+/// Enabling windowing without the version makes adbd ignore the windowed OPEN
+/// (no OKAY → `open_session` times out) — the defect this gate prevents.
+/// Pure / I/O-free for unit testing (D1).
+fn negotiate_delayed_ack(
+    local_delayed_ack: bool,
+    device_banner: &str,
+    device_version: u32,
+) -> bool {
+    local_delayed_ack
+        && banner_advertises_delayed_ack(device_banner)
+        && device_version >= A_VERSION_SKIP_CHECKSUM
+}
+
 /// A persistent USB connection to an ADB device that supports concurrent sessions.
 ///
 /// Unlike the per-operation model in `ADBUSBDevice`, this holds the USB handle
@@ -281,11 +307,16 @@ impl PersistentUsbConnection {
 
         // Perform CNXN handshake; the device's banner tells us which features it
         // supports so we can negotiate `delayed_ack` (intersection of both ends).
-        let device_banner = Self::do_connect(&mut transport, &private_key, &features).await?;
+        let (device_version, device_banner) =
+            Self::do_connect(&mut transport, &private_key, &features).await?;
+        // Windowing is only valid once BOTH ends advertise `delayed_ack` AND the
+        // negotiated wire version is `>= A_VERSION_SKIP_CHECKSUM`. We advertise
+        // that version iff `features.delayed_ack`, so gating on `device_version`
+        // here is the effective min of the two ends.
         let delayed_ack_negotiated =
-            features.delayed_ack && banner_advertises_delayed_ack(&device_banner);
+            negotiate_delayed_ack(features.delayed_ack, &device_banner, device_version);
         log::debug!(
-            "PersistentUsb: delayed_ack negotiated = {delayed_ack_negotiated} (local={}, device_banner_has_it={})",
+            "PersistentUsb: delayed_ack negotiated = {delayed_ack_negotiated} (local={}, device_banner_has_it={}, device_version={device_version:#010x})",
             features.delayed_ack,
             banner_advertises_delayed_ack(&device_banner)
         );
@@ -439,13 +470,16 @@ impl PersistentUsbConnection {
 
     /// Perform CNXN+AUTH handshake on a connected transport.
     ///
-    /// Returns the device's CNXN banner string (used to negotiate features such
-    /// as `delayed_ack`).
+    /// Returns `(device_protocol_version, device_banner)`. The banner is used to
+    /// negotiate features such as `delayed_ack`; the version is taken from the
+    /// CNXN response header (`arg0`) so the caller can gate `delayed_ack`
+    /// windowing on the negotiated version (windowing is only valid at
+    /// `>= A_VERSION_SKIP_CHECKSUM`).
     async fn do_connect(
         transport: &mut USBTransport,
         private_key: &ADBRsaKey,
         features: &DeviceFeatureSet,
-    ) -> Result<String> {
+    ) -> Result<(u32, String)> {
         // Drain any stale messages from previous sessions on this USB pipe
         while let Ok(msg) = transport
             .read_message_with_timeout(Duration::from_millis(100))
@@ -461,11 +495,22 @@ impl PersistentUsbConnection {
         // (see `DeviceFeatureSet`). The trailing NUL matches a real adb server.
         let banner = features.to_banner_string();
 
+        // The CNXN wire version must agree with the `delayed_ack` feature: AOSP
+        // only permits windowed flow control at `>= A_VERSION_SKIP_CHECKSUM`.
+        // Advertising `delayed_ack` at the legacy version makes adbd ignore the
+        // windowed OPEN (no OKAY → open_session times out), so connect at the
+        // version that allows windowing iff we intend to use it.
+        let cnxn_version = if features.delayed_ack {
+            A_VERSION_SKIP_CHECKSUM
+        } else {
+            A_VERSION_LEGACY
+        };
+
         // Try CNXN up to 3 times (adbd may send stale CLSE after unclean disconnect)
         for attempt in 1..=3 {
             let cnxn_msg = ADBTransportMessage::try_new(
                 MessageCommand::Cnxn,
-                0x0100_0000, // A_VERSION
+                cnxn_version,
                 1_048_576,
                 banner.as_bytes(),
             )?;
@@ -479,7 +524,7 @@ impl PersistentUsbConnection {
                     log::debug!(
                         "PersistentUsb: unencrypted connection established, device banner: {dev_banner:?}"
                     );
-                    return Ok(dev_banner);
+                    return Ok((response.header().arg0(), dev_banner));
                 }
                 MessageCommand::Auth => {
                     log::debug!("PersistentUsb: authentication required");
@@ -508,11 +553,13 @@ impl PersistentUsbConnection {
         ))
     }
 
+    /// Returns `(device_protocol_version, device_banner)` from the accepted CNXN
+    /// response — see [`Self::do_connect`].
     async fn do_auth(
         transport: &mut USBTransport,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
-    ) -> Result<String> {
+    ) -> Result<(u32, String)> {
         if message.header().arg0() != AUTH_TOKEN {
             return Err(RustADBError::ADBRequestFailed(format!(
                 "AUTH message with type != TOKEN ({})",
@@ -528,7 +575,7 @@ impl PersistentUsbConnection {
         if received.header().command() == MessageCommand::Cnxn {
             let banner = String::from_utf8_lossy(received.payload()).into_owned();
             log::info!("PersistentUsb: auth OK (signature accepted), device banner: {banner:?}");
-            return Ok(banner);
+            return Ok((received.header().arg0(), banner));
         }
 
         // Send public key
@@ -544,7 +591,7 @@ impl PersistentUsbConnection {
         final_resp.assert_command(MessageCommand::Cnxn)?;
         let banner = String::from_utf8_lossy(final_resp.payload()).into_owned();
         log::info!("PersistentUsb: auth OK (public key accepted), device banner: {banner:?}");
-        Ok(banner)
+        Ok((final_resp.header().arg0(), banner))
     }
 
     /// Reader task: the single owner of the USB bulk-IN endpoint.
@@ -1746,6 +1793,59 @@ mod tests {
         assert!(
             !banner_advertises_delayed_ack("device::ro.product.name=sdk\0"),
             "a banner with no features= segment must not be detected"
+        );
+    }
+
+    // A banner that advertises delayed_ack (capable device).
+    const BANNER_WITH_DELAYED_ACK: &str =
+        "device::ro.product.name=test;features=shell_v2,cmd,delayed_ack";
+    // A banner that does not advertise delayed_ack (e.g. Android 11).
+    const BANNER_WITHOUT_DELAYED_ACK: &str = "device::ro.product.name=test;features=shell_v2,cmd";
+
+    #[test]
+    fn negotiate_delayed_ack_android16_capable_is_enabled() {
+        // Both ends advertise delayed_ack and the wire version is at the gate.
+        assert!(
+            negotiate_delayed_ack(true, BANNER_WITH_DELAYED_ACK, A_VERSION_SKIP_CHECKSUM),
+            "delayed_ack must be enabled when local+banner advertise it and version >= A_VERSION_SKIP_CHECKSUM"
+        );
+    }
+
+    #[test]
+    fn negotiate_delayed_ack_legacy_version_is_disabled() {
+        // Regression lock: device advertises delayed_ack but the negotiated wire
+        // version is legacy. Enabling windowing here makes adbd ignore the
+        // windowed OPEN (no OKAY → open_session times out). MUST stay false.
+        assert!(
+            !negotiate_delayed_ack(true, BANNER_WITH_DELAYED_ACK, A_VERSION_LEGACY),
+            "delayed_ack must NOT be enabled at A_VERSION_LEGACY even if the banner advertises it"
+        );
+    }
+
+    #[test]
+    fn negotiate_delayed_ack_no_banner_feature_is_disabled() {
+        // Android 11: capable wire version but the banner lacks delayed_ack.
+        assert!(
+            !negotiate_delayed_ack(true, BANNER_WITHOUT_DELAYED_ACK, A_VERSION_SKIP_CHECKSUM),
+            "delayed_ack must NOT be enabled when the device banner does not advertise it"
+        );
+    }
+
+    #[test]
+    fn negotiate_delayed_ack_local_opt_out_is_disabled() {
+        // Local end opted out even though the device is fully capable.
+        assert!(
+            !negotiate_delayed_ack(false, BANNER_WITH_DELAYED_ACK, A_VERSION_SKIP_CHECKSUM),
+            "delayed_ack must NOT be enabled when the local end did not advertise it"
+        );
+    }
+
+    #[test]
+    fn negotiate_delayed_ack_above_threshold_is_enabled() {
+        // A version strictly above the threshold with a capable banner.
+        assert!(
+            negotiate_delayed_ack(true, BANNER_WITH_DELAYED_ACK, A_VERSION_SKIP_CHECKSUM + 1),
+            "delayed_ack must be enabled for any version >= A_VERSION_SKIP_CHECKSUM with a capable banner"
         );
     }
 
