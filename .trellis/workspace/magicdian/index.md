@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 11
+- **Total Sessions**: 12
 - **Last Active**: 2026-06-12
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~373 | Active |
+| `journal-1.md` | ~413 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-06-12 | adboost ADB server capability + CLI server start/kill daemon | `6ebdfec`, `9b23064`, `68a80c1`, `0b24d8e`, `00d72b2`, `5efe2f6`, `0c5a86c`, `65c9736` | `feat/adboost-server-capability` |
 | 11 | 2026-06-12 | adboost_cli rebrand + async migration + persistent USB exerciser (subtask B) — real-device closed-loop verified | `19aa24a` | `main` |
 | 10 | 2026-06-12 | Library log->tracing migration (subtask A): emit-only, per-session local_id spans, RUST_LOG activation | `e4ed77d` | `main` |
 | 9 | 2026-06-12 | Bug #3 TRUE root cause: CNXN banner trailing NUL corrupted last feature (delayed_ack) — device-verified fix | `a0e39da` | `main` |

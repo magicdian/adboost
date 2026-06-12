@@ -371,3 +371,43 @@ Completed subtask B (capability work). Rebranded adb_cli -> adboost_cli (git mv)
 ### Next Steps
 
 - None - task complete
+
+
+## Session 12: adboost ADB server capability + CLI server start/kill daemon
+
+**Date**: 2026-06-12
+**Task**: adboost ADB server capability + CLI server start/kill daemon
+**Branch**: `feat/adboost-server-capability`
+
+### Summary
+
+Implemented USB-backed ADB server in adb_client (feature 'server', phases 1-4): host-protocol pure fns, DeviceBackend trait + UsbDeviceBackend (nusb hotplug), AdbServerFrontend accept loop + shell:/tcp: bridge, ServerCapabilities. Architecture refactor: renamed misleading server/server_device modules -> proxy (ADBProxyServer/ADBProxyDevice) to free the 'server' name. Added USB serial addressing. CLI gained 'server start/kill' as a re-exec detached daemon with PID file + signal shutdown. Validated end-to-end against two real devices (XPENG d02, Qualcomm SA8155P): adb devices/devices-l/shell all work. 110 unit + 4 doctests, clippy pedantic clean. Follow-up: host:forward family + pyadb/examples migration to proxy API.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6ebdfec` | (see git log) |
+| `9b23064` | (see git log) |
+| `68a80c1` | (see git log) |
+| `0b24d8e` | (see git log) |
+| `00d72b2` | (see git log) |
+| `5efe2f6` | (see git log) |
+| `0c5a86c` | (see git log) |
+| `65c9736` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
