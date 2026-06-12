@@ -239,3 +239,36 @@ External bug report #2: CRITICAL regression from 46d674f. Bumping USB CNXN to A_
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: Audit magic-only decision + harden USB receive path (data_length bound, reader fault-tolerance, bug #3 OPEN-rejection)
+
+**Date**: 2026-06-12
+**Task**: Audit magic-only decision + harden USB receive path (data_length bound, reader fault-tolerance, bug #3 OPEN-rejection)
+**Branch**: `main`
+
+### Summary
+
+User asked to confirm the magic-only fix was optimal/maintainable and whether latent issues remain. Ran an adversarial audit (3-way debate: defend magic-only / attack-prefer-version-aware / AOSP-faithful judge) + latent-bug hunt. Verdict: magic-only is the AOSP-faithful, lowest-maintenance optimal choice (AOSP check_header never validates data_check in any version; version-aware would add Arc<AtomicBool> hot-path state for a vestigial byte-sum -> rejected). Audit surfaced a CRITICAL pre-existing OOM (unbounded vec![0; data_length] before any check) and downstream reported bug #3 (windowed OPEN 10s hang). Root-caused bug #3 against AOSP source: report hypothesis 2a confirmed (adbd rejection A_CLSE(arg0=0,arg1=local_id) routed to data channel, open_session only awaited ack channel -> silent timeout); 2e refuted (adbd writes header/payload as separate bulk writes). Fixed: A) MAX_PAYLOAD bound (relocated to always-compiled module, shared pure helper) on USB+TCP before alloc; B) reader fault-tolerance (only InvalidIntegrity recoverable -- post-payload-read & frame-aligned; ConversionError/bound-error/IO stay fatal -- trellis-check caught the implementer wrongly marking ConversionError recoverable, a real desync bug in the fix); C) open_session biased select over ack_rx+data_rx for fast-fail on CLSE + read_exact non-discard guard. Honest: bug #3 is hang->fast-fail, not windowed-OPEN-forced-success (needs real-device usbmon capture). Spec adb-wire-protocol-contract.md extended with check_header two clauses, CLSE-routing, reader resync invariant. +4 tests. All gates green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6fec37e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
