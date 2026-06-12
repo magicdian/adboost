@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验收:clippy pedantic 全绿、MSRV、feature gate、测试覆盖与质量门槛"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "验收:host 协议回包语义正确性(三种 OKAY 变体/FAIL/transport-id 一致性/features 不 over-claim)"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "验收:proxy 重命名与新 server 模块布局符合目录/模块约定,无残留旧路径"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "验收:错误处理一致,无 unwrap/panic 滥用,daemon IO 错误正确传播"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "验收:server 前端->backend->PersistentUsbConnection 跨层数据流一致,CLI feature 透传正确"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "验收:确认复用既有 session/桥接原语,无重复实现设备侧传输/协议"}
+{"file": ".trellis/tasks/06-12-adboost-server-capability-cli-start-server-kill-server/prd.md", "reason": "验收对照:Acceptance Criteria 与决策项逐条核对"}

@@ -1,12 +1,12 @@
 use adb_client::{
     Result,
-    server::{ADBServer, DeviceShort, MDNSBackend, WaitForDeviceState},
+    proxy::{ADBProxyServer, DeviceShort, MDNSBackend, WaitForDeviceState},
 };
 
 use crate::models::{HostCommand, MdnsCommand, ServerCommand};
 
 pub async fn handle_host_commands(server_command: ServerCommand<HostCommand>) -> Result<()> {
-    let mut adb_server = ADBServer::new(server_command.address);
+    let mut adb_server = ADBProxyServer::new(server_command.address);
 
     match server_command.command {
         HostCommand::Version => {

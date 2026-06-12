@@ -35,7 +35,7 @@ const READ_CHUNK: usize = 65535;
 /// A decoded shell-v2 inner-frame channel id.
 ///
 /// Mirrors the AOSP `ShellProtocol::Id` values and the reference enum in
-/// `server_device/adb_server_device_commands.rs` (which only handles
+/// `proxy/adb_proxy_device_commands.rs` (which only handles
 /// stdout/stderr/exit-status). We additionally classify the host→device-only
 /// and interactive ids so the decoder can consume-and-ignore them on the
 /// device→host stream rather than erroring.
@@ -88,7 +88,7 @@ struct FrameHeader {
 /// Decode a 5-byte shell-v2 frame header: `[id:u8][len:u32 LE]`.
 ///
 /// Mirrors the reference parser in
-/// `server_device/adb_server_device_commands.rs:201-205` (1 byte channel + 4
+/// `proxy/adb_proxy_device_commands.rs:201-205` (1 byte channel + 4
 /// bytes LE size); ported here because that impl reads from a TCP
 /// `RawConnection` while this path reads from a USB [`MultiplexedSession`].
 /// Pure / I/O-free for unit testing.

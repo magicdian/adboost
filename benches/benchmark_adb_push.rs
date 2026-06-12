@@ -1,4 +1,4 @@
-use adb_client::server::ADBServer;
+use adb_client::proxy::ADBProxyServer;
 use anyhow::Result;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::{RngExt, rng};
@@ -36,7 +36,7 @@ fn generate_test_file(size_in_bytes: usize) -> Result<()> {
 /// drives the async API to completion via `block_on`.
 fn bench_adb_client_push(runtime: &tokio::runtime::Runtime) -> Result<()> {
     runtime.block_on(async {
-        let mut client = ADBServer::default();
+        let mut client = ADBProxyServer::default();
         let mut device = client.get_device().await?;
         let f = tokio::fs::File::open(LOCAL_TEST_FILE_PATH).await?;
         device.push(f, REMOTE_TEST_FILE_PATH).await?;
@@ -58,7 +58,7 @@ fn bench_adb_push_command() -> Result<()> {
     Ok(())
 }
 
-/// benchmarking `adb push INPUT DEST` and `adb_client` `ADBServerDevice.push(INPUT, DEST)`
+/// benchmarking `adb push INPUT DEST` and `adb_client` `ADBProxyDevice.push(INPUT, DEST)`
 fn benchmark_adb_push(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("cannot build tokio runtime");
 

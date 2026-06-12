@@ -1,10 +1,10 @@
-use adb_client::server_device::ADBServerDevice;
+use adb_client::proxy::ADBProxyDevice;
 use tokio::io::AsyncWrite;
 
 use crate::models::{ADBCliResult, ForwardCommand, LocalDeviceCommand, ReverseCommand};
 
 pub async fn handle_local_commands(
-    mut device: ADBServerDevice,
+    mut device: ADBProxyDevice,
     local_device_commands: LocalDeviceCommand,
 ) -> ADBCliResult<()> {
     match local_device_commands {

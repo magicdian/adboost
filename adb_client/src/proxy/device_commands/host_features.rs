@@ -1,0 +1,22 @@
+use crate::{
+    Result,
+    models::{ADBCommand, ADBHostCommand, HostFeatures},
+    proxy::ADBProxyDevice,
+};
+
+impl ADBProxyDevice {
+    /// Lists available ADB server features.
+    pub async fn host_features(&mut self) -> Result<Vec<HostFeatures>> {
+        self.set_serial_transport().await?;
+
+        let features = self
+            .transport
+            .proxy_connection(&ADBCommand::Host(ADBHostCommand::HostFeatures), true)
+            .await?;
+
+        Ok(features
+            .split(|x| x.eq(&b','))
+            .filter_map(|v| HostFeatures::try_from(v).ok())
+            .collect())
+    }
+}

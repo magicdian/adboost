@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     ADBTransport, Result, RustADBError, emulator::tcp_emulator_transport::TCPEmulatorTransport,
-    server_device::ADBServerDevice,
+    proxy::ADBProxyDevice,
 };
 use regex::Regex;
 
@@ -60,10 +60,10 @@ impl ADBEmulatorDevice {
     }
 }
 
-impl TryFrom<ADBServerDevice> for ADBEmulatorDevice {
+impl TryFrom<ADBProxyDevice> for ADBEmulatorDevice {
     type Error = RustADBError;
 
-    fn try_from(value: ADBServerDevice) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: ADBProxyDevice) -> std::result::Result<Self, Self::Error> {
         value.identifier.as_ref().map_or_else(
             || {
                 Err(RustADBError::DeviceNotFound(

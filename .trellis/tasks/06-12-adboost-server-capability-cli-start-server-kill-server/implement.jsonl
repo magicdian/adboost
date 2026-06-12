@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 server 前端模块 + 重命名 server->proxy 必须遵守 workspace/模块/mod.rs/models-commands 拆分约定"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "host 协议回包语义、CNXN/delayed_ack/features 通告耦合;features 默认诚实最小集的依据"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "新模块的 Result/RustADBError/CLI ADBCliError 错误处理需与既有一致;daemon/PID IO 错误"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "server accept 循环 / 桥接 / daemon 的 tracing 事件需遵守日志约定(库为纯 emitter)"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic、MSRV 1.88、feature gate(server)、测试风格、纯函数单测要求"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "RSA key / USB session 多路复用 / PersistentUsbConnection 状态约定;UsbDeviceBackend 复用既有连接"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "server 前端必须复用既有 PersistentUsbConnection/MultiplexedSession,而非重写设备侧传输"}
+{"file": ".trellis/tasks/06-12-adboost-server-capability-cli-start-server-kill-server/prd.md", "reason": "完整技术方案、4 phase 拆解、已确认事实与决策"}
+{"file": "/private/tmp/adboost-server-feature-request.md", "reason": "原始需求文档:DeviceBackend trait/UsbDeviceBackend/AdbServerFrontend/protocol 纯函数的参考实现与回包语义"}

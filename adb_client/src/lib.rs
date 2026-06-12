@@ -18,11 +18,10 @@ mod error;
 mod message_devices;
 mod models;
 
-/// Server-related definitions
-pub mod server;
-
-/// Device reachable by the server related definitions
-pub mod server_device;
+/// Proxy client: connects to and proxies commands through an **external** ADB
+/// server daemon (the classic `adb` server on `:5037`). This is a client, not a
+/// server — for adboost's own ADB server frontend, see a future `server` module.
+pub mod proxy;
 mod utils;
 
 /// MDNS-related definitions

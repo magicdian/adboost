@@ -9,8 +9,8 @@ mod utils;
 
 use adb_client::ADBDeviceExt;
 use adb_client::mdns::MDNSDiscoveryService;
-use adb_client::server::ADBServer;
-use adb_client::server_device::ADBServerDevice;
+use adb_client::proxy::ADBProxyServer;
+use adb_client::proxy::ADBProxyDevice;
 use adb_client::tcp::ADBTcpDevice;
 use adb_client::usb::{ADBDeviceInfo, ADBUSBDevice, find_all_connected_adb_devices};
 
@@ -154,15 +154,15 @@ async fn inner_main() -> ADBCliResult<()> {
             // Must start server to communicate with device, but only if this is a local one.
             let server_address_ip = server_command.address.ip();
             if server_address_ip.is_loopback() || server_address_ip.is_unspecified() {
-                ADBServer::start(&HashMap::default(), &None);
+                ADBProxyServer::start(&HashMap::default(), &None);
             }
 
             let device = if let Some(id) = server_command.transport_id {
-                ADBServerDevice::new_with_transport_id(id, Some(server_command.address))
+                ADBProxyDevice::new_with_transport_id(id, Some(server_command.address))
             } else if let Some(serial) = server_command.serial {
-                ADBServerDevice::new(serial, Some(server_command.address))
+                ADBProxyDevice::new(serial, Some(server_command.address))
             } else {
-                ADBServerDevice::autodetect(Some(server_command.address))
+                ADBProxyDevice::autodetect(Some(server_command.address))
             };
 
             match server_command.command {
