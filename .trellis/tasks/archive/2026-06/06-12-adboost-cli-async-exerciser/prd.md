@@ -25,10 +25,28 @@ reproducer + reference implementation.
 
 ### async migration
 - [ ] `main` becomes async (`#[tokio::main]`); all `ADBDeviceExt`/device calls migrated to
-      `.await` (`device.shell(...)?` → `device.shell(...).await?`, etc.).
-- [ ] All existing subcommands (server/host/local/emu/tcp/usb) compile & run against the async
-      `adb_client`. Where an API changed shape in the async rewrite, adapt the call site
-      (preserve behavior; do not delete functionality).
+      `.await`. Device CONSTRUCTORS are now async too (`ADBUSBDevice::new/autodetect/...`,
+      `ADBTcpDevice::new...`) → `.await` them.
+- [ ] **dyn-dispatch rebuild (architectural):** `ADBDeviceExt` is now async (AFIT +
+      `trait_variant::make(Send)`) and **NOT dyn-compatible** — `boxed()` / `Box<dyn
+      ADBDeviceExt>` were removed. The CLI currently funnels all device types into
+      `Box<dyn ADBDeviceExt>` → one `run_command`. **Decision: generic-ize**
+      `run_command` to `async fn run_command<D: ADBDeviceExt>(mut device: D, cmd: DeviceCommands)`
+      and call it from each `main` match arm (usb / tcp / server) with the concrete device
+      type. No new deps, compile-time monomorphized, idiomatic. The arms can no longer share a
+      single `Box` variable — restructure so each branch calls `run_command(concrete, cmd).await`.
+      (Rejected: `dynosaur` — extra dep + would touch the library trait; concrete enum — manual
+      dispatch boilerplate.)
+- [ ] **Byte-stream bridging:** `ADBDeviceExt` stream params are now
+      `tokio::io::{AsyncRead, AsyncWrite}` (+ `Pin<Box<dyn AsyncWrite + Send>>` for `shell`).
+      Bridge sync `File`/stdin/stdout via `tokio::fs::File` / `tokio::io::{stdin,stdout}` or
+      `tokio_util::compat`. Pull/Push file I/O → `tokio::fs`.
+- [ ] Server-side ops (`ADBServer`, `ADBServerDevice` host_features/get_logs/forward/reverse,
+      `handle_host_commands`/`handle_local_commands`/`handle_emulator_commands`) appear to remain
+      sync — keep them sync where the library API is still sync; only add `.await` where the
+      called API is actually async. Verify per-call.
+- [ ] All existing subcommands (server/host/local/emu/tcp/usb/mdns/version) compile & run.
+      Preserve behavior; do not delete functionality.
 
 ### persistent exerciser (the closed-loop value)
 - [ ] New subcommand (e.g. `adboost_cli usb-direct …` / `adboost_cli persistent …`) that builds
@@ -71,7 +89,15 @@ reproducer + reference implementation.
   shell_exec, open_shell_v2, open_session, device_features, subscribe_raw}`
   (`persistent.rs`); `ADBLocalCommand::ShellCommand("getprop".into(), vec![])` → `shell:getprop`.
 - Device used this session: MediaTek `0e8d:201c`, serial `YTGUSCNFMFAIK7ZP`.
-- nusb needs its `tokio` feature for real `connect()` (the diagnostic harness had to add it) —
-  check whether `adb_client`'s nusb dep enables it; if the CLI hits the "Awaiting blocking
-  syscall without an async runtime" panic, that nusb-feature gap must be fixed (likely in
-  `adb_client/Cargo.toml`, coordinate with subtask A / note as a found issue).
+- **CONFIRMED nusb-feature gap (prerequisite):** `adb_client/Cargo.toml:76` declares
+  `nusb = { version = "0.2", optional = true }` WITHOUT its `tokio` feature. Real USB
+  `connect()` then panics: "Awaiting blocking syscall without an async runtime: enable the
+  `smol` or `tokio` feature of nusb." (Hit this session in the diagnostic harness.) The
+  persistent exerciser exercises real USB, so this MUST be fixed: change to
+  `nusb = { version = "0.2", features = ["tokio"], optional = true }` in `adb_client`. This is
+  a real library bug (the async USB path can't actually connect without it) — fix it here as
+  part of B (or note it loudly). Verify the legacy `ADBUSBDevice` path and the persistent path
+  both connect after the fix.
+- Confirmed migration facts: `ADBUSBDevice::{new,autodetect,...}` are async; all three device
+  types impl async `ADBDeviceExt`; `Box<dyn ADBDeviceExt>` removed; ~17 device-method call
+  sites + the constructors need `.await`; `run_command` takes `Box<dyn ADBDeviceExt>` today.

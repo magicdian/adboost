@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-12-adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability/research/logging-approach.md", "reason": "CLI subscriber-install story: use adb_client::init_tracing_from_env() (tracing-init feature) so RUST_LOG works; library stays emit-only"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "persistent exerciser self-check fields (device_version, delayed_ack negotiated, banner, first frame after OPEN) + classic-vs-windowed flag map to this contract"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "post-tracing-migration logging conventions; CLI owns subscriber install"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, workspace member/CI conventions, test style"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "workspace layout / where the renamed adboost_cli crate fits"}

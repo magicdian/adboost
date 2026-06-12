@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "verify both crates green in CI, clippy pedantic, no lost functionality in the async migration"}
+{"file": ".trellis/tasks/06-12-adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability/research/logging-approach.md", "reason": "verify CLI installs subscriber correctly (library stays emit-only) and RUST_LOG works"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "verify exerciser self-check + classic/windowed flag match the protocol contract"}
