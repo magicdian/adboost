@@ -1,0 +1,29 @@
+{
+  "id": "adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability",
+  "name": "adboost-capability-adb-cli-closed-loop-validation-async-persistent-exerciser-controllable-library-observability",
+  "title": "adboost capability: adb_cli closed-loop validation (async + persistent exerciser) + controllable library observability",
+  "description": "",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "magicdian",
+  "assignee": "magicdian",
+  "createdAt": "2026-06-12",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-12-lib-tracing-migration",
+    "06-12-adboost-cli-async-exerciser"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
