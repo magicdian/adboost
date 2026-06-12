@@ -1,0 +1,5 @@
+{"file": "research/aosp-verified-facts.md", "reason": "AOSP-verified root cause + code anchors for all three fixes (A/B/C)"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "CNXN/delayed_ack/data_check contract; check_header includes the data_length<=MAX_PAYLOAD clause this task adds"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "sans-io (D1) test convention, naming, comment density"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError variant choice for bound/reject/desync errors"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "warn-level on skipped frames, debug/trace conventions for reader loop"}

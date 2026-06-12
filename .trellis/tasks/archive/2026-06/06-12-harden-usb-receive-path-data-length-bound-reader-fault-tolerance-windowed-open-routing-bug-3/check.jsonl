@@ -1,0 +1,3 @@
+{"file": "research/aosp-verified-facts.md", "reason": "verify fixes match the AOSP-confirmed semantics (CLSE arg layout, framing, check_header bound)"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "verify sans-io test coverage, naming, comment density, clippy pedantic"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify error variants/no dead code, fast-fail messages actionable"}
