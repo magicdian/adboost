@@ -19,8 +19,10 @@ pub mod protocol;
 
 mod backend;
 mod capabilities;
+mod frontend;
 mod usb_backend;
 
 pub use backend::{DeviceBackend, DeviceEntry, DeviceState};
 pub use capabilities::{KillPolicy, ServerCapabilities};
+pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
 pub use usb_backend::UsbDeviceBackend;

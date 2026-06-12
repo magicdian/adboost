@@ -72,6 +72,21 @@ pub fn transport_id_for(serial: &str, serials: &[String]) -> Option<u64> {
         .map(|i| (i + 1) as u64)
 }
 
+/// The inverse of [`transport_id_for`]: resolve a 1-based transport id to its
+/// serial over the **sorted** serial set. Returns `None` when `id` is 0 or out
+/// of range. Sharing the same sort here keeps `host:transport-id:N` /
+/// `host:tport` selection consistent with the ids shown by `devices-l`.
+#[must_use]
+pub fn transport_id_for_index(id: u64, serials: &[String]) -> Option<String> {
+    if id == 0 {
+        return None;
+    }
+    let mut sorted: Vec<&String> = serials.iter().collect();
+    sorted.sort();
+    let idx = usize::try_from(id - 1).ok()?;
+    sorted.get(idx).map(|s| (*s).clone())
+}
+
 /// Bytes for a host **data query** reply: `OKAY` + `%04x`+payload.
 ///
 /// `None` when the payload exceeds the 4-hex length ceiling (see
@@ -229,6 +244,32 @@ mod tests {
     fn transport_id_absent_serial_is_none() {
         let serials = vec!["a".to_string(), "b".to_string()];
         assert_eq!(transport_id_for("c", &serials), None);
+    }
+
+    #[test]
+    fn transport_id_for_index_is_inverse_of_transport_id_for() {
+        let serials = vec![
+            "emulator-5554".to_string(),
+            "192.168.1.5".to_string(),
+            "device1".to_string(),
+        ];
+        for s in ["192.168.1.5", "device1", "emulator-5554"] {
+            let id = transport_id_for(s, &serials).expect("id exists");
+            assert_eq!(
+                transport_id_for_index(id, &serials).as_deref(),
+                Some(s),
+                "id->serial must invert serial->id over the same sorted set"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_id_for_index_rejects_zero_and_out_of_range() {
+        let serials = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(transport_id_for_index(0, &serials), None);
+        assert_eq!(transport_id_for_index(3, &serials), None);
+        assert_eq!(transport_id_for_index(1, &serials).as_deref(), Some("a"));
+        assert_eq!(transport_id_for_index(2, &serials).as_deref(), Some("b"));
     }
 
     #[test]
