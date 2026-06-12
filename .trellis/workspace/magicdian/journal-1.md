@@ -272,3 +272,36 @@ User asked to confirm the magic-only fix was optimal/maintainable and whether la
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: Bug #3 TRUE root cause: CNXN banner trailing NUL corrupted last feature (delayed_ack) — device-verified fix
+
+**Date**: 2026-06-12
+**Task**: Bug #3 TRUE root cause: CNXN banner trailing NUL corrupted last feature (delayed_ack) — device-verified fix
+**Branch**: `main`
+
+### Summary
+
+User connected a real Android-16 device (adb/xdb servers killed) to capture ground truth for bug #3. Built a throwaway /tmp diagnostic harness using the public subscribe_raw frame-tee + open_session(shell:getprop). Capture settled it decisively: windowed OPEN got CLSE(arg0=0, arg1=local_id) in ~1.8ms (hypothesis 2a confirmed, 2e refuted -- frame teed cleanly); classic mode succeeded. AOSP source research found the ONLY immediate-CLSE-on-OPEN path (adb.cpp:507 SupportsDelayedAck() != bool(arg1)) and that SupportsDelayedAck() keys purely on the host CNXN banner features= list (not the protocol version). Deeper AOSP dig found the real bug: adbd's StringToFeatureSet splits the feature CSV on ',' WITHOUT trimming and never strips the CNXN banner's trailing NUL, so to_banner_string()'s trailing \0 corrupted the LAST token ('delayed_ack\0' != 'delayed_ack') -> SupportsDelayedAck() false -> windowed OPEN(arg1=32MiB) rejected. shell_v2 (first token) masked it. Proved by temporarily removing the NUL on-device: windowed OPEN then succeeded with a 4-byte windowed OKAY grant [00,00,00,02]=32MiB. Fixed to_banner_string() (drop \0), corrected the false 'matches real adb' doc/comment, updated 3 banner tests + added regression lock, re-verified end-to-end on-device with the committed code (open_session SUCCEEDED ~13ms). Removed the diag harness. spec adb-wire-protocol-contract.md: new no-NUL-banner contract + bug #3 marked RESOLVED. Downstream may now drop the delayed_ack=false workaround. All gates green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a0e39da` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
