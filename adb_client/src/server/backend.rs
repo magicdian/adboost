@@ -91,6 +91,43 @@ pub struct BackendCapabilities {
     /// The backend implements [`DeviceBackend::open_shell_v2`] (separated
     /// stdout/stderr + exit code).
     pub shell_v2: bool,
+    /// The backend implements the reverse family
+    /// ([`DeviceBackend::open_reverse`] etc. — device-initiated port forwarding).
+    pub reverse: bool,
+}
+
+/// Policy deciding which device-initiated reverse connections are accepted.
+///
+/// `reverse:` makes the *device* open connections back to a host target. A
+/// compromised or buggy device could try to reach an arbitrary host port, so the
+/// server validates each inbound `A_OPEN` against this policy before dialing.
+/// The library does not hard-code a choice — the caller picks the security
+/// posture; the bundled CLI uses [`ReversePolicy::RejectUnconfigured`].
+#[derive(Clone, Default)]
+pub enum ReversePolicy {
+    /// Accept only inbound opens whose target matches a reverse rule the client
+    /// explicitly configured (`reverse:forward:`). Anything else is closed. This
+    /// is the safe default and mirrors AOSP's allow-list hardening (minus its
+    /// process-abort).
+    #[default]
+    RejectUnconfigured,
+    /// Accept any device-initiated open (relay / advanced use). **Unsafe**: the
+    /// device may ask the server to connect to any local target. Opt in only
+    /// when the device is fully trusted.
+    AllowAll,
+    /// Caller-supplied predicate over the target endpoint string (e.g. `tcp:5201`).
+    /// Returning `true` accepts; `false` closes the stream.
+    Custom(std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for ReversePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RejectUnconfigured => f.write_str("RejectUnconfigured"),
+            Self::AllowAll => f.write_str("AllowAll"),
+            Self::Custom(_) => f.write_str("Custom(<fn>)"),
+        }
+    }
 }
 
 /// The device backend: the frontend gets its device list, change stream, and
@@ -179,6 +216,52 @@ pub trait DeviceBackend: Send + Sync + 'static {
             ))
         }
     }
+
+    /// Establish a reverse rule: ask the device to listen on `remote` (e.g.
+    /// `tcp:5201`) and tunnel inbound connections back to the host target
+    /// `local`. The backend owns the whole reverse data path — it sets up the
+    /// device listener, records the allow-list rule, and (lazily) runs the pump
+    /// that accepts device-initiated opens and bridges them to `local`.
+    ///
+    /// The default returns `unsupported`; set [`BackendCapabilities::reverse`]
+    /// and override to enable. Note the AOSP arg order: `remote` is the
+    /// device-listen endpoint, `local` is the host-connect target (opposite of
+    /// forward).
+    async fn open_reverse(&self, _serial: &str, _remote: &str, _local: &str) -> Result<()> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "reverse not supported by this backend".into(),
+            ))
+        }
+    }
+
+    /// Remove the reverse rule whose device-listen endpoint is `remote`.
+    async fn reverse_remove(&self, _serial: &str, _remote: &str) -> Result<()> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "reverse not supported by this backend".into(),
+            ))
+        }
+    }
+
+    /// Remove every reverse rule for `serial`.
+    async fn reverse_remove_all(&self, _serial: &str) -> Result<()> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "reverse not supported by this backend".into(),
+            ))
+        }
+    }
+
+    /// List active reverse rules for `serial` as the `host:list-forward` body
+    /// would render them (`(reverse) <remote> <local>\n` per rule).
+    async fn list_reverse(&self, _serial: &str) -> Result<String> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "reverse not supported by this backend".into(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +294,18 @@ mod tests {
             !caps.shell_v2,
             "shell_v2 must default to false (honest banner)"
         );
+        assert!(
+            !caps.reverse,
+            "reverse must default to false (honest banner)"
+        );
+    }
+
+    #[test]
+    fn reverse_policy_default_is_reject_unconfigured() {
+        // The safe default: only configured reverse targets are accepted.
+        assert!(matches!(
+            ReversePolicy::default(),
+            ReversePolicy::RejectUnconfigured
+        ));
     }
 }

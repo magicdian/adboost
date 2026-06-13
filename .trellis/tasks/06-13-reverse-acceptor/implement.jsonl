@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/06-13-reverse-acceptor/research/aosp-reverse-protocol.md", "reason": "Exact AOSP reverse wire protocol: client request string, device-initiated A_OPEN format, acceptor A_OKAY/A_CLSE framing, delayed_ack windowing, kill/list framing, lifecycle"}
+{"file": ".trellis/tasks/06-13-reverse-acceptor/research/adboost-acceptor-inventory.md", "reason": "Exact reuse map for accept_device_open: open_session walkthrough, incoming_opens, ReaderControl, session struct fields, FlowControl acceptor seeding — line-cited"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "delayed_ack/CNXN/data_check coupling — the acceptor-role windowed OKAY must get this right; this exact area caused 3 prior regressions"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError patterns for accept_device_open; reject = close stream not panic; CLI ADBCliError exhaustive match if a new variant is added"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "pedantic clippy, MSRV 1.88, inline test style, no unwrap on fallible paths, no new lock().unwrap()"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "accept_device_open mirrors open_session; reverse registry mirrors ForwardRegistry; bridge_session reused — avoid duplication"}

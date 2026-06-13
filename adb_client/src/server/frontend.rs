@@ -621,6 +621,12 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         service: &str,
         serial: &str,
     ) -> std::io::Result<()> {
+        // `reverse:*` is a control service handled against the backend's reverse
+        // API (the device binds the listener; the backend pumps inbound opens).
+        if service.starts_with("reverse:") {
+            return self.serve_reverse(&mut stream, service, serial).await;
+        }
+
         let cmd = match self.map_local_service(service) {
             Ok(cmd) => cmd,
             Err(reason) => {
@@ -678,18 +684,73 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 .map(ADBLocalCommand::TcpConnect)
                 .map_err(|_| format!("invalid tcp port: {port_str}"));
         }
-        // `reverse:*` is recognized but intentionally NOT served end-to-end: it
-        // needs host-side servicing of device-initiated OPENs (an acceptor API
-        // that does not exist yet) and unvalidated acceptor-role flow control.
-        // We give a DISTINCT, explicit FAIL rather than half-implement (which
-        // would make clients believe reverse succeeded while the tunnel is dead)
-        // and never advertise a reverse capability. See the task's
-        // research/p4-reverse-staging-decision.md for the completion plan.
-        if service.starts_with("reverse:") {
-            return Err("reverse not supported by this server".to_string());
-        }
+        // `reverse:*` is routed earlier (serve_reverse) and never reaches here.
         // jdwp/localabstract are not bridged. Everything else is a stable FAIL.
         Err(format!("service not supported: {service}"))
+    }
+
+    /// Handle a post-transport `reverse:*` control service against the backend.
+    ///
+    /// `reverse:forward:[norebind:]<remote>;<local>` sets up a device-side
+    /// listener (the backend owns the inbound-open pump + host-dial bridge);
+    /// `reverse:killforward:<remote>` / `reverse:killforward-all` remove rules;
+    /// `reverse:list-forward` lists them.
+    ///
+    /// Reply framing matches AOSP so native `adb` stays in sync: forward /
+    /// killforward / killforward-all reply **two** OKAYs (`okay_twice` — connect
+    /// then status; native adb reads both, the proxy client reads the first and
+    /// ignores the rest); `list-forward` replies a single OKAY + framed body.
+    /// Errors are a single FAIL.
+    async fn serve_reverse(
+        &self,
+        stream: &mut TcpStream,
+        service: &str,
+        serial: &str,
+    ) -> std::io::Result<()> {
+        let rest = &service["reverse:".len()..];
+        // reverse:list-forward → OKAY + framed body of "(reverse) <remote> <local>" lines.
+        if rest == "list-forward" {
+            return match self.backend.list_reverse(serial).await {
+                Ok(body) => {
+                    stream
+                        .write_all(&reply_or_overflow(protocol::okay_data(&body)))
+                        .await
+                }
+                Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+            };
+        }
+        // reverse:killforward-all
+        if rest == "killforward-all" {
+            return match self.backend.reverse_remove_all(serial).await {
+                Ok(()) => stream.write_all(&protocol::okay_twice()).await,
+                Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+            };
+        }
+        // reverse:killforward:<remote>
+        if let Some(remote) = rest.strip_prefix("killforward:") {
+            return match self.backend.reverse_remove(serial, remote).await {
+                Ok(()) => stream.write_all(&protocol::okay_twice()).await,
+                Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+            };
+        }
+        // reverse:forward:[norebind:]<remote>;<local>  (order: remote;local)
+        if let Some(arg) = rest.strip_prefix("forward:") {
+            let arg = arg.strip_prefix("norebind:").unwrap_or(arg);
+            let Some((remote, local)) = arg.split_once(';') else {
+                return stream
+                    .write_all(&protocol::fail(&format!("bad reverse forward: {arg}")))
+                    .await;
+            };
+            return match self.backend.open_reverse(serial, remote, local).await {
+                Ok(()) => stream.write_all(&protocol::okay_twice()).await,
+                Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+            };
+        }
+        stream
+            .write_all(&protocol::fail(&format!(
+                "unsupported reverse service: {service}"
+            )))
+            .await
     }
 }
 
@@ -797,23 +858,47 @@ async fn run_forward_listener<B: DeviceBackend>(
     }
 }
 
+/// Bridge an arbitrary host TCP stream to a device session — the reverse data
+/// path's host-dial side reuses the same bidirectional copy as the forward/local
+/// bridge. `pub(super)` so [`super::reverse`] can call it.
+pub(super) async fn bridge_session_public(
+    host: TcpStream,
+    session: crate::usb::MultiplexedSession,
+) {
+    bridge_session(host, session).await;
+}
+
 /// Bridge a client TCP socket to a device [`MultiplexedSession`] bidirectionally.
 ///
-/// Both halves are `AsyncRead`/`AsyncWrite`; when either direction ends, the
-/// other is aborted so the bridge tears down promptly.
+/// Both halves are `AsyncRead`/`AsyncWrite`. Each direction is copied
+/// independently; when one direction reaches EOF, the *write* half of the other
+/// peer is shut down (propagating the half-close as EOF) rather than aborting
+/// the opposite copy. This is essential for request/response and
+/// `echo … | nc`-style flows over `reverse`/`forward`: the client may close its
+/// send side after the request while still expecting the reply to flow back.
+/// The bridge ends only once BOTH directions complete.
 async fn bridge_session(client: TcpStream, session: crate::usb::MultiplexedSession) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let local_id = session.local_id();
     let (mut usb_read, mut usb_write) = session.into_split();
     let (mut client_read, mut client_write) = client.into_split();
 
-    let mut c2u =
-        tokio::spawn(async move { tokio::io::copy(&mut client_read, &mut usb_write).await });
-    let mut u2c =
-        tokio::spawn(async move { tokio::io::copy(&mut usb_read, &mut client_write).await });
+    // client → device, then signal EOF to the device by shutting its write half.
+    let c2u = tokio::spawn(async move {
+        let n = tokio::io::copy(&mut client_read, &mut usb_write).await;
+        tracing::trace!("bridge c2u (host→device) ended local_id={local_id}: {n:?}");
+        let _ = usb_write.shutdown().await;
+    });
+    // device → client, then signal EOF to the client.
+    let u2c = tokio::spawn(async move {
+        let n = tokio::io::copy(&mut usb_read, &mut client_write).await;
+        tracing::trace!("bridge u2c (device→host) ended local_id={local_id}: {n:?}");
+        let _ = client_write.shutdown().await;
+    });
 
-    tokio::select! {
-        _ = &mut c2u => u2c.abort(),
-        _ = &mut u2c => c2u.abort(),
-    }
+    // Wait for BOTH directions to finish so a late reply is not truncated.
+    let _ = tokio::join!(c2u, u2c);
 }
 
 #[cfg(test)]
@@ -849,6 +934,15 @@ mod tests {
             _cmd: &ADBLocalCommand,
         ) -> Result<crate::usb::MultiplexedSession> {
             unimplemented!("bridge path needs USB hardware; not exercised in unit tests")
+        }
+        // Reverse routing tests use these hardware-free stubs: list returns a
+        // canned body; the kill/forward arms just succeed so the frontend's
+        // reply framing can be asserted.
+        async fn list_reverse(&self, _serial: &str) -> Result<String> {
+            Ok("(reverse) tcp:5201 tcp:5201\n".to_string())
+        }
+        async fn reverse_remove_all(&self, _serial: &str) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -1180,20 +1274,83 @@ mod tests {
     }
 
     #[test]
-    fn map_local_service_reverse_and_jdwp_unsupported() {
+    fn map_local_service_jdwp_and_localabstract_unsupported() {
         let f = frontend_with_caps(
             ServerCapabilities::default()
                 .with_feature("sync_v2")
                 .with_shell_v2(),
         );
-        // reverse gets a DISTINCT, explicit reason (honest staged degradation),
-        // not the generic "service not supported". `ADBLocalCommand` has no
-        // `Debug`, so match the Result rather than using `expect_err`.
-        match f.map_local_service("reverse:forward:tcp:1;tcp:2") {
-            Err(reason) => assert_eq!(reason, "reverse not supported by this server"),
-            Ok(_) => panic!("reverse must FAIL (staged, not implemented end-to-end)"),
-        }
+        // reverse: is routed by serve_reverse before map_local_service, so it is
+        // not exercised here. jdwp/localabstract remain unbridged.
         assert!(f.map_local_service("jdwp:1234").is_err());
         assert!(f.map_local_service("localabstract:foo").is_err());
+    }
+
+    /// Select a transport then send one post-transport request, returning the
+    /// server's reply bytes. Used for the reverse control services, which arrive
+    /// after `host:transport:<serial>`.
+    async fn post_transport_round_trip(
+        frontend: Arc<AdbServerFrontend<MockBackend>>,
+        serial: &str,
+        post: &str,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = frontend.handle_client(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        // 1) select transport (bare OKAY).
+        let sel = format!("host:transport:{serial}");
+        client
+            .write_all(format!("{:04x}{sel}", sel.len()).as_bytes())
+            .await
+            .expect("write transport");
+        client.flush().await.expect("flush");
+        let mut okay = [0u8; 4];
+        client.read_exact(&mut okay).await.expect("transport OKAY");
+        assert_eq!(&okay, b"OKAY");
+        // 2) the post-transport service.
+        client
+            .write_all(format!("{:04x}{post}", post.len()).as_bytes())
+            .await
+            .expect("write post");
+        client.flush().await.expect("flush");
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf).await;
+        server.await.expect("server task");
+        buf
+    }
+
+    #[tokio::test]
+    async fn reverse_forward_routes_to_backend_and_okays() {
+        // MockBackend's open_reverse uses the trait default (unsupported) → FAIL,
+        // proving the request REACHES the backend (not a generic frontend reject).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = post_transport_round_trip(f, "dev1", "reverse:forward:tcp:5201;tcp:5201").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("reverse not supported"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn reverse_list_forward_frames_backend_body() {
+        // MockBackend.list_reverse returns a canned (reverse) line; the frontend
+        // must reply OKAY + framed body.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = post_transport_round_trip(f, "dev1", "reverse:list-forward").await;
+        assert_eq!(&resp[..4], b"OKAY", "list-forward is OKAY + framed body");
+        let body = String::from_utf8(resp[8..].to_vec()).unwrap();
+        assert!(body.contains("(reverse) tcp:5201 tcp:5201"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn reverse_killforward_all_okays() {
+        // MockBackend.reverse_remove_all returns Ok → two OKAYs (AOSP framing).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = post_transport_round_trip(f, "dev1", "reverse:killforward-all").await;
+        assert_eq!(resp, b"OKAYOKAY", "killforward-all success is two OKAYs");
     }
 }

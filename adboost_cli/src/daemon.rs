@@ -63,7 +63,11 @@ fn home_dir() -> Option<PathBuf> {
 /// file (process gone) yields `None` so callers treat the server as not running.
 #[must_use]
 pub fn running_pid(pid_file: &std::path::Path) -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pid_file).ok()?.trim().parse().ok()?;
+    let pid: u32 = std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     if is_alive(pid) { Some(pid) } else { None }
 }
 
@@ -204,16 +208,19 @@ async fn run_server(
 ) -> ADBCliResult<()> {
     tracing::info!(
         "adboost server {} on {address}",
-        if foreground { "running (foreground)" } else { "daemon serving" }
+        if foreground {
+            "running (foreground)"
+        } else {
+            "daemon serving"
+        }
     );
     let backend = Arc::new(UsbDeviceBackend::new());
     let frontend = AdbServerFrontend::builder(backend).addr(address).build();
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .map_err(|e| ADBCliError::from(format!("cannot install SIGTERM handler: {e}")))?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| ADBCliError::from(format!("cannot install SIGTERM handler: {e}")))?;
         tokio::select! {
             r = frontend.serve() => r.map_err(|e| ADBCliError::from(format!("server error: {e}")))?,
             _ = sigterm.recv() => tracing::info!("SIGTERM received; shutting down adb server"),

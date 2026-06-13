@@ -15,7 +15,7 @@
 //! | `sync:` (push/pull) | local (backend) | ✅ bridged verbatim, advertised as `sync_v2` only when the backend implements it |
 //! | `shell,v2` | local (backend) | ✅ bridged verbatim, advertised as `shell_v2` only when the backend implements it |
 //! | `host:forward` / `killforward` / `killforward-all` / `list-forward` | host (frontend) | ✅ host-side listener + per-conn bridge, AOSP double-OKAY framing, `tcp:0` auto-assign |
-//! | `reverse:*` | local + frontend | ⛔ recognized, returns an explicit FAIL (no host-side acceptor API yet); never advertised |
+//! | `reverse:forward` / `killforward` / `killforward-all` / `list-forward` | host (frontend) | ✅ device-initiated-OPEN acceptor + per-conn host-dial bridge; rule registry mirrors forward; `(reverse)` marker comes from the device. No new `host:features` flag (adb reverse has none); gated on `BackendCapabilities::reverse`. iperf3 reverse device-verified (sender+receiver both >0). |
 //!
 //! Optional features (`sync_v2` / `shell_v2`) are advertised in `host:features`
 //! **only** when the injected backend reports it implements them
@@ -37,9 +37,10 @@ mod backend;
 mod capabilities;
 mod forward;
 mod frontend;
+mod reverse;
 mod usb_backend;
 
-pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState};
+pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, ReversePolicy};
 pub use capabilities::{KillPolicy, ServerCapabilities};
 pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
 pub use usb_backend::UsbDeviceBackend;

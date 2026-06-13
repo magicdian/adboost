@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-13-reverse-acceptor/research/aosp-reverse-protocol.md", "reason": "Verify reply framing, arg ordering (arg0=our_id/arg1=device_id), window grant, (reverse) marker against AOSP"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Verify acceptor windowed OKAY + send-window seed from OPEN arg1 honors the delayed_ack contract"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify reject closes stream (no panic), errors follow RustADBError/ADBCliError conventions"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify clippy/test/MSRV gate"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Reverse spans frontend↔backend↔pump↔persistent + host-dial bridge; verify the inbound-OPEN data flow and lifecycle/teardown across layers"}

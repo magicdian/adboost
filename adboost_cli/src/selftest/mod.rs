@@ -20,6 +20,7 @@ mod channels;
 mod interactive;
 mod parity;
 mod report;
+mod reverse_cases;
 
 use std::time::{Duration, Instant};
 
@@ -154,11 +155,48 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
         let outcome = case_forward_control_plane(&mut device).await;
         run_one(reporter, "through_server", "forward_add_remove", outcome);
 
+        // Reverse data-plane: echo always (when the device has nc), iperf3 when
+        // present. A fixed device-listen port per device avoids collisions.
+        run_reverse_cases(reporter, &mut device).await;
+
         // Optional parity: drive the SAME adboost server with the official `adb`
         // client (auto-detected; SKIPPED when adb is absent).
         run_parity_against_server(reporter, server.addr(), serial).await;
     }
     // `server` dropped here → accept loop aborted, port freed.
+}
+
+/// Device-listen port used by the reverse data-plane cases (arbitrary high port
+/// unlikely to be in use on the device).
+const REVERSE_DEVICE_PORT: u16 = 47131;
+
+/// Run the reverse data-plane cases against `device` (through-server channel):
+/// `reverse_echo` (when the device has `nc`) then `reverse_iperf3` (when the
+/// device has `iperf3`). Each is SKIPPED with a reason when its tool is absent.
+async fn run_reverse_cases(reporter: &mut Reporter, device: &mut ADBProxyDevice) {
+    if reverse_cases::device_has_nc(device).await {
+        let outcome = reverse_cases::reverse_echo(device, REVERSE_DEVICE_PORT).await;
+        run_one(reporter, "through_server", "reverse_echo", outcome);
+    } else {
+        run_one(
+            reporter,
+            "through_server",
+            "reverse_echo",
+            Outcome::Skipped("device has no `nc` for the reverse echo client".into()),
+        );
+    }
+
+    if reverse_cases::device_has_iperf3(device).await {
+        let outcome = reverse_cases::reverse_iperf3(device, REVERSE_DEVICE_PORT).await;
+        run_one(reporter, "through_server", "reverse_iperf3", outcome);
+    } else {
+        run_one(
+            reporter,
+            "through_server",
+            "reverse_iperf3",
+            Outcome::Skipped("device has no `iperf3`".into()),
+        );
+    }
 }
 
 /// Run the official-adb parity case against the running adboost server, or

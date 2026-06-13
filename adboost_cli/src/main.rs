@@ -11,8 +11,8 @@ mod utils;
 
 use adb_client::ADBDeviceExt;
 use adb_client::mdns::MDNSDiscoveryService;
-use adb_client::proxy::ADBProxyServer;
 use adb_client::proxy::ADBProxyDevice;
+use adb_client::proxy::ADBProxyServer;
 use adb_client::tcp::ADBTcpDevice;
 use adb_client::usb::{ADBDeviceInfo, ADBUSBDevice, find_all_connected_adb_devices};
 
@@ -212,8 +212,14 @@ async fn handle_usb_command(usb_command: models::UsbCommand) -> ADBCliResult<()>
         let devices = find_all_connected_adb_devices()?;
 
         let mut writer = TabWriter::new(stdout()).alignment(tabwriter::Alignment::Center);
-        writeln!(writer, "Index\tVendor ID\tProduct ID\tSerial\tDevice Description")?;
-        writeln!(writer, "-----\t---------\t----------\t------\t----------------")?;
+        writeln!(
+            writer,
+            "Index\tVendor ID\tProduct ID\tSerial\tDevice Description"
+        )?;
+        writeln!(
+            writer,
+            "-----\t---------\t----------\t------\t----------------"
+        )?;
 
         for (
             index,

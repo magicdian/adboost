@@ -205,6 +205,21 @@ fn classify_message(
 /// Timeout for the OPEN → first-response handshake.
 const OPEN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The acceptor's initial send-window controller for a device-initiated OPEN.
+///
+/// Pure / I/O-free so the windowing decision can be unit tested (D1).
+/// `windowed` is the CONNECTION's `delayed_ack` mode (adbd gates its OKAY payloads
+/// on the connection level, so the session must match it to credit the send
+/// window from adbd's OKAYs). `initial_grant` is the device's OPEN `arg1` (often
+/// 0), the starting send credit; further credit arrives via adbd's OKAYs.
+fn acceptor_send_flow(windowed: bool, initial_grant: i64) -> FlowControl {
+    if windowed {
+        FlowControl::new_windowed(initial_grant)
+    } else {
+        FlowControl::new_classic()
+    }
+}
+
 /// Await the device's first response to an OPEN, racing the session's ACK and
 /// DATA channels (within [`OPEN_RESPONSE_TIMEOUT`]).
 ///
@@ -303,11 +318,12 @@ pub struct PersistentUsbConnection {
     /// AND the device's CNXN banner advertised it. When `false`, sessions use
     /// classic strict stop-and-wait. See [`FlowControl`].
     delayed_ack_negotiated: bool,
-    /// The single consumer side of the device-originated OPEN queue. `Option`
-    /// so it can be taken by [`Self::incoming_opens`]; subsequent calls return
-    /// an error. The matching sender lives in (and is kept alive by) the reader
+    /// The single consumer side of the device-originated OPEN queue. `Mutex<Option>`
+    /// so it can be taken by [`Self::incoming_opens`] through a shared `&self`
+    /// (the connection is typically held as `Arc`); subsequent calls return an
+    /// error. The matching sender lives in (and is kept alive by) the reader
     /// task, so the receiver reports disconnect once the reader stops.
-    pending_opens_rx: Option<mpsc::Receiver<ADBTransportMessage>>,
+    pending_opens_rx: std::sync::Mutex<Option<mpsc::Receiver<ADBTransportMessage>>>,
 }
 
 impl PersistentUsbConnection {
@@ -393,7 +409,7 @@ impl PersistentUsbConnection {
             writer_handle: Some(writer_handle),
             features,
             delayed_ack_negotiated,
-            pending_opens_rx: Some(pending_opens_rx),
+            pending_opens_rx: std::sync::Mutex::new(Some(pending_opens_rx)),
         })
     }
 
@@ -433,10 +449,7 @@ impl PersistentUsbConnection {
     /// the identifier `adb devices` shows (see
     /// [`USBTransport::new_by_serial`]). Advertises the honest
     /// [`DeviceFeatureSet::default`] banner.
-    pub async fn new_from_serial(
-        serial: &str,
-        private_key_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    pub async fn new_from_serial(serial: &str, private_key_path: Option<PathBuf>) -> Result<Self> {
         let transport = USBTransport::new_by_serial(serial).await?;
         Self::new(transport, private_key_path).await
     }
@@ -453,10 +466,13 @@ impl PersistentUsbConnection {
     /// every inbound `OPEN` whose target local id is not a known session
     /// (i.e. a device-initiated stream such as a `reverse:`/scrcpy connection,
     /// `A_OPEN(device_local_id, 0, "<dest>")`) into this queue. The caller
-    /// (typically the xdb server layer) decides whether to accept the stream
-    /// (reply `OKAY(device_local_id, host_local_id)` + register a session) or
-    /// reject it (reply `CLSE(0, device_local_id)`). This crate intentionally
-    /// implements no reverse policy.
+    /// decides whether to accept the stream — turn the OPEN into a session via
+    /// [`Self::accept_device_open`] — or reject it (reply `CLSE(0, device_local_id)`
+    /// via [`Self::send_raw`]). This crate intentionally implements no reverse
+    /// *policy* (which targets are allowed); that belongs to the caller.
+    ///
+    /// Takes `&self` (via interior mutability) so it works on an `Arc`-shared
+    /// connection. Single-consumer: the receiver can be taken once.
     ///
     /// The queue is bounded; on overflow the reader drops the *incoming* OPEN
     /// and logs a warning rather than blocking (a blocked reader would stall
@@ -465,13 +481,18 @@ impl PersistentUsbConnection {
     /// # Errors
     ///
     /// Returns [`RustADBError::ADBRequestFailed`] if the receiver has already
-    /// been taken by a previous call (there is a single consumer).
-    pub fn incoming_opens(&mut self) -> Result<mpsc::Receiver<ADBTransportMessage>> {
-        self.pending_opens_rx.take().ok_or_else(|| {
-            RustADBError::ADBRequestFailed(
-                "incoming_opens: receiver already taken (single consumer only)".into(),
-            )
-        })
+    /// been taken by a previous call (there is a single consumer), or
+    /// [`RustADBError::PoisonError`] if the guard mutex was poisoned.
+    pub fn incoming_opens(&self) -> Result<mpsc::Receiver<ADBTransportMessage>> {
+        self.pending_opens_rx
+            .lock()
+            .map_err(|_| RustADBError::PoisonError)?
+            .take()
+            .ok_or_else(|| {
+                RustADBError::ADBRequestFailed(
+                    "incoming_opens: receiver already taken (single consumer only)".into(),
+                )
+            })
     }
 
     /// Subscribe to a raw, filtered copy of every inbound message (low-level
@@ -690,11 +711,19 @@ impl PersistentUsbConnection {
         let mut raw_subscribers: Vec<RawSubscriber> = Vec::new();
 
         loop {
-            // A single ADB frame read is a cancel-safe atomic unit (nusb
-            // `next_complete` is cancel-safe; the transport wraps it in its own
-            // 1s timeout). We `select!` it against control-channel mutations so
-            // registry changes are applied promptly without ever holding a lock
-            // across the read `.await`.
+            // Apply any pending control-channel mutations FIRST, without
+            // cancelling an in-flight read. A multi-byte ADB frame read
+            // (header + `data_length` payload, possibly spanning many bulk
+            // transfers, plus the residual carry-over in `usb_transport`) is
+            // NOT cancel-safe: dropping `read_message_with_timeout` mid-frame
+            // discards the partial payload and desyncs the stream. Previously
+            // the read was `select!`ed against `control_rx`, so a `Register`/
+            // `Unregister` arriving mid-read (e.g. while accepting a second
+            // concurrent reverse session) cancelled and corrupted a large
+            // in-flight WRTE — one of two concurrent device→host bulk streams
+            // would silently stall at 0 bytes. Draining control between frames
+            // (the read's own 1s timeout bounds the wait) keeps each frame read
+            // atomic. Registration latency is at most one frame, which is short.
             let outcome = Self::read_or_control(
                 &mut transport,
                 &mut control_rx,
@@ -710,7 +739,7 @@ impl PersistentUsbConnection {
                 // `TransferError::Cancelled`, which the transport maps to
                 // `RustADBError::UsbTimeout`. `Control`: a control message was
                 // applied (registry already mutated). Both just keep looping.
-                ReadStep::ReadTimeout | ReadStep::Control => continue,
+                ReadStep::ReadTimeout => continue,
                 ReadStep::Closed => {
                     tracing::debug!("PersistentUsb reader: control channel closed, exiting");
                     break;
@@ -753,6 +782,18 @@ impl PersistentUsbConnection {
                 msg.payload().len()
             );
 
+            // Apply any control mutations that arrived DURING the (uninterruptible)
+            // frame read BEFORE classifying it. This preserves the
+            // register-before-route guarantee that `open_session` /
+            // `accept_device_open` rely on: they send `Register(local_id, ...)` and
+            // then the device replies; that reply frame may complete this read
+            // before the loop top drains control, so a `Register` could still be
+            // queued here. Draining now ensures the just-registered session is in
+            // `sessions` when its first frame is classified (otherwise the reply
+            // would misroute to the device-OPEN queue). A `Closed` result is
+            // handled on the next loop iteration after this frame is routed.
+            let _ = Self::drain_control(&mut control_rx, &mut sessions, &mut raw_subscribers);
+
             // Tee to raw subscribers first (orthogonal to the primary route).
             Self::tee_raw(&mut raw_subscribers, &msg);
 
@@ -777,6 +818,11 @@ impl PersistentUsbConnection {
                     }
                 }
                 RouteDecision::DeviceOpen => {
+                    tracing::debug!(
+                        "PersistentUsb: device-originated OPEN arg0={} payload_len={}",
+                        msg.header().arg0(),
+                        msg.payload().len()
+                    );
                     // Bounded queue, overflow policy = drop the incoming OPEN
                     // (the reader can never block on a full queue).
                     if pending_opens_tx.try_send(msg).is_err() {
@@ -797,37 +843,65 @@ impl PersistentUsbConnection {
         tracing::debug!("PersistentUsb reader task exiting");
     }
 
-    /// Await either the next USB frame or the next reader-control message,
-    /// applying control messages to the registry directly (so no lock crosses
-    /// the read `.await`).
+    /// Drain pending control-channel mutations, then read the next USB frame to
+    /// completion.
+    ///
+    /// Control messages are applied to the registry first and non-blockingly
+    /// (`try_recv` loop), so they never cancel an in-flight frame read — a frame
+    /// read is NOT cancel-safe (see [`Self::reader_loop`]). The read then runs to
+    /// completion under its own 1s timeout, which both bounds how long a freshly
+    /// queued control message waits and lets a closed control channel be noticed
+    /// between frames.
     async fn read_or_control(
         transport: &mut USBTransport,
         control_rx: &mut mpsc::Receiver<ReaderControl>,
         sessions: &mut HashMap<u32, SessionChannels>,
         raw_subscribers: &mut Vec<RawSubscriber>,
     ) -> ReadStep {
-        tokio::select! {
-            biased;
-            ctrl = control_rx.recv() => match ctrl {
-                Some(ReaderControl::Register(id, channels)) => {
+        // 1. Apply all currently-queued control mutations without awaiting.
+        if matches!(
+            Self::drain_control(control_rx, sessions, raw_subscribers),
+            ControlDrain::Closed
+        ) {
+            return ReadStep::Closed;
+        }
+
+        // 2. Read one full frame to completion (atomic, never cancelled by a
+        //    control message mid-frame). The 1s timeout returns control to the
+        //    loop so newly-queued control mutations are applied between frames.
+        match transport
+            .read_message_with_timeout(Duration::from_secs(1))
+            .await
+        {
+            Ok(msg) => ReadStep::Message(msg),
+            Err(RustADBError::UsbTimeout) => ReadStep::ReadTimeout,
+            Err(e) => ReadStep::ReadError(e),
+        }
+    }
+
+    /// Apply every currently-queued [`ReaderControl`] mutation to the registry
+    /// without awaiting (non-cancelling). Returns [`ControlDrain::Closed`] if the
+    /// control channel has been disconnected (all senders dropped → the
+    /// connection is shutting down).
+    fn drain_control(
+        control_rx: &mut mpsc::Receiver<ReaderControl>,
+        sessions: &mut HashMap<u32, SessionChannels>,
+        raw_subscribers: &mut Vec<RawSubscriber>,
+    ) -> ControlDrain {
+        loop {
+            match control_rx.try_recv() {
+                Ok(ReaderControl::Register(id, channels)) => {
                     sessions.insert(id, channels);
-                    ReadStep::Control
                 }
-                Some(ReaderControl::Unregister(id)) => {
+                Ok(ReaderControl::Unregister(id)) => {
                     sessions.remove(&id);
-                    ReadStep::Control
                 }
-                Some(ReaderControl::Subscribe(sub)) => {
+                Ok(ReaderControl::Subscribe(sub)) => {
                     raw_subscribers.push(sub);
-                    ReadStep::Control
                 }
-                None => ReadStep::Closed,
-            },
-            read = transport.read_message_with_timeout(Duration::from_secs(1)) => match read {
-                Ok(msg) => ReadStep::Message(msg),
-                Err(RustADBError::UsbTimeout) => ReadStep::ReadTimeout,
-                Err(e) => ReadStep::ReadError(e),
-            },
+                Err(mpsc::error::TryRecvError::Empty) => return ControlDrain::Drained,
+                Err(mpsc::error::TryRecvError::Disconnected) => return ControlDrain::Closed,
+            }
         }
     }
 
@@ -1065,6 +1139,121 @@ impl PersistentUsbConnection {
         })
     }
 
+    /// Accept a **device-initiated** `OPEN` (the acceptor role — the mirror of
+    /// [`Self::open_session`]'s opener role), returning a bridgeable
+    /// [`MultiplexedSession`].
+    ///
+    /// `open_msg` is an `A_OPEN(arg0 = device_local_id, arg1 = window|0,
+    /// payload = "<dest>\0")` taken from [`Self::incoming_opens`] (e.g. a
+    /// `reverse:` connection the device originated). This method does NOT send an
+    /// `OPEN`; instead it:
+    ///
+    /// 1. takes `remote_id` from the OPEN's `arg0` (the device's local id),
+    /// 2. allocates our own `local_id` and registers the session BEFORE replying
+    ///    (so the device's subsequent `WRTE`/`OKAY`, which target our `local_id`
+    ///    in their `arg1`, route to this session rather than back to the
+    ///    incoming-OPEN queue),
+    /// 3. replies `A_OKAY(arg0 = our local_id, arg1 = remote_id, payload =
+    ///    32 MiB window grant when delayed_ack)`,
+    /// 4. seeds the send window from the OPEN's `arg1` (the device's grant to us)
+    ///    under `delayed_ack` — so we may immediately write toward the device.
+    ///
+    /// Arg ordering follows [`Self::open_session`]'s ready-OKAY (`arg0 = ours`,
+    /// `arg1 = device's`); the reader routes by `arg1`. To *reject* an OPEN
+    /// instead, the caller sends `A_CLSE(0, device_local_id)` via
+    /// [`Self::send_raw`] and does not call this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RustADBError::SendError`] if a background task is gone, or a
+    /// transport/encoding error while building the reply.
+    #[tracing::instrument(name = "accept", skip(self, open_msg), fields(local_id))]
+    pub async fn accept_device_open(
+        &self,
+        open_msg: &ADBTransportMessage,
+    ) -> Result<MultiplexedSession> {
+        // The device's local id (its socket) becomes our remote id.
+        let remote_id = open_msg.header().arg0();
+        // Windowing is a CONNECTION-level property: AOSP gates the OKAY payload on
+        // `t->SupportsDelayedAck()` (adb.cpp send_ready), and adbd's own OKAYs to
+        // us carry a 4-byte window delta whenever the connection negotiated
+        // delayed_ack — regardless of this OPEN's arg1. So the session must use
+        // the connection's mode (otherwise a 4-byte OKAY from adbd is rejected by
+        // `on_okay_payload` and our send window is never credited → we can never
+        // write toward the device). The OPEN's arg1 is only the *initial* send
+        // grant (0 here = we wait for adbd's first OKAY to gain send credit, same
+        // as the opener seeding from the device's first OKAY).
+        let windowed = self.delayed_ack_negotiated;
+        let initial_send_grant = if windowed {
+            i64::from(open_msg.header().arg1())
+        } else {
+            0
+        };
+
+        let local_id: u32 = {
+            let mut rng = rand::rng();
+            rng.random()
+        };
+        tracing::Span::current().record("local_id", local_id);
+
+        let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (ack_tx, ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+
+        // Register BEFORE replying so the device's follow-up frames (targeting
+        // our local_id) route here, not back into the incoming-OPEN queue.
+        self.control_tx
+            .send(ReaderControl::Register(
+                local_id,
+                SessionChannels { data_tx, ack_tx },
+            ))
+            .await
+            .map_err(|_| RustADBError::SendError)?;
+
+        // Our send window: in windowed mode it starts from the device's initial
+        // grant (OPEN arg1, often 0) and is credited by adbd's subsequent OKAYs;
+        // in classic mode it is stop-and-wait.
+        let send_flow = acceptor_send_flow(windowed, initial_send_grant);
+
+        // Reply OKAY granting the device our receive window (32 MiB under
+        // delayed_ack; empty payload in classic mode). Match the device's
+        // per-stream windowing (see above) so adbd does not reject the OKAY.
+        let ready_payload = encode_okay_payload(
+            windowed,
+            usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX),
+        );
+        let ready_msg = ADBTransportMessage::try_new(
+            MessageCommand::Okay,
+            local_id,
+            remote_id,
+            &ready_payload,
+        )?;
+        if let Err(e) = self.writer.try_send_fire_forget(ready_msg) {
+            self.unregister_session(local_id).await;
+            return Err(RustADBError::IOError(e));
+        }
+
+        let inner = SessionInner {
+            local_id,
+            remote_id,
+            writer: self.writer.clone(),
+            control_tx: self.control_tx.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+            // Per-stream windowing (matches the OKAY we just sent), not the
+            // connection-level flag.
+            windowed,
+        };
+
+        Ok(MultiplexedSession {
+            shared: Arc::new(inner),
+            data_rx,
+            ack_rx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            send_flow,
+            write_state: WriteState::Idle,
+        })
+    }
+
     /// Open a SYNC v1 file-transfer session multiplexed on this connection.
     ///
     /// Returns a [`SyncSession`] for `adb push`/`adb pull`. It opens a normal
@@ -1160,13 +1349,21 @@ impl PersistentUsbConnection {
     }
 }
 
-/// Outcome of a single reader `select!` step.
+/// Outcome of a single reader step (drain control, then read one frame).
 enum ReadStep {
     Message(ADBTransportMessage),
     ReadTimeout,
-    Control,
     Closed,
     ReadError(RustADBError),
+}
+
+/// Result of draining the reader's control channel (non-cancelling).
+#[derive(Debug, PartialEq, Eq)]
+enum ControlDrain {
+    /// All queued control messages applied; channel still open.
+    Drained,
+    /// The control channel is disconnected (connection shutting down).
+    Closed,
 }
 
 impl Drop for PersistentUsbConnection {
@@ -1851,6 +2048,40 @@ mod tests {
             RouteDecision::Unknown,
             "non-OPEN message to an unknown session id must be dropped"
         );
+    }
+
+    #[test]
+    fn acceptor_send_flow_windowed_seeds_from_initial_grant() {
+        // Windowed (connection delayed_ack) seeds the send window from the OPEN's
+        // arg1 initial grant; adbd's later OKAYs credit it further.
+        let grant = 32 * 1024 * 1024i64;
+        let fc = acceptor_send_flow(true, grant);
+        assert!(
+            fc.is_windowed(),
+            "delayed_ack must produce a windowed controller"
+        );
+        assert_eq!(
+            fc.available_bytes(),
+            Some(grant),
+            "acceptor send window must seed from the OPEN arg1 initial grant"
+        );
+    }
+
+    #[test]
+    fn acceptor_send_flow_windowed_zero_initial_grant() {
+        // The common reverse case: OPEN arg1=0 → windowed but 0 initial credit,
+        // waiting for adbd's first OKAY to gain send credit.
+        let fc = acceptor_send_flow(true, 0);
+        assert!(fc.is_windowed(), "still windowed at the connection level");
+        assert_eq!(fc.available_bytes(), Some(0), "0 initial send credit");
+    }
+
+    #[test]
+    fn acceptor_send_flow_classic_is_stop_and_wait() {
+        // Without delayed_ack the grant is ignored and the controller is classic.
+        let fc = acceptor_send_flow(false, 0);
+        assert!(!fc.is_windowed(), "classic mode must not be windowed");
+        assert_eq!(fc.available_bytes(), None, "classic mode tracks no window");
     }
 
     #[tokio::test]

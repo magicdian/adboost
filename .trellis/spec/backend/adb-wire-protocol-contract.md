@@ -213,13 +213,51 @@ stream **frame-aligned**. The framing rule, from the read order
 > error that you `continue` past leaves orphaned payload bytes that desync every
 > subsequent frame. When unsure an error preserves framing, keep it fatal.
 
-## read_exact must not silently discard
+## read_exact must CARRY over-read bytes, never discard or fatal
 
-`read_exact` must error (`"USB frame desync: ..."`) if a single bulk completion
-returns more bytes than requested, not silently truncate. AOSP adbd writes the
-24-byte header and the payload as **separate** bulk writes (the 24-byte header is a
-short packet terminating its transfer), so a compliant device never over-delivers;
-the guard surfaces non-compliant firmware loudly instead of desyncing.
+`read_exact` must copy out exactly what the current frame field needs and **stash
+any overshoot** in a persistent residual buffer (`Connection::read_residual`),
+consuming it first on the next read. It must NOT discard the extra bytes and must
+NOT raise a fatal "frame desync" error on over-read.
+
+A single bulk IN completion can legitimately return MORE bytes than the field we
+logically requested: `nusb` requires the requested length to be a nonzero multiple
+of `max_packet_size`, so a 24-byte header read requests a full `max_packet_size`
+buffer, and under sustained **device→host bulk throughput (the `reverse` data
+plane)** the device/host controller coalesces a frame's payload tail and the next
+frame's header (or the start of the next payload) into one transfer. The earlier
+assumption that "AOSP adbd writes header and payload as separate bulk writes so a
+compliant device never over-delivers" was WRONG on the IN path: the over-read
+happened on a real Android 16 device the instant the first large reverse WRTE
+arrived, and the fatal-error guard tore down the **whole multiplexed connection**
+(every session's channel closed → 0 bytes transferred). Carrying the overshoot is
+the correct, normal buffered-reader behavior and keeps the framed stream aligned.
+
+The pure copy/carry logic is `fill_and_carry(received, dst, residual)`
+(`usb_transport.rs`), unit-tested for exact-fit, overshoot, short-packet, and
+residual-append cases.
+
+## Reader frame reads must be atomic — never `select!`ed against control mid-frame
+
+The persistent reader's per-frame read (`read_message_with_timeout`: header +
+`data_length` payload across many bulk transfers + the residual carry-over) is
+**NOT cancel-safe**: dropping it mid-frame discards the partial payload and
+desyncs the stream. The reader must therefore drain `control_rx`
+(`Register`/`Unregister`/`Subscribe`) **between** frames (non-blocking `try_recv`
+loop), NOT race it against the read in a `tokio::select!`. Racing them was a real
+bug: a `Register`/`Unregister` arriving while the reader was mid-way through a
+large device→host WRTE (e.g. accepting a second concurrent `reverse` session, or
+iperf3's parallel control+data connections) cancelled and corrupted the in-flight
+frame — one of two concurrent device→host bulk streams silently stalled at 0
+bytes (device-reproduced; iperf3 reverse showed `sender>0, receiver 0`).
+
+To preserve the register-before-route guarantee (`open_session` /
+`accept_device_open` send `Register(local_id)` then the device replies), the
+reader also drains control **again right before classifying** each freshly-read
+frame, so a `Register` that was queued during the uninterruptible read is applied
+before its session's first frame is routed (otherwise the reply misroutes to the
+device-OPEN queue). Frame-read latency bounds how long a queued control message
+waits, which is short.
 
 ## Bug #3 status: RESOLVED (root cause found + device-verified)
 

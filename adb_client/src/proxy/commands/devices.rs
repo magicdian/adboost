@@ -4,8 +4,8 @@ use crate::{
     Result, RustADBError,
     emulator::ADBEmulatorDevice,
     models::{ADBCommand, ADBHostCommand},
-    proxy::{ADBProxyServer, DeviceLong, DeviceShort},
     proxy::ADBProxyDevice,
+    proxy::{ADBProxyServer, DeviceLong, DeviceShort},
 };
 
 impl ADBProxyServer {

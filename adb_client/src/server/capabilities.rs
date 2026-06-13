@@ -187,6 +187,7 @@ mod tests {
         let caps = ServerCapabilities::default().negotiated_with(BackendCapabilities {
             sync: true,
             shell_v2: true,
+            ..Default::default()
         });
         let csv = caps.features_csv();
         assert!(
@@ -217,6 +218,7 @@ mod tests {
         let caps = ServerCapabilities::default().negotiated_with(BackendCapabilities {
             sync: true,
             shell_v2: false,
+            ..Default::default()
         });
         let csv = caps.features_csv();
         assert!(csv.contains("sync_v2"), "sync backend advertises sync_v2");

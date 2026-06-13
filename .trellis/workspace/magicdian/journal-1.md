@@ -474,3 +474,61 @@ the server's cached claims. Live result: 18 passed / 3 skipped on both devices.
 ### Status
 
 [OK] **Completed** — pending user acceptance.
+
+---
+
+## 2026-06-13 — P4 reverse end-to-end (subtask 06-13-reverse-acceptor)
+
+**Task**: `06-13-reverse-acceptor` (subtask of the 06-12 capability expansion).
+
+### Summary
+
+Replaced the staged reverse FAIL with a real, device-validated end-to-end
+implementation. `adb reverse` now works through adboost's server: iperf3 reverse
+measured **335 Mbits/sec** (sender) / **322 Mbits/sec** (receiver) on a real
+device — on par with official adb.
+
+- **accept_device_open** (acceptor role) in PersistentUsbConnection: mirror of
+  open_session minus OPEN send/await; AOSP-verified arg order (OKAY arg0=our_id,
+  arg1=device_id); windowing keyed on connection-level delayed_ack; send-window
+  seeded from the OPEN arg1 grant.
+- **incoming_opens** changed to `&self` (Mutex<Option>) so an Arc-shared backend
+  can pump device-initiated OPENs.
+- **DeviceBackend** reverse API (open_reverse/reverse_remove/reverse_remove_all/
+  list_reverse) + `BackendCapabilities::reverse` + **ReversePolicy** (library-
+  configurable security: RejectUnconfigured default / AllowAll / Custom; CLI uses
+  RejectUnconfigured). UsbDeviceBackend owns the reverse data path: lazy per-serial
+  ReverseState (rules + inbound-open pump), accept → dial host → bridge.
+- **frontend** routes reverse:forward/killforward*/list-forward to the backend,
+  AOSP double-OKAY framing (native adb stays in sync), single OKAY+body for list.
+- **selftest**: reverse_echo (always) + reverse_iperf3 (auto when device has it),
+  both PASS on both real devices.
+
+### Two protocol bugs found + fixed on the device (and captured in the spec)
+
+1. **read_exact over-read**: a bulk IN completion can return MORE than the
+   requested field (max_packet_size alignment + controller coalescing under
+   sustained device→host throughput). The old fatal "frame desync" guard tore
+   down the whole multiplexed connection on the first large reverse WRTE. Fixed
+   with a residual carry-buffer (`fill_and_carry`, unit-tested). The prior spec
+   assumption ("adbd writes header/payload separately so never over-delivers")
+   was WRONG on the IN path — spec corrected.
+2. **reader frame reads were select!ed against control_rx** → not cancel-safe; a
+   Register/Unregister mid-frame corrupted an in-flight WRTE, stalling one of two
+   concurrent device→host streams. Fixed: drain control between frames (non-
+   cancelling), re-drain before classify to keep register-before-route. Spec
+   updated with the atomic-frame-read contract.
+   (+ defensive `read_residual.clear()` on connect/disconnect so a fresh CNXN
+   never consumes a stale frame.)
+
+### Testing
+
+- adb_client 154 unit + 4 doctests (default & server); 86 (usb, incl. fill_and_carry).
+- selftest on 2 real devices: reverse_echo + reverse_iperf3 PASS; 0 failures.
+  (usb_direct flaky-skips on the Qualcomm device — pre-existing PersistentUsbConnection
+  rapid-reclaim timing, not the reverse work; XPENG passes it.)
+- fmt clean; clippy pedantic clean on default / server / usb.
+
+### Status
+
+[OK] **Completed** — reverse end-to-end working, pending user acceptance.
