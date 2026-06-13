@@ -566,3 +566,38 @@ Expanded the adboost ADB server frontend per the follow-up capabilities FR: P1 h
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: Export composable usb::ReverseEngine for external DeviceBackend impls
+
+**Date**: 2026-06-13
+**Task**: Export composable usb::ReverseEngine for external DeviceBackend impls
+**Branch**: `main`
+
+### Summary
+
+Promoted the reverse data path from a server-private state machine to a public, per-connection usb::ReverseEngine (new + open/remove/remove_all/list) so any acts-as-a-server backend (xdb) delegates reverse in four lines, symmetric with sync/shell_v2. PR1: moved ReversePolicy to usb:: (server:: re-export) and extracted the shared half-close bridge as pub usb::bridge_tcp_session. PR2+3: ReverseEngine body (absorbs run_reverse_command; pump dials via bridge_tcp_session; rule/policy split into connection-free RuleSet for hardware-free tests), UsbDeviceBackend delegates, server/reverse.rs deleted, no_run doctest. Documented the key contract in spec: reverse data-plane belongs to whoever is the device's server — proxy-style backends forward the reverse: command instead of using the engine, to avoid racing for single-consumer incoming_opens. 158 tests + 5 doctests + clippy (default/usb/server) green; no wire-protocol change.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3e96e47` | (see git log) |
+| `ec22bd2` | (see git log) |
+| `c19e7c6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
+- **Total Sessions**: 14
 - **Last Active**: 2026-06-13
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~568 | Active |
+| `journal-1.md` | ~603 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-06-13 | Export composable usb::ReverseEngine for external DeviceBackend impls | `3e96e47`, `ec22bd2`, `c19e7c6` | `main` |
 | 13 | 2026-06-13 | adboost server P1-P4 (forward/sync/shell-v2/reverse) + interactive self-test harness | `866dac4`, `f5ef847` | `main` |
 | 12 | 2026-06-12 | adboost ADB server capability + CLI server start/kill daemon | `6ebdfec`, `9b23064`, `68a80c1`, `0b24d8e`, `00d72b2`, `5efe2f6`, `0c5a86c`, `65c9736` | `feat/adboost-server-capability` |
 | 11 | 2026-06-12 | adboost_cli rebrand + async migration + persistent USB exerciser (subtask B) — real-device closed-loop verified | `19aa24a` | `main` |
