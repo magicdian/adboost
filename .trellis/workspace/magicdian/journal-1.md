@@ -532,3 +532,37 @@ device — on par with official adb.
 ### Status
 
 [OK] **Completed** — reverse end-to-end working, pending user acceptance.
+
+
+## Session 13: adboost server P1-P4 (forward/sync/shell-v2/reverse) + interactive self-test harness
+
+**Date**: 2026-06-13
+**Task**: adboost server P1-P4 (forward/sync/shell-v2/reverse) + interactive self-test harness
+**Branch**: `main`
+
+### Summary
+
+Expanded the adboost ADB server frontend per the follow-up capabilities FR: P1 host:forward family (AOSP-exact framing), P2 sync: + P3 shell,v2 bridged verbatim with honest capability negotiation, and P4 reverse end-to-end (device-initiated OPEN acceptor + ReversePolicy + per-serial pump). Added an interactive device-backed self-test CLI (adboost_cli selftest, gtest-style) covering USB-direct + through-server channels, forward, reverse (echo + iperf3), official-adb parity, multi-device, USB replug/reboot recovery. Validated on two real devices incl. iperf3 reverse at 335 Mbits/sec. Fixed two device-found USB protocol bugs (bulk IN over-read carry-over; non-cancel-safe reader frame reads) and corrected the wire-protocol spec contract. 154 unit + 4 doctests, clippy pedantic clean on default/server/usb.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `866dac4` | (see git log) |
+| `f5ef847` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
