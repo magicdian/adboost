@@ -83,6 +83,27 @@ Consequences for any feature that needs inbound messages:
   `try_send` (the reader must never block, or it stalls *all* sessions); on
   `Full`, `log::warn!` with the session id + command. Do **not** restore the old
   silent `let _ = …try_send` drops.
+- **Control signals must NOT ride a droppable queue.** The per-session `data_tx`
+  / `ack_tx` are bounded and CAN drop a frame on overflow (the never-block rule
+  above). Two signals must survive that drop, so they live in shared atomics the
+  reader updates directly, NOT (only) as messages on those queues:
+  - **CLSE (close):** the reader sets the session's shared `closed: Arc<AtomicBool>`
+    the instant it classifies a CLSE — regardless of whether the CLSE message also
+    fits on `data_tx`. The read half reports EOF from this flag, so a dropped CLSE
+    cannot hang a reader. `poll_read` still delivers any already-queued WRTEs
+    BEFORE honoring the flag (drain-then-EOF), so close never abandons buffered
+    data. Losing a CLSE was also a feeder of the stale-CLSE pollution loop (see the
+    graceful-teardown section in `adb-wire-protocol-contract.md`).
+  - **OKAY window credit:** the reader parses each OKAY's signed delta
+    (`parse_okay_delta`) and `fetch_add`s it into the session's shared
+    `recv_credit: Arc<AtomicI64>` — the SINGLE source of send-window credit. The
+    OKAY message on `ack_tx` is then only a wakeup *poke*; its payload is NOT
+    re-read for credit (that would double-count). The write half drains the atomic
+    (`apply_delta(recv_credit.swap(0))`) in `poll_write` step 2 and again before
+    parking in step 3, so a poke dropped on a full `ack_tx` never loses credit and
+    never deadlocks a parked writer (a poke only drops when the queue is non-empty,
+    i.e. another poke is pending to wake on). Only a dropped DATA (WRTE) frame is a
+    real, warned loss — the acknowledged never-block ∧ bounded-memory tradeoff.
 
 ### Delayed-ack flow-control contract (`flow_control.rs`)
 
@@ -176,3 +197,9 @@ transport and ship its inline sans-io test in the same file.
   `MultiplexedSession` and the split halves instead of using the shared
   `read_with_ack` / `windowed_write` helpers.
 - Letting a reader-side channel `try_send` drop silently — log on `Full`.
+- Carrying a CLSE or an OKAY window credit ONLY as a message on the bounded
+  `data_tx`/`ack_tx` queue — both must be reflected in the shared `closed` /
+  `recv_credit` atomics so a full-queue drop cannot lose a close or flow-control
+  credit (see "Control signals must NOT ride a droppable queue" above).
+- Re-reading the OKAY payload for credit in `apply_ack`/`poll_write` after the
+  reader has already banked it into `recv_credit` — that double-counts the window.

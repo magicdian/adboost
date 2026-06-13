@@ -3,7 +3,7 @@
   "name": "pr3-backpressure-control-signals",
   "title": "PR3: per-session backpressure must never drop control signals (CLSE close semantics + OKAY window-ack separated from droppable data queue)",
   "description": "",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

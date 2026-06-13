@@ -44,7 +44,7 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -62,7 +62,7 @@ use crate::message_devices::adb_transport_message::{
 use crate::message_devices::message_commands::MessageCommand;
 use crate::message_devices::models::{ADBRsaKey, read_adb_private_key};
 use crate::message_devices::usb::flow_control::{
-    FlowControl, INITIAL_DELAYED_ACK_BYTES, MAX_PAYLOAD, encode_okay_payload,
+    FlowControl, INITIAL_DELAYED_ACK_BYTES, MAX_PAYLOAD, encode_okay_payload, parse_okay_delta,
 };
 use crate::message_devices::usb::shell_v2_session::ShellV2Session;
 use crate::message_devices::usb::sync_session::SyncSession;
@@ -874,20 +874,51 @@ impl PersistentUsbConnection {
 
             // Primary routing decision (I/O-free, unit-testable).
             match classify_message(&msg, &sessions) {
-                RouteDecision::SessionAck(id) | RouteDecision::SessionData(id) => {
-                    let is_ack = msg.header().command() == MessageCommand::Okay;
+                RouteDecision::SessionAck(id) => {
+                    // OKAY → the session's ack channel. The flow-control credit
+                    // (the OKAY's signed window delta) is the load-bearing part and
+                    // MUST NOT be lost on a full queue, so it is accumulated into
+                    // the shared `recv_credit` atomic here (lossless); the queued
+                    // OKAY message then serves only as a wakeup poke for a write
+                    // half that is parked waiting for credit. A dropped poke is
+                    // harmless: it only happens when the queue is full, i.e. the
+                    // write half is NOT parked on it (so no wakeup is owed) and
+                    // will re-read the atomic on its next poll.
+                    if let Some(channels) = sessions.get(&id) {
+                        if let Some(delta) = parse_okay_delta(msg.payload()) {
+                            if delta != 0 {
+                                channels.recv_credit.fetch_add(delta, Ordering::AcqRel);
+                            }
+                        } else {
+                            // Malformed OKAY payload (len ∉ {0,4}); AOSP drops it.
+                            tracing::warn!(
+                                "PersistentUsb: session {id} ignoring OKAY with invalid payload len {}",
+                                msg.payload().len()
+                            );
+                        }
+                        // Wakeup poke (best-effort); credit already banked above.
+                        let _ = channels.ack_tx.try_send(msg);
+                    }
+                }
+                RouteDecision::SessionData(id) => {
+                    // WRTE / CLSE / other → the session's data channel. A CLSE is a
+                    // control signal that MUST NOT be lost: set the shared `closed`
+                    // flag directly (lossless) so the read half reports EOF even if
+                    // the queued CLSE is dropped on a full queue. The queued CLSE is
+                    // then best-effort for a timely, ordered EOF after any buffered
+                    // WRTEs. A dropped WRTE is the acknowledged never-block/bounded-
+                    // memory tradeoff and stays warned.
                     if let Some(channels) = sessions.get(&id) {
                         let cmd = msg.header().command();
-                        let target = if is_ack {
-                            &channels.ack_tx
-                        } else {
-                            &channels.data_tx
-                        };
-                        if target.try_send(msg).is_err() {
-                            // Bounded queue full. Do NOT block (would stall all
-                            // sessions). Drop with an observable warning.
+                        let is_clse = cmd == MessageCommand::Clse;
+                        if is_clse {
+                            channels.closed.store(true, Ordering::Release);
+                        }
+                        if channels.data_tx.try_send(msg).is_err() && !is_clse {
+                            // Only a dropped DATA frame is a real loss worth warning;
+                            // a dropped CLSE already took effect via `closed`.
                             tracing::warn!(
-                                "PersistentUsb: session {id} queue full, dropped {cmd} message"
+                                "PersistentUsb: session {id} data queue full, dropped {cmd} message"
                             );
                         }
                     }
@@ -1089,6 +1120,14 @@ impl PersistentUsbConnection {
         let (data_tx, mut data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
         let (ack_tx, mut ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
 
+        // Shared lossless control signals (same Arcs the reader holds in
+        // `SessionChannels` and the session keeps in `SessionInner`): the close
+        // flag and the windowed-ack credit accumulator. Created BEFORE `Register`
+        // so the reader posts CLSE/OKAY-credit into the very same atomics this
+        // call (and the returned session) reads.
+        let closed = Arc::new(AtomicBool::new(false));
+        let recv_credit = Arc::new(AtomicI64::new(0));
+
         // Register in the reader's session map BEFORE sending OPEN (the reader
         // may respond fast). The control message is applied before any frame
         // for this id can be routed because the reader applies control messages
@@ -1096,7 +1135,12 @@ impl PersistentUsbConnection {
         self.control_tx
             .send(ReaderControl::Register(
                 local_id,
-                SessionChannels { data_tx, ack_tx },
+                SessionChannels {
+                    data_tx,
+                    ack_tx,
+                    closed: Arc::clone(&closed),
+                    recv_credit: Arc::clone(&recv_credit),
+                },
             ))
             .await
             .map_err(|_| RustADBError::SendError)?;
@@ -1157,49 +1201,43 @@ impl PersistentUsbConnection {
         let remote_id = response.header().arg0();
 
         // Send-side window. As the opener (AOSP `connect_to_remote`) our own send
-        // window starts at 0 when delayed_ack is on: the device's first OKAY
-        // payload credits it up to its grant. In classic mode it stays
-        // stop-and-wait (no window). We seed the controller from any window
-        // delta already carried by the OKAY response above (the device's first
-        // OKAY may already carry its grant).
+        // window starts at 0 when delayed_ack is on; in classic mode it stays
+        // stop-and-wait (no window).
         let mut send_flow = if self.delayed_ack_negotiated {
             FlowControl::new_windowed(0)
         } else {
             FlowControl::new_classic()
         };
-        send_flow.on_okay_payload(response.payload());
 
         // With delayed_ack, send an initial OKAY granting our own receive window
-        // (32 MiB as i32 LE in the payload). Without it (classic), the OKAY
-        // carries an empty payload and just signals readiness. adbd won't send
-        // WRTE until it gets this initial OKAY.
+        // (32 MiB as i32 LE). Classic mode sends an empty-payload readiness OKAY.
+        // adbd won't send WRTE until it gets this initial OKAY.
         let ready_payload = encode_okay_payload(
             self.delayed_ack_negotiated,
             usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX),
         );
-        let ready_msg = ADBTransportMessage::try_new(
-            MessageCommand::Okay,
-            local_id,
-            remote_id,
-            &ready_payload,
-        )?;
+        let ready_msg =
+            ADBTransportMessage::try_new(MessageCommand::Okay, local_id, remote_id, &ready_payload)?;
         self.writer
             .try_send_fire_forget(ready_msg)
             .map_err(|_| RustADBError::SendError)?;
 
-        // Take any window deltas already buffered on the ack channel (the device
-        // may have credited us between OPEN and now); non-blocking.
-        while let Ok(extra) = ack_rx.try_recv() {
-            send_flow.on_okay_payload(extra.payload());
-        }
+        // Seed the send window from the lossless `recv_credit` atomic. The reader
+        // banks EVERY OKAY's window delta there (the handshake grant and anything
+        // credited since), so a single drain here captures the device's grant —
+        // NOT `on_okay_payload(response.payload())`, which would double-count what
+        // the reader already added. Then clear any poke messages off the channel
+        // (cosmetic; `poll_write` would otherwise consume them).
+        send_flow.apply_delta(recv_credit.swap(0, Ordering::AcqRel));
+        while ack_rx.try_recv().is_ok() {}
 
-        let close_state = Arc::new(AtomicBool::new(false));
         let inner = SessionInner {
             local_id,
             remote_id,
             writer: self.writer.clone(),
             control_tx: self.control_tx.clone(),
-            closed: close_state,
+            closed,
+            recv_credit,
             conn_closed: Arc::clone(&self.conn_closed),
             windowed: self.delayed_ack_negotiated,
         };
@@ -1275,12 +1313,24 @@ impl PersistentUsbConnection {
         let (data_tx, data_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
         let (ack_tx, ack_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
 
+        // Shared lossless control signals (see `SessionChannels` docs). Same Arcs
+        // the reader and the returned session hold. The send window's INITIAL
+        // grant comes from the OPEN's arg1 (not an OKAY), so `recv_credit` starts
+        // at 0 and only accrues adbd's subsequent OKAY deltas — no double count.
+        let closed = Arc::new(AtomicBool::new(false));
+        let recv_credit = Arc::new(AtomicI64::new(0));
+
         // Register BEFORE replying so the device's follow-up frames (targeting
         // our local_id) route here, not back into the incoming-OPEN queue.
         self.control_tx
             .send(ReaderControl::Register(
                 local_id,
-                SessionChannels { data_tx, ack_tx },
+                SessionChannels {
+                    data_tx,
+                    ack_tx,
+                    closed: Arc::clone(&closed),
+                    recv_credit: Arc::clone(&recv_credit),
+                },
             ))
             .await
             .map_err(|_| RustADBError::SendError)?;
@@ -1313,7 +1363,8 @@ impl PersistentUsbConnection {
             remote_id,
             writer: self.writer.clone(),
             control_tx: self.control_tx.clone(),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
+            recv_credit,
             conn_closed: Arc::clone(&self.conn_closed),
             // Per-stream windowing (matches the OKAY we just sent), not the
             // connection-level flag.
@@ -1514,6 +1565,11 @@ struct SessionInner {
     control_tx: mpsc::Sender<ReaderControl>,
     /// Shared close flag. `true` once a CLSE has been observed (inbound) or sent.
     closed: Arc<AtomicBool>,
+    /// Shared windowed-ack credit accumulator (same `Arc` the reader holds in
+    /// [`SessionChannels::recv_credit`]). The reader `fetch_add`s each OKAY's
+    /// signed window delta here so a full `ack_tx` cannot lose flow-control
+    /// credit; the write half drains it (`swap(0)`) as its single credit source.
+    recv_credit: Arc<AtomicI64>,
     /// Connection-level close flag (shared with [`PersistentUsbConnection`]).
     /// `true` once a connection-level CLSE has been flushed by `shutdown`/`close`.
     /// When set, this session's `Drop` skips its per-stream CLSE: the device has
@@ -1531,6 +1587,13 @@ impl SessionInner {
 
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Atomically take (and zero) the accumulated windowed-ack credit the reader
+    /// has posted for this session. Returns the net signed delta to apply to the
+    /// send window. Single-consumer (the write half) by construction.
+    fn take_recv_credit(&self) -> i64 {
+        self.recv_credit.swap(0, Ordering::AcqRel)
     }
 }
 
@@ -1587,10 +1650,31 @@ pub struct MultiplexedSession {
     write_state: WriteState,
 }
 
-/// Channels for a single multiplexed session (held by the reader task).
+/// Channels + lossless control signals for a single multiplexed session, held by
+/// the reader task.
+///
+/// `data_tx` / `ack_tx` are bounded and may drop on overflow (the reader never
+/// blocks). To make the two control signals that MUST NOT be lost survive a full
+/// queue, they are carried out-of-band in shared atomics instead of (only) as
+/// messages on those queues:
+///
+/// - `closed`: set directly by the reader the instant a CLSE is classified for
+///   this session, regardless of whether the CLSE message also fits on `data_tx`.
+///   The read half observes it and reports EOF even if the queued CLSE was
+///   dropped. Same `Arc` as the session's [`SessionInner::closed`].
+/// - `recv_credit`: the reader `fetch_add`s each OKAY's signed window delta here;
+///   the write half drains it as the single source of send-window credit. A
+///   full `ack_tx` therefore never loses flow-control credit — the OKAY message
+///   is now only a wakeup poke. Same `Arc` as [`SessionInner::recv_credit`].
 pub struct SessionChannels {
     pub data_tx: mpsc::Sender<ADBTransportMessage>,
     pub ack_tx: mpsc::Sender<ADBTransportMessage>,
+    /// Shared close flag (same `Arc` as the session's `SessionInner::closed`).
+    closed: Arc<AtomicBool>,
+    /// Shared windowed-ack credit accumulator (same `Arc` as
+    /// `SessionInner::recv_credit`). Signed; the reader adds OKAY deltas, the
+    /// write half swaps it to zero and applies it to its `FlowControl`.
+    recv_credit: Arc<AtomicI64>,
 }
 
 #[cfg(test)]
@@ -1621,6 +1705,7 @@ impl MultiplexedSession {
             writer: WriterHandle { tx: writer_tx },
             control_tx,
             closed: Arc::new(AtomicBool::new(false)),
+            recv_credit: Arc::new(AtomicI64::new(0)),
             conn_closed: Arc::new(AtomicBool::new(false)),
             windowed,
         });
@@ -1641,6 +1726,14 @@ impl MultiplexedSession {
     /// the session's `Drop` then suppresses its per-stream CLSE.
     fn conn_closed_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shared.conn_closed)
+    }
+
+    /// Test-only handle to the session's shared `recv_credit` atomic, so a test can
+    /// emulate what the reader does on an inbound OKAY: bank the window delta here
+    /// (lossless) *before* poking the ack channel. The write half drains this as
+    /// its single credit source.
+    fn recv_credit_handle(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.shared.recv_credit)
     }
 }
 
@@ -1740,8 +1833,15 @@ enum WriteState {
     },
 }
 
-/// Apply a single ack-channel message: OKAY credits the window from its payload
-/// delta; CLSE closes the stream; anything else is an error.
+/// React to an ack-channel message (a wakeup *poke*) by folding in the window
+/// credit the reader has banked in the shared `recv_credit` atomic.
+///
+/// The OKAY's window delta is NOT read from `msg` here: the reader already added
+/// it to `recv_credit` losslessly (so a full ack queue cannot lose credit), and
+/// the message on the channel is only a wakeup signal. We drain the atomic
+/// (`take_recv_credit`) and apply the net delta — idempotent across repeated
+/// calls (a second drain returns 0). A CLSE that somehow lands on the ack channel
+/// still closes defensively; the reader's primary path sets `closed` directly.
 fn apply_ack(
     msg: &ADBTransportMessage,
     send_flow: &mut FlowControl,
@@ -1749,14 +1849,7 @@ fn apply_ack(
 ) -> io::Result<()> {
     match msg.header().command() {
         MessageCommand::Okay => {
-            if !send_flow.on_okay_payload(msg.payload()) {
-                // Malformed OKAY payload (len not in {0,4}). AOSP drops the
-                // packet; we log and keep the window unchanged rather than fail.
-                tracing::warn!(
-                    "PersistentUsb: ignoring OKAY with invalid payload len {}",
-                    msg.payload().len()
-                );
-            }
+            send_flow.apply_delta(shared.take_recv_credit());
             Ok(())
         }
         MessageCommand::Clse => {
@@ -1788,11 +1881,9 @@ fn poll_read_impl(
     read_pos: &mut usize,
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
-    if shared.is_closed() {
-        return Poll::Ready(Ok(()));
-    }
-
     // Return buffered data first (no new OKAY needed; it was acked on arrival).
+    // This precedes the close check so a session closed mid-stream still drains
+    // its already-received bytes before signalling EOF.
     if *read_pos < read_buf.len() {
         let available = &read_buf[*read_pos..];
         let to_copy = available.len().min(buf.remaining());
@@ -1805,51 +1896,84 @@ fn poll_read_impl(
         return Poll::Ready(Ok(()));
     }
 
+    // Closed sessions: the reader sets the shared `closed` flag DIRECTLY on an
+    // inbound CLSE (lossless — independent of whether the CLSE message also fit on
+    // the bounded data queue). But a CLSE arrives AFTER any in-flight WRTEs, and
+    // those WRTEs may still be sitting on the data channel, so we must NOT short-
+    // circuit to EOF while data is immediately available. Deliver any ready WRTE
+    // first (`try_recv`); only report EOF once the channel has no ready data.
+    if shared.is_closed() {
+        match data_rx.try_recv() {
+            Ok(msg) => return deliver_data_msg(shared, read_buf, read_pos, buf, msg),
+            // No buffered data left → genuine EOF (even if the CLSE message itself
+            // was dropped on a full queue; the flag carried the close).
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+
     match data_rx.poll_recv(cx) {
-        Poll::Ready(Some(msg)) => match msg.header().command() {
-            MessageCommand::Write => {
-                let payload = msg.into_payload();
-                let okay_payload = encode_okay_payload(shared.windowed, payload.len());
-                let okay = match ADBTransportMessage::try_new(
-                    MessageCommand::Okay,
-                    shared.local_id,
-                    shared.remote_id,
-                    &okay_payload,
-                ) {
-                    Ok(m) => m,
-                    Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
-                };
-                // Synchronous, non-blocking enqueue — no await between recv and
-                // OKAY (cancellation safety, P1-③).
-                if let Err(e) = shared.writer.try_send_fire_forget(okay) {
-                    return Poll::Ready(Err(e));
-                }
-                if payload.is_empty() {
-                    // 0-byte frame: nothing to copy; the read still made progress.
-                    return Poll::Ready(Ok(()));
-                }
-                let to_copy = payload.len().min(buf.remaining());
-                buf.put_slice(&payload[..to_copy]);
-                if to_copy < payload.len() {
-                    *read_buf = payload;
-                    *read_pos = to_copy;
-                }
-                Poll::Ready(Ok(()))
-            }
-            MessageCommand::Clse => {
-                shared.mark_closed();
-                Poll::Ready(Ok(())) // EOF (0 bytes filled)
-            }
-            other => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected command in data channel: {other}"),
-            ))),
-        },
+        Poll::Ready(Some(msg)) => deliver_data_msg(shared, read_buf, read_pos, buf, msg),
         Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "session channel closed",
         ))),
         Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Handle one inbound data-channel message for the read path: a WRTE is acked
+/// (crediting OKAY enqueued synchronously, P1-③) and its payload copied into
+/// `buf` (overflow stashed in `read_buf`); a CLSE marks the session closed and
+/// yields EOF; anything else is a protocol error. Shared by the normal
+/// `poll_recv` path and the closed-session drain (`try_recv`) so both deliver
+/// queued WRTEs identically before EOF.
+fn deliver_data_msg(
+    shared: &Arc<SessionInner>,
+    read_buf: &mut Vec<u8>,
+    read_pos: &mut usize,
+    buf: &mut ReadBuf<'_>,
+    msg: ADBTransportMessage,
+) -> Poll<io::Result<()>> {
+    match msg.header().command() {
+        MessageCommand::Write => {
+            let payload = msg.into_payload();
+            let okay_payload = encode_okay_payload(shared.windowed, payload.len());
+            let okay = match ADBTransportMessage::try_new(
+                MessageCommand::Okay,
+                shared.local_id,
+                shared.remote_id,
+                &okay_payload,
+            ) {
+                Ok(m) => m,
+                Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+            };
+            // Synchronous, non-blocking enqueue — no await between recv and
+            // OKAY (cancellation safety, P1-③).
+            if let Err(e) = shared.writer.try_send_fire_forget(okay) {
+                return Poll::Ready(Err(e));
+            }
+            if payload.is_empty() {
+                // 0-byte frame: nothing to copy; the read still made progress.
+                return Poll::Ready(Ok(()));
+            }
+            let to_copy = payload.len().min(buf.remaining());
+            buf.put_slice(&payload[..to_copy]);
+            if to_copy < payload.len() {
+                *read_buf = payload;
+                *read_pos = to_copy;
+            }
+            Poll::Ready(Ok(()))
+        }
+        MessageCommand::Clse => {
+            shared.mark_closed();
+            Poll::Ready(Ok(())) // EOF (0 bytes filled)
+        }
+        other => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected command in data channel: {other}"),
+        ))),
     }
 }
 
@@ -1932,7 +2056,13 @@ fn poll_write_impl(
         )));
     }
 
-    // 2. Credit the window with any OKAYs that already arrived (non-blocking).
+    // 2. Credit the window from the lossless `recv_credit` atomic (the reader
+    //    banks every OKAY's delta there even when the poke message is dropped on
+    //    a full ack queue). Then drain any poke messages off the channel so it
+    //    does not back up — `apply_ack` re-drains the (now-zero) atomic, so this
+    //    cannot double-count. Draining the channel also surfaces a CLSE that
+    //    landed on the ack side and a disconnected channel.
+    send_flow.apply_delta(shared.take_recv_credit());
     loop {
         match ack_rx.try_recv() {
             Ok(msg) => apply_ack(&msg, send_flow, shared)?,
@@ -1954,6 +2084,15 @@ fn poll_write_impl(
 
     // 3. Windowed backpressure: if the window is exhausted, register for a wake
     //    when an OKAY arrives. `poll_recv` registers the waker on Pending.
+    //
+    //    Credit lives in the lossless `recv_credit` atomic, so before parking we
+    //    always re-drain it: an OKAY may have banked credit while dropping its
+    //    poke on a full ack queue (then no message wakes us), or landed in the
+    //    gap after step 2. Re-checking the atomic on each iteration — and again
+    //    right before returning Pending — guarantees we never sleep holding
+    //    credit. A dropped poke is safe precisely because it only happens when the
+    //    queue is non-empty (so `poll_recv` returns a message and we loop) or the
+    //    atomic already carries the credit we just folded in.
     if send_flow.is_windowed() {
         while !send_flow.can_send() {
             match ack_rx.poll_recv(cx) {
@@ -1972,7 +2111,16 @@ fn poll_write_impl(
                         "session ack channel closed",
                     )));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // No poke pending. Fold any credit banked since the last drain;
+                    // if it now lets us send, loop without parking. Otherwise park
+                    // (the waker is registered by the poll_recv above).
+                    send_flow.apply_delta(shared.take_recv_credit());
+                    if send_flow.can_send() {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -2118,7 +2266,15 @@ mod tests {
             // receivers are irrelevant here.
             let (data_tx, _) = mpsc::channel(1);
             let (ack_tx, _) = mpsc::channel(1);
-            map.insert(id, SessionChannels { data_tx, ack_tx });
+            map.insert(
+                id,
+                SessionChannels {
+                    data_tx,
+                    ack_tx,
+                    closed: Arc::new(AtomicBool::new(false)),
+                    recv_credit: Arc::new(AtomicI64::new(0)),
+                },
+            );
         }
         map
     }
@@ -2494,6 +2650,9 @@ mod tests {
         // credits the send window.
         let (mut session, _data_tx, ack_tx, mut writer_rx, _ctl) =
             MultiplexedSession::new_for_test(10, 20, true, FlowControl::new_windowed(0));
+        // Grab the shared credit atomic before the session moves into the task —
+        // crediting now flows through it (the OKAY message is only a wakeup poke).
+        let recv_credit = session.recv_credit_handle();
 
         let write = tokio::spawn(async move {
             session.write_all(b"abc").await.expect("write after credit");
@@ -2507,7 +2666,9 @@ mod tests {
             "no WRTE must be enqueued while the send window is exhausted"
         );
 
-        // Credit the window via an OKAY on the ack channel.
+        // Credit the window the way the reader does: bank the signed delta in the
+        // lossless atomic FIRST, then send the OKAY poke to wake the parked writer.
+        recv_credit.fetch_add(1024, Ordering::AcqRel);
         ack_tx
             .send(msg(MessageCommand::Okay, 20, 10, &1024_i32.to_le_bytes()))
             .await
@@ -2818,6 +2979,80 @@ mod tests {
             ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop unregisters the local id"),
             _ => panic!("drop must unregister the session id"),
         }
+    }
+
+    /// PR3 (C1): when the reader classifies a CLSE it sets the shared `closed`
+    /// flag DIRECTLY (lossless), so even if the bounded data queue is full and the
+    /// CLSE message itself is dropped, the read half still reports EOF. This test
+    /// emulates a full data queue: it sets `closed` without delivering any CLSE
+    /// message and asserts the read returns EOF (0 bytes), and that any buffered
+    /// data delivered first is still returned before EOF.
+    #[tokio::test]
+    async fn clse_closes_session_via_flag_even_if_data_queue_dropped_it() {
+        let (mut session, data_tx, _ack_tx, _writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, false, FlowControl::new_classic());
+
+        // The reader banks a buffered WRTE that DID fit, then the CLSE that did
+        // NOT fit (queue full) — modeled by setting `closed` without a CLSE msg.
+        data_tx
+            .send(msg(MessageCommand::Write, 20, 10, b"tail"))
+            .await
+            .expect("buffered WRTE fits");
+        session.shared.closed.store(true, Ordering::Release);
+
+        // Buffered data must still be delivered before EOF (no data abandoned).
+        let mut buf = [0u8; 8];
+        let n = session.read(&mut buf).await.expect("read buffered tail");
+        assert_eq!(&buf[..n], b"tail", "buffered WRTE is delivered before EOF");
+
+        // Then EOF, driven purely by the `closed` flag (the CLSE msg was dropped).
+        let n2 = session.read(&mut buf).await.expect("read after close flag");
+        assert_eq!(n2, 0, "a dropped CLSE still surfaces as EOF via the closed flag");
+    }
+
+    /// PR3 (C2): the windowed send credit is sourced from the shared `recv_credit`
+    /// atomic that the reader fills losslessly — NOT from the ack message's
+    /// payload. The ack message is only a wakeup poke. This test proves the
+    /// separation: it banks the real credit in the atomic, then wakes the parked
+    /// writer with an EMPTY-payload poke (0 wire delta). Under the old "credit
+    /// from the OKAY payload" model the empty poke would credit 0 and the write
+    /// would stay blocked forever; with the atomic as the source the write
+    /// unblocks. (A poke is only ever dropped when the ack queue is full, i.e.
+    /// other pokes are pending to wake on, so a banked credit always has a wakeup.)
+    #[tokio::test]
+    async fn windowed_write_credit_comes_from_atomic_not_poke_payload() {
+        let (mut session, _data_tx, ack_tx, mut writer_rx, _ctl) =
+            MultiplexedSession::new_for_test(10, 20, true, FlowControl::new_windowed(0));
+        let recv_credit = session.recv_credit_handle();
+
+        let write = tokio::spawn(async move {
+            session.write_all(b"xyz").await.expect("write after atomic credit");
+            session
+        });
+
+        // Parked: window starts at 0, nothing enqueued.
+        tokio::task::yield_now().await;
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "no WRTE while the window is exhausted"
+        );
+
+        // Reader path: bank the credit in the atomic FIRST (lossless), then send a
+        // bare wakeup poke that carries NO window delta in its payload.
+        recv_credit.fetch_add(4096, Ordering::AcqRel);
+        ack_tx
+            .send(msg(MessageCommand::Okay, 20, 10, &[]))
+            .await
+            .expect("send empty OKAY poke");
+
+        // The write must flush, crediting from the atomic (not the empty poke).
+        let frame = pump_writer(&mut writer_rx).await;
+        assert_eq!(
+            frame.payload(),
+            b"xyz",
+            "credit from the atomic (not the empty poke payload) unblocks the write"
+        );
+        let _session = write.await.expect("write task completes");
     }
 
     /// The per-session span carries `local_id` as a field, so an event emitted

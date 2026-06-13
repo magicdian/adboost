@@ -1,1 +1,7 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "CLSE 关闭语义/CLSE-on-data 拒绝、reader 帧对齐不变量、OKAY 窗口语义——本 PR 直接改这些路径，必须严格遵守。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "delayed_ack 流控契约（OKAY delta i32 LE/signed/累加、初始窗口、opener 起始 0）+ 单 reader/never-block 不变量——C2 信用原子化的正确性边界。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "io::Error 构造、broken-pipe 语义、不吞错；poll_read/poll_write 错误路径改动须合规。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "本 PR 消除 dropped OKAY/CLSE warn，但保留 data 丢帧 warn；级别与措辞、overflow 必须可观测的约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门 + sans-io 内联测试（reader 路由/flow_control 已有范式，新增原子无损测试照此）。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "信用单一来源（原子）避免与 on_okay_payload 双路径并存；复用 FlowControl::apply_delta 而非新增窗口逻辑。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "reader（连接层）→ SessionChannels/SessionInner 共享态 → poll_read/write（会话层）的信用/关闭信号跨层流动需一致。"}

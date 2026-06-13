@@ -1,1 +1,5 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 CLSE 关闭语义/帧对齐/OKAY 改动未违反线协议契约。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验 delayed_ack 信用记账正确（delta 累加、窗口语义）+ never-block 不变量保持。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "build/clippy/全测试绿，新增无损测试覆盖 CLSE-on-full、OKAY-credit-on-full、排空后 EOF。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "校验信用单一来源、无双路径、复用 apply_delta。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验 reader→共享态→会话层信用/关闭流动一致无遗漏。"}

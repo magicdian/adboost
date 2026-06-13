@@ -55,7 +55,7 @@ impl FlowControl {
     ///
     /// As the OPENER (host `open_session`), AOSP sets its OWN send window to 0
     /// and waits for the device's first OKAY (carrying the device's grant) to
-    /// credit it — so pass `0` here for the opener and let `on_okay_payload`
+    /// credit it — so pass `0` here for the opener and let `apply_delta`
     /// raise the window. See research/07 Q2.
     #[must_use]
     pub const fn new_windowed(initial_window: i64) -> Self {
@@ -114,35 +114,12 @@ impl FlowControl {
         }
     }
 
-    /// Apply an OKAY payload to the send window.
+    /// Apply a raw signed delta to the window. No-op in classic mode.
     ///
-    /// Parses the optional 4-byte LE signed `i32` delta and accumulates it:
-    /// `available_bytes += delta`. An empty payload is a classic/no-op OKAY (the
-    /// rendezvous signal). A payload whose length is neither 0 nor 4 is rejected
-    /// (returns `false`) and ignored, matching AOSP's "drop the packet" behavior;
-    /// the caller decides whether to log.
-    ///
-    /// Returns `true` if the payload was accepted (including the empty/classic
-    /// case), `false` if it was malformed.
-    pub fn on_okay_payload(&mut self, payload: &[u8]) -> bool {
-        match payload.len() {
-            0 => true, // classic / no-op OKAY rendezvous
-            4 => {
-                // Signed i32, little-endian. May be negative.
-                let bytes: [u8; 4] = match payload.try_into() {
-                    Ok(b) => b,
-                    Err(_) => return false,
-                };
-                let delta = i32::from_le_bytes(bytes);
-                self.apply_delta(i64::from(delta));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Apply a raw signed delta to the window (used by `on_okay_payload`; also
-    /// directly testable). No-op in classic mode.
+    /// The OKAY wire payload is decoded into this delta by [`parse_okay_delta`];
+    /// the persistent reader banks that delta into a shared atomic (lossless even
+    /// when the ack queue is full) and the write half applies it here. The two
+    /// steps are split so flow-control credit survives backpressure.
     pub fn apply_delta(&mut self, delta: i64) {
         if let Some(window) = self.available_bytes.as_mut() {
             *window = window.saturating_add(delta);
@@ -165,6 +142,28 @@ pub fn encode_okay_payload(windowed: bool, bytes: usize) -> Vec<u8> {
         delta.to_le_bytes().to_vec()
     } else {
         Vec::new()
+    }
+}
+
+/// Parse the signed window delta (bytes) carried by an OKAY payload.
+///
+/// - Empty payload (classic / no-op rendezvous OKAY) → `Some(0)`.
+/// - 4-byte little-endian signed `i32` (windowed delta, may be negative) →
+///   `Some(delta as i64)`.
+/// - Any other length → `None` (malformed; AOSP drops the packet).
+///
+/// The reader's lossless credit accumulator adds this delta into a shared atomic
+/// (so a full ack queue never loses window credit) and the write half folds it
+/// into its [`FlowControl`] via [`FlowControl::apply_delta`].
+#[must_use]
+pub fn parse_okay_delta(payload: &[u8]) -> Option<i64> {
+    match payload.len() {
+        0 => Some(0),
+        4 => {
+            let bytes: [u8; 4] = payload.try_into().ok()?;
+            Some(i64::from(i32::from_le_bytes(bytes)))
+        }
+        _ => None,
     }
 }
 
@@ -210,7 +209,8 @@ mod tests {
         // Device grants 32 MiB via the first OKAY payload.
         let grant = INITIAL_DELAYED_ACK_BYTES;
         let payload = (i32::try_from(grant).expect("fits i32")).to_le_bytes();
-        assert!(fc.on_okay_payload(&payload), "valid 4-byte OKAY accepted");
+        let delta = parse_okay_delta(&payload).expect("valid 4-byte OKAY accepted");
+        fc.apply_delta(delta);
         assert_eq!(
             fc.available_bytes(),
             Some(grant),
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(fc.available_bytes(), Some(0), "window drained to exactly 0");
         assert!(!fc.can_send(), "a zero window blocks the next send");
         // OKAY credits 300 bytes back.
-        assert!(fc.on_okay_payload(&300_i32.to_le_bytes()));
+        fc.apply_delta(parse_okay_delta(&300_i32.to_le_bytes()).expect("valid delta"));
         assert_eq!(
             fc.available_bytes(),
             Some(300),
@@ -263,10 +263,9 @@ mod tests {
     fn negative_delta_is_applied_without_panic() {
         let mut fc = FlowControl::new_windowed(1000);
         // Preemptive backpressure: a negative delta shrinks the window.
-        assert!(
-            fc.on_okay_payload(&(-400_i32).to_le_bytes()),
-            "a negative i32 delta is a valid (signed) OKAY"
-        );
+        let delta = parse_okay_delta(&(-400_i32).to_le_bytes())
+            .expect("a negative i32 delta is a valid (signed) OKAY");
+        fc.apply_delta(delta);
         assert_eq!(
             fc.available_bytes(),
             Some(600),
@@ -274,11 +273,24 @@ mod tests {
         );
     }
 
+    /// Test helper mirroring how the live code applies an OKAY: decode the wire
+    /// payload via `parse_okay_delta`, and if valid fold it in via `apply_delta`.
+    /// Returns whether the payload was accepted (the reader logs+ignores on `None`).
+    fn apply_okay(fc: &mut FlowControl, payload: &[u8]) -> bool {
+        match parse_okay_delta(payload) {
+            Some(delta) => {
+                fc.apply_delta(delta);
+                true
+            }
+            None => false,
+        }
+    }
+
     #[test]
     fn classic_empty_payload_okay_is_noop() {
         let mut fc = FlowControl::new_classic();
         assert!(
-            fc.on_okay_payload(&[]),
+            apply_okay(&mut fc, &[]),
             "empty OKAY payload is the classic rendezvous, accepted"
         );
         assert_eq!(
@@ -292,7 +304,7 @@ mod tests {
     fn empty_payload_in_windowed_mode_is_noop_credit() {
         let mut fc = FlowControl::new_windowed(1000);
         assert!(
-            fc.on_okay_payload(&[]),
+            apply_okay(&mut fc, &[]),
             "an empty payload is a 0-delta no-op"
         );
         assert_eq!(
@@ -306,12 +318,16 @@ mod tests {
     fn malformed_okay_payload_is_rejected() {
         let mut fc = FlowControl::new_windowed(1000);
         assert!(
-            !fc.on_okay_payload(&[1, 2, 3]),
+            !apply_okay(&mut fc, &[1, 2, 3]),
             "a 3-byte payload is neither classic (0) nor a valid delta (4) → rejected"
         );
         assert!(
-            !fc.on_okay_payload(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            !apply_okay(&mut fc, &[1, 2, 3, 4, 5, 6, 7, 8]),
             "an 8-byte payload is rejected (only 0 or 4 are valid)"
+        );
+        assert!(
+            parse_okay_delta(&[1, 2, 3]).is_none(),
+            "parse_okay_delta rejects a 3-byte payload directly"
         );
         assert_eq!(
             fc.available_bytes(),
@@ -334,10 +350,12 @@ mod tests {
         ] {
             let mut fc = FlowControl::new_windowed(0);
             let payload = value.to_le_bytes();
-            assert!(
-                fc.on_okay_payload(&payload),
-                "valid 4-byte payload for {value}"
+            assert_eq!(
+                parse_okay_delta(&payload),
+                Some(i64::from(value)),
+                "parse_okay_delta decodes i32 LE {value}"
             );
+            assert!(apply_okay(&mut fc, &payload), "valid 4-byte payload for {value}");
             assert_eq!(
                 fc.available_bytes(),
                 Some(i64::from(value)),
@@ -382,7 +400,7 @@ mod tests {
         let mut fc = FlowControl::new_windowed(i64::MAX - 10);
         // Repeated max positive deltas must saturate, never panic.
         for _ in 0..5 {
-            assert!(fc.on_okay_payload(&i32::MAX.to_le_bytes()));
+            assert!(apply_okay(&mut fc, &i32::MAX.to_le_bytes()));
         }
         assert_eq!(
             fc.available_bytes(),
