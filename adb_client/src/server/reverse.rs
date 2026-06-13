@@ -161,7 +161,7 @@ async fn run_reverse_pump(
                         tracing::debug!("reverse: set_nodelay failed: {e}");
                     }
                     tracing::debug!("reverse: dialed {addr}, bridging");
-                    super::frontend::bridge_session_public(host, session).await;
+                    crate::usb::bridge_tcp_session(host, session).await;
                     tracing::debug!("reverse: bridge for {addr} ended");
                 }
                 Err(e) => {

@@ -648,7 +648,7 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
 
         // Service accepted — the socket is now a raw byte stream.
         stream.write_all(&protocol::okay()).await?;
-        bridge_session(stream, session).await;
+        crate::usb::bridge_tcp_session(stream, session).await;
         Ok(())
     }
 
@@ -849,56 +849,13 @@ async fn run_forward_listener<B: DeviceBackend>(
         tokio::spawn(async move {
             let cmd = ADBLocalCommand::TcpConnect(remote_port);
             match backend.open_local_service(&serial, &cmd).await {
-                Ok(session) => bridge_session(client, session).await,
+                Ok(session) => crate::usb::bridge_tcp_session(client, session).await,
                 Err(e) => {
                     tracing::debug!("forward {peer}→tcp:{remote_port} open failed: {e}");
                 }
             }
         });
     }
-}
-
-/// Bridge an arbitrary host TCP stream to a device session — the reverse data
-/// path's host-dial side reuses the same bidirectional copy as the forward/local
-/// bridge. `pub(super)` so [`super::reverse`] can call it.
-pub(super) async fn bridge_session_public(
-    host: TcpStream,
-    session: crate::usb::MultiplexedSession,
-) {
-    bridge_session(host, session).await;
-}
-
-/// Bridge a client TCP socket to a device [`MultiplexedSession`] bidirectionally.
-///
-/// Both halves are `AsyncRead`/`AsyncWrite`. Each direction is copied
-/// independently; when one direction reaches EOF, the *write* half of the other
-/// peer is shut down (propagating the half-close as EOF) rather than aborting
-/// the opposite copy. This is essential for request/response and
-/// `echo … | nc`-style flows over `reverse`/`forward`: the client may close its
-/// send side after the request while still expecting the reply to flow back.
-/// The bridge ends only once BOTH directions complete.
-async fn bridge_session(client: TcpStream, session: crate::usb::MultiplexedSession) {
-    use tokio::io::AsyncWriteExt as _;
-
-    let local_id = session.local_id();
-    let (mut usb_read, mut usb_write) = session.into_split();
-    let (mut client_read, mut client_write) = client.into_split();
-
-    // client → device, then signal EOF to the device by shutting its write half.
-    let c2u = tokio::spawn(async move {
-        let n = tokio::io::copy(&mut client_read, &mut usb_write).await;
-        tracing::trace!("bridge c2u (host→device) ended local_id={local_id}: {n:?}");
-        let _ = usb_write.shutdown().await;
-    });
-    // device → client, then signal EOF to the client.
-    let u2c = tokio::spawn(async move {
-        let n = tokio::io::copy(&mut usb_read, &mut client_write).await;
-        tracing::trace!("bridge u2c (device→host) ended local_id={local_id}: {n:?}");
-        let _ = client_write.shutdown().await;
-    });
-
-    // Wait for BOTH directions to finish so a late reply is not truncated.
-    let _ = tokio::join!(c2u, u2c);
 }
 
 #[cfg(test)]

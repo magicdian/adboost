@@ -17,6 +17,11 @@ use crate::models::ADBLocalCommand;
 use crate::usb::{MultiplexedSession, ShellV2Session, SyncSession};
 use crate::{Result, RustADBError};
 
+// `ReversePolicy` now lives in `usb::` (it parameterises the reusable
+// `ReverseEngine` data path). Re-export it from this module's public surface so
+// existing `server::ReversePolicy` users keep compiling.
+pub use crate::usb::ReversePolicy;
+
 /// One device visible to clients. `state` is usually [`DeviceState::Device`]
 /// (the wire equivalent of AOSP's `ConnectionState`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,40 +99,6 @@ pub struct BackendCapabilities {
     /// The backend implements the reverse family
     /// ([`DeviceBackend::open_reverse`] etc. — device-initiated port forwarding).
     pub reverse: bool,
-}
-
-/// Policy deciding which device-initiated reverse connections are accepted.
-///
-/// `reverse:` makes the *device* open connections back to a host target. A
-/// compromised or buggy device could try to reach an arbitrary host port, so the
-/// server validates each inbound `A_OPEN` against this policy before dialing.
-/// The library does not hard-code a choice — the caller picks the security
-/// posture; the bundled CLI uses [`ReversePolicy::RejectUnconfigured`].
-#[derive(Clone, Default)]
-pub enum ReversePolicy {
-    /// Accept only inbound opens whose target matches a reverse rule the client
-    /// explicitly configured (`reverse:forward:`). Anything else is closed. This
-    /// is the safe default and mirrors AOSP's allow-list hardening (minus its
-    /// process-abort).
-    #[default]
-    RejectUnconfigured,
-    /// Accept any device-initiated open (relay / advanced use). **Unsafe**: the
-    /// device may ask the server to connect to any local target. Opt in only
-    /// when the device is fully trusted.
-    AllowAll,
-    /// Caller-supplied predicate over the target endpoint string (e.g. `tcp:5201`).
-    /// Returning `true` accepts; `false` closes the stream.
-    Custom(std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>),
-}
-
-impl std::fmt::Debug for ReversePolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RejectUnconfigured => f.write_str("RejectUnconfigured"),
-            Self::AllowAll => f.write_str("AllowAll"),
-            Self::Custom(_) => f.write_str("Custom(<fn>)"),
-        }
-    }
 }
 
 /// The device backend: the frontend gets its device list, change stream, and
@@ -298,14 +269,5 @@ mod tests {
             !caps.reverse,
             "reverse must default to false (honest banner)"
         );
-    }
-
-    #[test]
-    fn reverse_policy_default_is_reject_unconfigured() {
-        // The safe default: only configured reverse targets are accepted.
-        assert!(matches!(
-            ReversePolicy::default(),
-            ReversePolicy::RejectUnconfigured
-        ));
     }
 }

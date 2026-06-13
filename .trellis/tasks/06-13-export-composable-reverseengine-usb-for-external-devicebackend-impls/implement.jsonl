@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新建 usb::reverse 模块、把 ReverseState/ReversePolicy/bridge 在 usb:: 与 server:: 间搬移，须遵循既有模块组织与 pub/pub(crate) 约定及 mod.rs 再导出风格"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "ReverseEngine 五方法返回 crate Result<T>/RustADBError；迁移控制命令(run_reverse_command)的 FAIL 解码需符合既有错误构造与传播约定"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核心动作之一是把 bridge 提为公开 usb::bridge_tcp_session 让 frontend forward/local 与 reverse pump 共用，消除 half-close 双处维护——正是 DRY 复用判断"}
+{"file": ".trellis/spec/backend/index.md", "reason": "总览 crate 定位与对外暴露面克制风格(对照 SyncSession/ShellV2Session)，指导 ReverseEngine 公开契约取舍"}

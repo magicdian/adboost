@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验收门：clippy 配置、CI 命令、测试风格——确认迁移后的 8 个 reverse 单测 + 新增 doctest 符合既有测试与质量标准"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "护栏：engine 含 A_OPEN(accept_device_open)/A_CLSE(reject_open) 处理，须确认本次纯重构未改动 reverse 线协议行为与帧构造"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "复核 engine 五方法及控制命令 FAIL 解码的错误传播与 RustADBError 构造符合约定"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "复核 usb::/server:: 模块归属、pub(crate) 边界与 ReversePolicy re-export 兜底是否符合既有组织约定且不破坏现有 import"}
