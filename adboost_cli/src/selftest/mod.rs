@@ -87,7 +87,15 @@ pub async fn run(cmd: SelftestCommand) -> ADBCliResult<()> {
         .map(|d| d.serial.clone().expect("addressable ⇒ has serial"))
         .collect();
 
-    for serial in &serials {
+    for (idx, serial) in serials.iter().enumerate() {
+        // Settle between devices: the prior device's connection released its USB
+        // claim on close, and OS USB stacks (macOS IOKit especially) need a beat
+        // to fully retire the endpoints before the next claim. Claiming too
+        // eagerly back-to-back can abort the fresh claim mid-handshake
+        // (kIOReturnAborted / 0xe00002ed), killing that connection's reader task.
+        if idx > 0 {
+            tokio::time::sleep(USB_DIRECT_INTER_DEVICE_SETTLE).await;
+        }
         run_usb_direct_suite(&mut reporter, serial).await;
     }
     run_through_server_phase(&mut reporter, &serials, multi).await;
@@ -170,6 +178,11 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
     // would only abort the accept loop, not flush the CLSEs.)
     server.shutdown().await;
 }
+
+/// Settle delay between two devices' `usb_direct` suites, giving the OS USB stack
+/// time to retire the prior device's released claim before the next one is
+/// claimed (avoids back-to-back claim aborts; see the loop in `run`).
+const USB_DIRECT_INTER_DEVICE_SETTLE: Duration = Duration::from_millis(300);
 
 /// Device-listen port used by the reverse data-plane cases (arbitrary high port
 /// unlikely to be in use on the device).
@@ -274,24 +287,80 @@ async fn run_usb_direct_suite(reporter: &mut Reporter, serial: &str) {
         reporter,
         "usb_direct",
         "shell_echo",
-        cases::persistent_shell_echo(&conn).await,
+        guarded_persistent_case(&conn, cases::persistent_shell_echo(&conn)).await,
     );
     run_one(
         reporter,
         "usb_direct",
         "shell_v2",
-        cases::persistent_shell_v2(&conn).await,
+        guarded_persistent_case(&conn, cases::persistent_shell_v2(&conn)).await,
     );
     run_one(
         reporter,
         "usb_direct",
         "push_pull_roundtrip",
-        cases::persistent_push_pull(&conn).await,
+        guarded_persistent_case(&conn, cases::persistent_push_pull(&conn)).await,
     );
 
     // Gracefully close (flush a connection-level CLSE) before the claim is
     // needed by the through-server phase.
     conn.close().await;
+}
+
+/// Connection-level failure reason for the `usb_direct` suite when the persistent
+/// connection's reader task has exited (e.g. the OS aborted the USB device claim
+/// — macOS `IOKit` `kIOReturnAborted` / `0xe00002ed` — under back-to-back
+/// multi-device claims). Used both to short-circuit a case and to annotate a
+/// case that failed *because* the reader died mid-run.
+const READER_DEAD_REASON: &str =
+    "persistent connection died: USB reader task exited (e.g. the OS aborted the \
+device claim). The remaining usb_direct cases cannot run on this connection.";
+
+/// Run one `usb_direct` case with connection-liveness guarding so a dead reader
+/// task surfaces as ONE clear connection-level failure rather than N confusing
+/// `error sending data to channel` per-case errors.
+///
+/// - If the reader is already dead, the case future is dropped un-awaited and the
+///   outcome is the connection-level reason.
+/// - Otherwise the case runs; if it then fails AND the reader has since died, the
+///   failure is annotated with the connection-level root cause (the underlying
+///   error is kept for diagnosis).
+///
+/// `case` is taken as an un-awaited future so the liveness check can short-circuit
+/// it (async fns are lazy — nothing runs until awaited).
+async fn guarded_persistent_case(
+    conn: &PersistentUsbConnection,
+    case: impl std::future::Future<Output = Outcome>,
+) -> Outcome {
+    // Pre-check: a dead reader means the case cannot run — short-circuit without
+    // awaiting it (async fns are lazy, so the case body never executes).
+    if let Some(reason) = reader_dead_short_circuit(conn.is_alive()) {
+        return reason;
+    }
+    let outcome = case.await;
+    // Post-check: annotate a failure that happened because the reader died mid-run.
+    annotate_if_reader_died(conn.is_alive(), outcome)
+}
+
+/// Pure policy: if the connection's reader is not alive *before* a case, the case
+/// cannot run — return the connection-level failure to use in its place.
+/// `None` means "reader alive, run the case normally". Sans-io / unit-testable.
+fn reader_dead_short_circuit(alive_before: bool) -> Option<Outcome> {
+    (!alive_before).then(|| Outcome::Failed(READER_DEAD_REASON.to_string()))
+}
+
+/// Pure policy: given the case `outcome` and whether the reader is still alive
+/// *after* it ran, annotate a failure that was actually caused by the reader
+/// dying mid-case (its per-case error is just a symptom). A passing/skipped
+/// outcome, or a genuine failure with the reader still alive, passes through
+/// unchanged. Sans-io / unit-testable.
+fn annotate_if_reader_died(alive_after: bool, outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed(reason) if !alive_after => {
+            Outcome::Failed(format!("{READER_DEAD_REASON} (underlying: {reason})"))
+        }
+        other => other,
+    }
 }
 
 /// Run the standard automated case suite against `device`, recording each
@@ -366,4 +435,73 @@ fn report_tcpip_skipped(reporter: &mut Reporter) {
             "tcpip channel not implemented yet (pre-wired; pending emulator debug env)".into(),
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_reader_before_case_short_circuits_to_connection_failure() {
+        // Reader already dead: the case must be replaced by the connection-level
+        // reason (and the caller drops the case future un-awaited).
+        let out = reader_dead_short_circuit(false).expect("dead reader short-circuits");
+        match out {
+            Outcome::Failed(reason) => assert!(
+                reason.contains("USB reader task exited"),
+                "reason names the reader death: {reason}"
+            ),
+            _ => panic!("dead reader must short-circuit to Failed"),
+        }
+    }
+
+    #[test]
+    fn live_reader_before_case_runs_normally() {
+        // Reader alive: no short-circuit, the case is run as usual.
+        assert!(
+            reader_dead_short_circuit(true).is_none(),
+            "a live reader must not short-circuit the case"
+        );
+    }
+
+    #[test]
+    fn failure_after_reader_death_is_annotated_with_root_cause() {
+        let symptom = Outcome::Failed("error sending data to channel".to_string());
+        match annotate_if_reader_died(false, symptom) {
+            Outcome::Failed(reason) => {
+                assert!(
+                    reason.contains("USB reader task exited"),
+                    "names the real cause: {reason}"
+                );
+                assert!(
+                    reason.contains("error sending data to channel"),
+                    "keeps the underlying symptom: {reason}"
+                );
+            }
+            _ => panic!("a failure with a dead reader must stay Failed (annotated)"),
+        }
+    }
+
+    #[test]
+    fn genuine_failure_with_live_reader_passes_through_unchanged() {
+        let genuine = Outcome::Failed("echo returned \"nope\"".to_string());
+        match annotate_if_reader_died(true, genuine) {
+            Outcome::Failed(reason) => {
+                assert_eq!(
+                    reason, "echo returned \"nope\"",
+                    "a real failure with a live reader must NOT be annotated"
+                );
+            }
+            _ => panic!("must remain the original Failed"),
+        }
+    }
+
+    #[test]
+    fn passing_outcome_is_never_annotated() {
+        // Even if the reader is reported not-alive after a pass (e.g. a benign
+        // race at teardown), a Passed/Skipped outcome passes through untouched.
+        assert_eq!(annotate_if_reader_died(false, Outcome::Passed), Outcome::Passed);
+        let skip = Outcome::Skipped("n/a".to_string());
+        assert_eq!(annotate_if_reader_died(false, skip.clone()), skip);
+    }
 }

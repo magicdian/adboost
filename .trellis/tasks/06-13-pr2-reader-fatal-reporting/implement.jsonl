@@ -1,1 +1,5 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "本 PR 核心是错误如实上报/标注；Outcome::Failed 原因构造、不吞错、不误标注须遵守错误处理约定。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "连接级失败原因/诊断输出的措辞与级别（CLI 输出走 tracing::info!，失败经 reporter）。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门 + selftest 既有 #[cfg(test)] 桩测试模式（cases.rs 已有 Outcome 断言测试可参照）。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "reader task 死亡是 connection 层事件，selftest 层须正确感知并转译为用户可读结论。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Always：改动限定在 adboost_cli/selftest，按既有模块边界。"}

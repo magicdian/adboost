@@ -1,1 +1,3 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验失败原因构造、无吞错、连接级标注不误伤正常失败。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "build/clippy/测试全绿，新增 guard helper 桩测试覆盖三态。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验 connection 层 reader 死亡正确转译为 selftest 层结论，无遗漏 case。"}
