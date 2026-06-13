@@ -37,7 +37,6 @@ mod backend;
 mod capabilities;
 mod forward;
 mod frontend;
-mod reverse;
 mod usb_backend;
 
 pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, ReversePolicy};

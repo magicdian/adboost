@@ -2,6 +2,7 @@ mod adb_usb_device;
 mod bridge;
 mod flow_control;
 pub mod persistent;
+mod reverse_engine;
 mod reverse_policy;
 mod shell_v2_session;
 mod sync_session;
@@ -13,6 +14,7 @@ pub use bridge::bridge_tcp_session;
 pub use persistent::{
     MultiplexedSession, PersistentUsbConnection, SessionReadHalf, SessionWriteHalf,
 };
+pub use reverse_engine::ReverseEngine;
 pub use reverse_policy::ReversePolicy;
 pub use shell_v2_session::{ShellChannel, ShellV2Output, ShellV2Session};
 pub use sync_session::SyncSession;
