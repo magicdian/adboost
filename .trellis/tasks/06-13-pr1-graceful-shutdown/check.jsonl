@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 CLSE/CNXN/drain-stale 改动未违反线协议契约。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 shutdown Result 契约、无吞错、变体分类完整。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "校验目标 warn 已消除/降级，新增日志级别与格式合规。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "build/clippy/测试全绿，新增单测覆盖 shutdown flush CLSE + 幂等。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验 daemon/InProcessServer/backend/connection 各层接入一致无遗漏。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "校验 shutdown 与 close/Drop 无重复关闭逻辑、单一真相来源。"}

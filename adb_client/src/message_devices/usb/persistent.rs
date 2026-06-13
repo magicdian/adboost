@@ -25,10 +25,19 @@
 //!   endpoint has a single physical writer enforced structurally — no shared
 //!   writer mutex anywhere.
 //!
-//! Teardown is explicit: [`PersistentUsbConnection::close`] /
-//! [`MultiplexedSession::close`] send their CLSE and await confirmation. `Drop`
-//! is best-effort: it enqueues CLSE fire-and-forget onto the writer channel and
-//! `abort()`s the reader/writer tasks (Rust stable has no async `Drop`).
+//! Teardown is explicit: [`PersistentUsbConnection::shutdown`] (`&self`, for
+//! `Arc`-held connections such as the server backend's cache),
+//! [`PersistentUsbConnection::close`] (`self`), and [`MultiplexedSession::close`]
+//! send their CLSE and await confirmation. A connection-level graceful close
+//! flushes ONE connection CLSE and sets a shared `conn_closed` flag; each live
+//! session's `Drop` then skips its now-redundant per-stream CLSE (the device
+//! already knows the whole connection is gone). `Drop` is the best-effort
+//! fallback: if no graceful close ran, it enqueues a connection CLSE
+//! fire-and-forget onto the writer channel; either way it `abort()`s the
+//! reader/writer tasks (Rust stable has no async `Drop`). Always prefer the
+//! explicit graceful path — at process teardown the writer task is often already
+//! gone, so a fire-and-forget CLSE fails to enqueue and the device is left with
+//! orphaned streams that reject the next CNXN with a stale CLSE.
 
 use std::collections::HashMap;
 use std::io;
@@ -76,6 +85,16 @@ const WRITER_CHANNEL_SIZE: usize = 256;
 
 /// Channel buffer size for the reader task's session-registry control queue.
 const CONTROL_CHANNEL_SIZE: usize = 64;
+
+/// Max CNXN handshake attempts before giving up. adbd can emit one stale CLSE
+/// per orphaned stream left by a previous connection's unclean teardown; the
+/// multi-session server path can leave several, so this is well above the old
+/// fixed 3. Each stale CLSE also triggers a re-drain (see `do_connect`).
+const CNXN_MAX_ATTEMPTS: u32 = 8;
+
+/// Upper bound on frames drained per [`PersistentUsbConnection::drain_stale`]
+/// pass, so a device that keeps emitting frames cannot wedge the drain forever.
+const STALE_DRAIN_MAX_FRAMES: usize = 64;
 
 /// Legacy ADB wire version; predates `delayed_ack` windowed flow control.
 const A_VERSION_LEGACY: u32 = 0x0100_0000;
@@ -150,6 +169,26 @@ impl WriterHandle {
         ack_rx
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped ack"))?
+    }
+}
+
+/// Flush exactly one connection-level CLSE through `writer` (awaiting the write
+/// confirmation) and set `conn_closed`. Idempotent: a `compare_exchange` makes
+/// the first caller win, so repeated `shutdown`/`close` calls — and a later
+/// `Drop` — send nothing more. Factored out of [`PersistentUsbConnection`] so it
+/// is the single source of truth for the graceful connection CLSE and is
+/// unit-testable against a bare writer channel.
+async fn flush_connection_clse_impl(writer: &WriterHandle, conn_closed: &Arc<AtomicBool>) {
+    if conn_closed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // already flushed by a prior shutdown()/close()
+    }
+    if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
+        // Best-effort: a closed/full writer at graceful teardown is expected and
+        // not warned (unlike Drop's fire-and-forget path).
+        let _ = writer.send_with_ack(clse).await;
     }
 }
 
@@ -324,6 +363,14 @@ pub struct PersistentUsbConnection {
     /// error. The matching sender lives in (and is kept alive by) the reader
     /// task, so the receiver reports disconnect once the reader stops.
     pending_opens_rx: std::sync::Mutex<Option<mpsc::Receiver<ADBTransportMessage>>>,
+    /// Set once a connection-level CLSE has been flushed by [`Self::shutdown`] /
+    /// [`Self::close`] (or the connection is otherwise being torn down). Cloned
+    /// into every [`SessionInner`] so a session's `Drop` skips its now-redundant
+    /// per-stream CLSE: the single connection-level CLSE already told the device
+    /// every stream on this connection is gone, and the writer task is being
+    /// intentionally retired — re-enqueueing per-session CLSEs would only race
+    /// the writer's teardown and emit spurious "writer task gone" warnings.
+    conn_closed: Arc<AtomicBool>,
 }
 
 impl PersistentUsbConnection {
@@ -410,6 +457,7 @@ impl PersistentUsbConnection {
             features,
             delayed_ack_negotiated,
             pending_opens_rx: std::sync::Mutex::new(Some(pending_opens_rx)),
+            conn_closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -563,16 +611,11 @@ impl PersistentUsbConnection {
         private_key: &ADBRsaKey,
         features: &DeviceFeatureSet,
     ) -> Result<(u32, String)> {
-        // Drain any stale messages from previous sessions on this USB pipe
-        while let Ok(msg) = transport
-            .read_message_with_timeout(Duration::from_millis(100))
-            .await
-        {
-            tracing::trace!(
-                "PersistentUsb: drained stale message: cmd={}",
-                msg.header().command()
-            );
-        }
+        // Drain any stale messages from previous sessions on this USB pipe before
+        // the handshake. An unclean prior teardown can leave several orphaned
+        // streams' CLSE/WRTE frames buffered; a fresh CNXN handshake must not
+        // consume them as its response.
+        Self::drain_stale(transport).await;
 
         // Honest banner: advertise only features this end actually implements
         // (see `DeviceFeatureSet`). No trailing NUL — the real AOSP adb host
@@ -591,8 +634,13 @@ impl PersistentUsbConnection {
             A_VERSION_LEGACY
         };
 
-        // Try CNXN up to 3 times (adbd may send stale CLSE after unclean disconnect)
-        for attempt in 1..=3 {
+        // Try CNXN up to `CNXN_MAX_ATTEMPTS` times. After an unclean disconnect
+        // adbd can have MULTIPLE orphaned streams queued, each emitting a stale
+        // CLSE; the count scales with how many sessions the previous connection
+        // had open, so a fixed-3 bound was too low under the multi-session server
+        // path. Each stale CLSE we hit, we also re-drain before retrying so a burst
+        // of buffered CLSEs is cleared in one pass rather than one-per-attempt.
+        for attempt in 1..=CNXN_MAX_ATTEMPTS {
             let cnxn_msg = ADBTransportMessage::try_new(
                 MessageCommand::Cnxn,
                 cnxn_version,
@@ -621,8 +669,12 @@ impl PersistentUsbConnection {
                     ));
                 }
                 MessageCommand::Clse => {
-                    // Stale CLSE from previous session — retry
-                    tracing::debug!("PersistentUsb: got stale CLSE on attempt {attempt}, retrying");
+                    // Stale CLSE from a previous session — drain any sibling stale
+                    // frames buffered behind it, then retry the handshake.
+                    tracing::debug!(
+                        "PersistentUsb: got stale CLSE on attempt {attempt}/{CNXN_MAX_ATTEMPTS}, draining + retrying"
+                    );
+                    Self::drain_stale(transport).await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 _ => {
@@ -633,9 +685,32 @@ impl PersistentUsbConnection {
                 }
             }
         }
-        Err(RustADBError::ADBRequestFailed(
-            "CNXN failed after 3 attempts (stale CLSE)".into(),
-        ))
+        Err(RustADBError::ADBRequestFailed(format!(
+            "CNXN failed after {CNXN_MAX_ATTEMPTS} attempts (stale CLSE)"
+        )))
+    }
+
+    /// Drain any buffered stale frames on the USB pipe (left by a previous
+    /// connection's unclean teardown) so a fresh CNXN handshake does not consume
+    /// them as its response. Reads with a short per-frame timeout until the pipe
+    /// goes quiet. Best-effort and bounded by `STALE_DRAIN_MAX_FRAMES` so a device
+    /// that keeps chattering cannot wedge the drain forever.
+    async fn drain_stale(transport: &mut USBTransport) {
+        for _ in 0..STALE_DRAIN_MAX_FRAMES {
+            match transport
+                .read_message_with_timeout(Duration::from_millis(100))
+                .await
+            {
+                Ok(msg) => tracing::trace!(
+                    "PersistentUsb: drained stale message: cmd={}",
+                    msg.header().command()
+                ),
+                Err(_) => return, // timeout (pipe quiet) or transient read error
+            }
+        }
+        tracing::debug!(
+            "PersistentUsb: stale-drain hit the {STALE_DRAIN_MAX_FRAMES}-frame cap; proceeding"
+        );
     }
 
     /// Returns `(device_protocol_version, device_banner)` from the accepted CNXN
@@ -1125,6 +1200,7 @@ impl PersistentUsbConnection {
             writer: self.writer.clone(),
             control_tx: self.control_tx.clone(),
             closed: close_state,
+            conn_closed: Arc::clone(&self.conn_closed),
             windowed: self.delayed_ack_negotiated,
         };
 
@@ -1238,6 +1314,7 @@ impl PersistentUsbConnection {
             writer: self.writer.clone(),
             control_tx: self.control_tx.clone(),
             closed: Arc::new(AtomicBool::new(false)),
+            conn_closed: Arc::clone(&self.conn_closed),
             // Per-stream windowing (matches the OKAY we just sent), not the
             // connection-level flag.
             windowed,
@@ -1328,16 +1405,47 @@ impl PersistentUsbConnection {
         }
     }
 
-    /// Gracefully close the connection: enqueues a connection-level CLSE and
+    /// Flush a single connection-level CLSE while the writer task is still alive,
+    /// awaiting its write confirmation, and mark the connection closed.
+    ///
+    /// Idempotent: only the first call sends the CLSE; subsequent calls (and a
+    /// later `Drop`) observe the `conn_closed` flag and do nothing. Setting the
+    /// flag also suppresses every live [`SessionInner`]'s per-stream CLSE on its
+    /// own `Drop` — the connection-level CLSE already told the device the whole
+    /// connection (and thus every stream on it) is gone, so per-session CLSEs
+    /// would only race the writer's retirement and emit spurious warnings.
+    ///
+    /// Shared by [`Self::shutdown`] (`&self`, for `Arc`-held connections) and
+    /// [`Self::close`] (`self`, the consuming variant). This is the single source
+    /// of truth for the graceful CLSE; do not duplicate it.
+    async fn flush_connection_clse(&self) {
+        flush_connection_clse_impl(&self.writer, &self.conn_closed).await;
+    }
+
+    /// Gracefully close the connection through a shared reference.
+    ///
+    /// Flushes a single connection-level CLSE (awaiting the writer's confirmation)
+    /// so the device tears down every multiplexed stream cleanly, then leaves the
+    /// reader/writer tasks to wind down on `Drop`. Safe to call on an
+    /// `Arc<PersistentUsbConnection>` (the server backend holds connections that
+    /// way) and idempotent.
+    ///
+    /// Prefer this over relying on `Drop`: `Drop` is best-effort and, at process
+    /// teardown, the writer task is often already gone — so its fire-and-forget
+    /// CLSE fails to enqueue and the device is left with orphaned streams that
+    /// reject the next connection's CNXN with a stale CLSE.
+    pub async fn shutdown(&self) {
+        self.flush_connection_clse().await;
+    }
+
+    /// Gracefully close the connection: flushes a connection-level CLSE and
     /// aborts the background tasks after the writer drains.
     ///
     /// `Drop` does this best-effort automatically; call `close` explicitly when
     /// you want to ensure the CLSE is flushed before the connection is dropped.
+    /// For an `Arc`-shared connection use [`Self::shutdown`] instead.
     pub async fn close(mut self) {
-        // Best-effort connection-level CLSE.
-        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[]) {
-            let _ = self.writer.send_with_ack(clse).await;
-        }
+        self.flush_connection_clse().await;
         // Dropping the writer handle + control tx lets both tasks drain and exit;
         // then abort to guarantee they stop even if a read is in flight.
         if let Some(h) = self.reader_handle.take() {
@@ -1368,16 +1476,22 @@ enum ControlDrain {
 
 impl Drop for PersistentUsbConnection {
     fn drop(&mut self) {
-        // Best-effort connection-level CLSE: fire-and-forget onto the writer
-        // queue (we cannot `.await` in Drop). If the queue is full or the writer
-        // is gone, the abort below still tears the connection down.
-        if let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])
+        // If `shutdown`/`close` already flushed a connection-level CLSE (awaiting
+        // the writer), the device has been told cleanly — skip the fire-and-forget
+        // CLSE entirely so we never race the retiring writer and warn spuriously.
+        // Otherwise fall back to best-effort: fire-and-forget onto the writer queue
+        // (we cannot `.await` in Drop). If the queue is full or the writer is gone,
+        // the abort below still tears the connection down.
+        if !self.conn_closed.load(Ordering::Relaxed)
+            && let Ok(clse) = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])
             && let Err(e) = self.writer.try_send_fire_forget(clse)
         {
             // Best-effort contract: a full/closed writer queue means the
             // connection-level CLSE could not be delivered. The `abort` below
             // still tears the connection down, but the device may keep the
             // stream open until it times out — log it so the leak is observable.
+            // (Reachable only when the connection was dropped WITHOUT a prior
+            // graceful `shutdown`/`close`.)
             tracing::warn!("PersistentUsb: could not enqueue connection CLSE on drop: {e}");
         }
         if let Some(handle) = self.reader_handle.take() {
@@ -1400,6 +1514,12 @@ struct SessionInner {
     control_tx: mpsc::Sender<ReaderControl>,
     /// Shared close flag. `true` once a CLSE has been observed (inbound) or sent.
     closed: Arc<AtomicBool>,
+    /// Connection-level close flag (shared with [`PersistentUsbConnection`]).
+    /// `true` once a connection-level CLSE has been flushed by `shutdown`/`close`.
+    /// When set, this session's `Drop` skips its per-stream CLSE: the device has
+    /// already been told the whole connection is closing and the writer task is
+    /// being retired, so a per-session CLSE would only race teardown and warn.
+    conn_closed: Arc<AtomicBool>,
     /// Whether `delayed_ack` windowing is active for this session.
     windowed: bool,
 }
@@ -1416,8 +1536,14 @@ impl SessionInner {
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
+        // If the whole connection was gracefully closed (a connection-level CLSE
+        // was flushed by `shutdown`/`close`), skip the per-stream CLSE: the device
+        // already knows every stream on this connection is gone and the writer
+        // task is being intentionally retired. Still unregister from the reader.
+        let conn_closed = self.conn_closed.load(Ordering::Relaxed);
         // Best-effort CLSE + unregister. Fire-and-forget; cannot `.await` here.
-        if !self.is_closed()
+        if !conn_closed
+            && !self.is_closed()
             && let Ok(clse) = ADBTransportMessage::try_new(
                 MessageCommand::Clse,
                 self.local_id,
@@ -1495,6 +1621,7 @@ impl MultiplexedSession {
             writer: WriterHandle { tx: writer_tx },
             control_tx,
             closed: Arc::new(AtomicBool::new(false)),
+            conn_closed: Arc::new(AtomicBool::new(false)),
             windowed,
         });
         let session = Self {
@@ -1507,6 +1634,13 @@ impl MultiplexedSession {
             write_state: WriteState::Idle,
         };
         (session, data_tx, ack_tx, writer_rx, control_rx)
+    }
+
+    /// Test-only handle to the session's connection-level `conn_closed` flag, so a
+    /// test can emulate a prior graceful connection-level shutdown and assert that
+    /// the session's `Drop` then suppresses its per-stream CLSE.
+    fn conn_closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shared.conn_closed)
     }
 }
 
@@ -2462,6 +2596,94 @@ mod tests {
             ReaderControl::Unregister(id) => assert_eq!(id, 10),
             _ => panic!("close+drop must unregister"),
         }
+    }
+
+    /// PR1: once a connection-level CLSE has been flushed (graceful
+    /// `shutdown`/`close` set `conn_closed`), a session's `Drop` must NOT enqueue
+    /// its own per-stream CLSE — the device already knows the whole connection is
+    /// gone and the writer task is being retired. It must still unregister.
+    #[tokio::test]
+    async fn drop_after_connection_closed_suppresses_per_stream_clse() {
+        let (session, _data_tx, _ack_tx, mut writer_rx, mut control_rx) =
+            MultiplexedSession::new_for_test(10, 20, false, FlowControl::new_classic());
+
+        // Emulate a prior graceful connection-level shutdown.
+        session.conn_closed_flag().store(true, Ordering::Relaxed);
+
+        drop(session);
+
+        // No CLSE must be enqueued (the connection-level CLSE already covered it).
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "session Drop must not enqueue a per-stream CLSE after a connection-level close"
+        );
+        // ...but the reader must still be asked to unregister the session id.
+        match control_rx
+            .recv()
+            .await
+            .expect("unregister still enqueued on drop")
+        {
+            ReaderControl::Unregister(id) => assert_eq!(id, 10, "drop still unregisters the id"),
+            _ => panic!("drop must still enqueue an Unregister"),
+        }
+    }
+
+    /// PR1: `flush_connection_clse` (the shared core of `shutdown`/`close`) sends
+    /// exactly one connection-level CLSE with an ack, sets `conn_closed`, and is
+    /// idempotent — a second call enqueues nothing more.
+    #[tokio::test]
+    async fn flush_connection_clse_sends_once_and_is_idempotent() {
+        // A bare connection wired to a writer channel we can observe. We only need
+        // the writer handle + the conn_closed flag, so build the minimum.
+        let (writer_tx, mut writer_rx) = mpsc::channel(WRITER_CHANNEL_SIZE);
+        let conn_closed = Arc::new(AtomicBool::new(false));
+
+        // Emulate the writer task: ack the first frame so send_with_ack completes.
+        let pump = tokio::spawn(async move {
+            let mut frames = Vec::new();
+            // First (and only expected) frame: the connection-level CLSE.
+            if let Some(frame) = writer_rx.recv().await {
+                match frame {
+                    OutboundFrame::WithAck(m, ack) => {
+                        let _ = ack.send(Ok(()));
+                        frames.push(m);
+                    }
+                    OutboundFrame::FireForget(m) => frames.push(m),
+                }
+            }
+            // Drain anything else (there must be none) without blocking forever.
+            while let Ok(extra) = writer_rx.try_recv() {
+                match extra {
+                    OutboundFrame::WithAck(m, ack) => {
+                        let _ = ack.send(Ok(()));
+                        frames.push(m);
+                    }
+                    OutboundFrame::FireForget(m) => frames.push(m),
+                }
+            }
+            frames
+        });
+
+        // Drive the shared flush helper twice against a bare writer channel.
+        let writer = WriterHandle { tx: writer_tx };
+        flush_connection_clse_impl(&writer, &conn_closed).await;
+        assert!(
+            conn_closed.load(Ordering::Relaxed),
+            "flush must set conn_closed"
+        );
+        // Second call: idempotent, enqueues nothing.
+        flush_connection_clse_impl(&writer, &conn_closed).await;
+
+        drop(writer); // close the channel so the pump's loop can end
+        let frames = pump.await.expect("writer pump");
+        assert_eq!(frames.len(), 1, "exactly one connection-level CLSE");
+        assert_eq!(
+            frames[0].header().command(),
+            MessageCommand::Clse,
+            "the flushed frame is a CLSE"
+        );
+        assert_eq!(frames[0].header().arg0(), 0, "connection CLSE has arg0=0");
+        assert_eq!(frames[0].header().arg1(), 0, "connection CLSE has arg1=0");
     }
 
     #[tokio::test]

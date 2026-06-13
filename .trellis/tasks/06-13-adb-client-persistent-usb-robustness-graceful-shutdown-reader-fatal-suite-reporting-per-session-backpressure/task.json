@@ -1,0 +1,30 @@
+{
+  "id": "adb-client-persistent-usb-robustness-graceful-shutdown-reader-fatal-suite-reporting-per-session-backpressure",
+  "name": "adb-client-persistent-usb-robustness-graceful-shutdown-reader-fatal-suite-reporting-per-session-backpressure",
+  "title": "adb_client persistent USB robustness: graceful shutdown, reader-fatal suite reporting, per-session backpressure",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "magicdian",
+  "assignee": "magicdian",
+  "createdAt": "2026-06-13",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-13-pr1-graceful-shutdown",
+    "06-13-pr2-reader-fatal-reporting",
+    "06-13-pr3-backpressure-control-signals"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

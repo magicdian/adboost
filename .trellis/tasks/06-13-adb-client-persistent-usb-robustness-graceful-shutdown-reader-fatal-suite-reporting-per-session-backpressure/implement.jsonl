@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "PR1 drain-stale 与 CNXN 重试、PR3 OKAY/CLSE 流控与 delayed_ack 窗口记账都直接受线协议契约约束；改动 reader demux / close 语义前必须遵守。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "PR2 要把 reader 致命错误如实上报为连接级失败、PR1 新增 shutdown API 的 Result 契约；改 Result/panic/错误传播路径必读。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "本任务核心就是收敛/重定级一批 tracing::warn（writer task gone / queue full dropped）；新增 shutdown、故障上报的日志需遵守级别与格式约定。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "persistent USB 连接的 session 注册表 / closed 标志 / 缓存连接是进程内有状态资源；优雅关闭与生命周期改动属 session state 范畴。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Always：改动跨 adb_client(message_devices/usb, server) 与 adboost_cli(selftest, daemon)，需按既有模块边界放置代码。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Always：编译/clippy/测试质量门，新增单测沿用 persistent.rs 既有无硬件 tests 模式。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "缺陷贯穿 selftest → server frontend/backend → PersistentUsbConnection reader/writer 多层；优雅关闭触发点与故障上报需跨层一致。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "新增 &self shutdown 应复用既有 close(self) 的 CLSE flush 逻辑，避免与 Drop 重复实现关闭路径。"}

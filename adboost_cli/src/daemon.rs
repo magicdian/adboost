@@ -215,6 +215,9 @@ async fn run_server(
         }
     );
     let backend = Arc::new(UsbDeviceBackend::new());
+    // Keep a handle to the backend so we can gracefully close its cached device
+    // connections on shutdown (the frontend takes ownership of its own clone).
+    let shutdown_backend = Arc::clone(&backend);
     let frontend = AdbServerFrontend::builder(backend).addr(address).build();
 
     #[cfg(unix)]
@@ -234,6 +237,9 @@ async fn run_server(
             _ = tokio::signal::ctrl_c() => tracing::info!("interrupt received; shutting down adb server"),
         }
     }
+    // Flush a connection-level CLSE to every cached device while the writer tasks
+    // are still alive, so devices are not left with orphaned streams.
+    shutdown_backend.shutdown().await;
     Ok(())
 }
 

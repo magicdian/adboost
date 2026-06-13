@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 CLSE/OKAY/CNXN 改动未违反线协议契约：drain-stale 重试、窗口记账、关闭握手语义。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 shutdown API 与 reader 致命错误上报的 Result/错误类型符合规范，无吞错或误降级。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "校验日志级别正确：原本 warn 的泄漏告警在优雅关闭后应消失或降级，新增日志符合格式。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门：build/clippy/测试全绿，新增单测覆盖优雅关闭 flush CLSE 与 CLSE 队满仍可观测。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验优雅关闭触发点在 daemon/InProcessServer/backend/connection 各层接入一致、无遗漏。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "校验 shutdown 与 close/Drop 的关闭逻辑无重复实现、单一真相来源。"}

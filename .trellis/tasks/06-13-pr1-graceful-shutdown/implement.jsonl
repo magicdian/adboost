@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "shutdown 发连接级 CLSE、drain-stale 与 CNXN 重试加固直接受 CLSE/CNXN 线协议契约约束。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "新增 shutdown API 的 Result/错误传播；若加 RustADBError 变体须在 adb_cli_error.rs 穷尽 match 分类。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "本 PR 目标即消除/降级一批 warn；新增日志须全限定 tracing:: + PersistentUsb: 前缀、正确级别。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "shutdown 触及 session 注册表 / 缓存连接生命周期；锁点须 ? 传播 PoisonError，不抄 lock().unwrap()。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门 + sans-io 内联测试模式（断言 writer_rx 收到 CLSE）。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "优雅关闭触发点跨 daemon/InProcessServer/backend/connection 多层，须一致接入无遗漏。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "shutdown(&self) 须复用 close(self) 的 CLSE flush 逻辑，避免与 Drop 重复实现关闭路径。"}

@@ -54,6 +54,10 @@ pub fn discover_devices() -> Result<Vec<DiscoveredDevice>, String> {
 pub struct InProcessServer {
     addr: SocketAddrV4,
     task: tokio::task::JoinHandle<()>,
+    /// Handle to the backend whose cached device connections must be gracefully
+    /// closed (connection-level CLSE flushed) before the process tears down — see
+    /// [`InProcessServer::shutdown`].
+    backend: Arc<UsbDeviceBackend>,
 }
 
 impl InProcessServer {
@@ -85,6 +89,9 @@ impl InProcessServer {
         drop(listener);
 
         let backend = Arc::new(UsbDeviceBackend::new());
+        // Keep a handle to gracefully close the backend's cached device
+        // connections on shutdown (the frontend takes ownership of its own clone).
+        let shutdown_backend = Arc::clone(&backend);
         let frontend = AdbServerFrontend::builder(backend)
             .addr(SocketAddr::V4(addr))
             .build();
@@ -97,7 +104,11 @@ impl InProcessServer {
         // Give the frontend a moment to rebind the port before clients connect.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        Ok(Self { addr, task })
+        Ok(Self {
+            addr,
+            task,
+            backend: shutdown_backend,
+        })
     }
 
     /// The loopback address clients should connect to.
@@ -105,10 +116,27 @@ impl InProcessServer {
     pub fn addr(&self) -> SocketAddrV4 {
         self.addr
     }
+
+    /// Gracefully shut the server down: flush a connection-level CLSE to every
+    /// cached device connection (while the writer tasks are still alive), then
+    /// abort the accept loop and free the port.
+    ///
+    /// Prefer this over relying on `Drop` (which can only `abort` the accept task,
+    /// not `.await` the backend's per-connection CLSE flush). Without it the device
+    /// connections are torn down at process exit when their writer tasks may
+    /// already be gone, leaving orphaned streams that make the next run's
+    /// `usb_direct` CNXN hit a stale CLSE.
+    pub async fn shutdown(self) {
+        self.backend.shutdown().await;
+        self.task.abort();
+    }
 }
 
 impl Drop for InProcessServer {
     fn drop(&mut self) {
+        // Fallback only: graceful teardown should go through `shutdown().await`,
+        // which flushes per-connection CLSEs first. Drop cannot `.await`, so it can
+        // only stop the accept loop.
         self.task.abort();
     }
 }

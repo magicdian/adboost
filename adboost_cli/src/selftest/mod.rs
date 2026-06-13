@@ -163,7 +163,12 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
         // client (auto-detected; SKIPPED when adb is absent).
         run_parity_against_server(reporter, server.addr(), serial).await;
     }
-    // `server` dropped here → accept loop aborted, port freed.
+    // Gracefully shut the server down: flush a connection-level CLSE to every
+    // cached device connection while their writer tasks are still alive, then
+    // free the port. This prevents orphaned device streams that would otherwise
+    // make a subsequent run's `usb_direct` CNXN hit a stale CLSE. (A bare drop
+    // would only abort the accept loop, not flush the CLSEs.)
+    server.shutdown().await;
 }
 
 /// Device-listen port used by the reverse data-plane cases (arbitrary high port

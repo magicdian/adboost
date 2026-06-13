@@ -277,3 +277,43 @@ Three complementary fixes shipped, all still valid:
    the 4-byte OKAY) was **refuted** against AOSP (separate header/payload writes).
 
 Downstream may now drop the `delayed_ack=false` workaround and use windowed mode.
+
+## Graceful teardown: flush ONE connection-level CLSE while the writer is alive
+
+A persistent connection MUST be torn down through an explicit graceful path —
+`PersistentUsbConnection::shutdown(&self)` (for `Arc`-held connections, e.g. the
+server backend cache) or `close(self)` — **not** left to `Drop`. The graceful
+path flushes exactly one **connection-level CLSE** (`A_CLSE(arg0=0, arg1=0)`)
+via `send_with_ack` (awaiting the write) and sets a shared `conn_closed` flag.
+
+- **Why not Drop**: `Drop` can only fire-and-forget a CLSE onto the writer
+  channel (no async in `Drop`). At process teardown the tokio runtime often
+  retires the **writer task before** the connection's `Drop` runs, so the
+  enqueue fails (`BrokenPipe "writer task gone"`) and the device is left with
+  orphaned streams. On the NEXT connection those orphans surface as stale
+  `A_CLSE` replies to the fresh `CNXN`, which (without enough retries) fails the
+  handshake — observed as flaky `usb_direct` SKIPs in selftest across runs.
+- **One CLSE, not N**: a connection-level `CLSE(0,0)` tells adbd the whole
+  connection is gone, so per-stream CLSEs are redundant. Setting `conn_closed`
+  makes each live `SessionInner::Drop` **skip** its per-stream CLSE — otherwise
+  they race the retiring writer and emit spurious `writer task gone` warnings.
+- **Idempotent**: `flush_connection_clse_impl` uses a `compare_exchange` on
+  `conn_closed` so the first caller wins; repeat `shutdown`/`close` + the later
+  `Drop` send nothing more. `Drop` also checks `conn_closed` and skips its
+  fallback CLSE when a graceful close already ran.
+- **Wiring (cross-layer, all required)**: `daemon::run_server` (after
+  SIGTERM/ctrl_c) and selftest's `InProcessServer::shutdown` both call
+  `UsbDeviceBackend::shutdown().await`, which drains the `conns` cache and
+  `shutdown()`s each connection BEFORE aborting the accept loop / exiting. A bare
+  `Drop`/`task.abort()` is insufficient.
+
+## Stale-CLSE drain is bounded and re-run per stale reply
+
+`do_connect` drains buffered stale frames before the handshake (`drain_stale`,
+bounded by `STALE_DRAIN_MAX_FRAMES`) AND re-drains after each stale `CLSE`
+response, retrying CNXN up to `CNXN_MAX_ATTEMPTS` (8, was a fixed 3). The count
+matters: an unclean teardown can leave one orphaned stream's CLSE **per session**
+the previous connection had open, so the multi-session server path can queue
+several — a fixed-3 bound under-counted and failed the handshake. This is
+belt-and-suspenders behind the graceful-teardown fix above: even if a CLSE is
+ever missed, the next connect self-heals instead of failing.

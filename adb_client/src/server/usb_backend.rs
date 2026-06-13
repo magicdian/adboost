@@ -101,6 +101,32 @@ impl UsbDeviceBackend {
         }
     }
 
+    /// Gracefully close every cached device connection.
+    ///
+    /// Call this on server teardown (SIGTERM / shutdown), BEFORE the process /
+    /// runtime starts tearing tasks down. Each connection flushes a single
+    /// connection-level CLSE while its writer task is still alive, so the device
+    /// tears every multiplexed stream down cleanly. Without this, connections are
+    /// only dropped at process exit — when the writer task may already be gone, so
+    /// the fire-and-forget CLSE fails and the device is left with orphaned streams
+    /// that reject the next CNXN with a stale CLSE (the selftest flaky-SKIP cause).
+    ///
+    /// Drains the cache so a re-used backend re-opens fresh connections. Idempotent.
+    pub async fn shutdown(&self) {
+        let conns: Vec<Arc<PersistentUsbConnection>> = {
+            let mut map = self.conns.lock().await;
+            map.drain().map(|(_serial, conn)| conn).collect()
+        };
+        for conn in conns {
+            // `shutdown` takes `&self` and is idempotent; any extra `Arc` clones
+            // held by reverse pumps will observe the connection already closed.
+            conn.shutdown().await;
+        }
+        // Reverse pumps key off the (now-closed) connections' readers stopping;
+        // clear the map so a restarted backend rebuilds them.
+        self.reverse.lock().await.clear();
+    }
+
     /// Get the cached connection for `serial`, opening (and caching) it on first
     /// use. A dead cached connection (reader task exited) is replaced.
     async fn get_or_open(&self, serial: &str) -> Result<Arc<PersistentUsbConnection>> {
