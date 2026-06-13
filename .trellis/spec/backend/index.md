@@ -34,7 +34,7 @@ Read the relevant guideline before writing code in that area:
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Workspace + module layout, mod.rs convention, models/commands split, device trait layering | Filled |
+| [Directory Structure](./directory-structure.md) | Workspace + module layout, mod.rs convention, models/commands split, device trait layering, composable backend helpers (sync/shell_v2/`ReverseEngine`) + reverse-by-link-type | Filled |
 | [Persistence & External State](./database-guidelines.md) | No DB; RSA key on disk, USB session multiplexing, state conventions | Filled |
 | [Error Handling](./error-handling.md) | `RustADBError` (thiserror), `Result` alias, CLI `ADBCliError`, PyO3 `anyhow` mapping | Filled |
 | [Quality Guidelines](./quality-guidelines.md) | clippy pedantic, MSRV, features, testing style, quality gate | Filled |

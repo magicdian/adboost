@@ -136,6 +136,75 @@ for **four** concrete types:
 
 ---
 
+## Composable backend helpers (`usb::`) — sync / shell_v2 / reverse
+
+The optional `DeviceBackend` capabilities (`open_sync_session` / `open_shell_v2`
+/ the `open_reverse` family) are **not** reimplemented per backend. Each is a
+small composable helper living in `usb::`, so any backend can delegate to it in
+a few lines (the bundled `UsbDeviceBackend` and downstreams like xdb stay
+symmetric):
+
+| Capability | Helper (in `usb::`) | Shape | Backend delegates via |
+|---|---|---|---|
+| `sync:` | `SyncSession` | per-call session | `conn.open_sync_session()` |
+| `shell,v2` | `ShellV2Session` | per-call session | `conn.open_shell_v2(cmd)` |
+| `reverse:` | `ReverseEngine` | **stateful, per-connection** | `ReverseEngine::new(conn, policy)` then `open/remove/remove_all/list` |
+
+`bridge_tcp_session(host: TcpStream, session: MultiplexedSession)` (also `usb::`)
+is the one bidirectional half-close copy shared by the `server` frontend's
+forward/local bridges **and** the reverse pump's host-dial side — don't re-derive
+it. `ReversePolicy` lives in `usb::reverse_policy`; `server::ReversePolicy` is a
+backward-compat `pub use` (the type predates the move). All of these sit under
+the `usb` feature; `server` implies `usb`, so the frontend always sees them.
+
+### Convention: choose the reverse implementation by link type
+
+**What**: A backend's `open_reverse` family must match how it reaches the device.
+
+- **Acts-as-a-server backend** (it *is* the ADB server for a directly-attached
+  device; holds its own `PersistentUsbConnection` — `UsbDeviceBackend`, xdb):
+  delegate to `usb::ReverseEngine`. Nobody else services the device's
+  device-initiated `A_OPEN`s, so this backend must run the pump itself.
+- **Proxy-style backend** (sits in front of a real adb server — `crate::proxy`):
+  **only forward the `reverse:` control command** and return (see
+  `proxy/device_commands/reverse.rs`). The downstream adb server owns the reverse
+  data path. Do **not** instantiate `ReverseEngine` here.
+
+**Why**: `ReverseEngine`'s pump calls `conn.incoming_opens()` (single-consumer)
+and accepts the device's inbound opens. If a proxy ran it *and* a real adb server
+were also draining that device, they would race for the same `A_OPEN`s. Reverse's
+**control plane** (build/remove/list rules) is link-agnostic; its **data plane**
+(accept inbound → dial host → bridge) belongs to whoever is the device's server.
+
+### `ReverseEngine` contract (stable public API)
+
+```rust
+// usb::ReverseEngine — one device connection's rules + lazy inbound-open pump.
+pub fn new(conn: Arc<PersistentUsbConnection>, policy: ReversePolicy) -> Arc<Self>;
+pub async fn open(self: &Arc<Self>, remote: &str, local: &str) -> Result<()>;
+pub async fn remove(&self, remote: &str) -> Result<()>;
+pub async fn remove_all(&self) -> Result<()>;
+pub async fn list(&self) -> String; // `(reverse) <remote> <local>\n` lines, sorted
+```
+
+Two guarantees callers may rely on (documented on the type):
+
+1. **Pump readiness**: `open()` starts the inbound-open pump *before* it asks the
+   device to bind its listener (internal order: `ensure_pump → reverse:forward
+   command → record rule`). The first inbound connection after the listener
+   appears is never dropped; callers issue no separate `start`.
+2. **Per-connection, serial-free**: the engine owns exactly one
+   `PersistentUsbConnection` and holds no serial. Multi-device callers keep one
+   `Arc<ReverseEngine>` per device alongside their serial→connection map.
+
+> **Gotcha**: `PersistentUsbConnection::incoming_opens()` is single-consumer
+> (takeable once). Build **at most one** `ReverseEngine` per connection — a second
+> engine's pump silently fails to take the receiver and never services opens. The
+> rule registry + policy are factored into a connection-free inner `RuleSet`, so
+> rule/policy logic is unit-tested without hardware.
+
+---
+
 ## Public API re-export idiom (`lib.rs`)
 
 Crate root sets `#![forbid(unsafe_code)]`, doc-includes `../README.md`, and gates
