@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verification bar: clippy pedantic 0 warnings, MSRV, and the feature-combo build/test/doctest matrix the acceptance criteria require — checker validates against this."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Confirms the rename matches the documented workspace layout and that this spec itself was updated (R7) — no lingering adb_client crate-name references except upstream attribution."}
