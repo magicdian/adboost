@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 15
+- **Total Sessions**: 16
 - **Last Active**: 2026-06-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~636 | Active |
+| `journal-1.md` | ~669 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 16 | 2026-06-15 | Fix reboot-recovery selftest + through-server shell exit code | `c7a09d1` | `main` |
 | 15 | 2026-06-15 | Fix tport:any error wording for multi-device (no -s) | `087ee85` | `main` |
 | 14 | 2026-06-13 | Export composable usb::ReverseEngine for external DeviceBackend impls | `3e96e47`, `ec22bd2`, `c19e7c6` | `main` |
 | 13 | 2026-06-13 | adboost server P1-P4 (forward/sync/shell-v2/reverse) + interactive self-test harness | `866dac4`, `f5ef847` | `main` |

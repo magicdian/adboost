@@ -634,3 +634,36 @@ Fixed select_tport collapsing all failures to 'device not found'; multi-device a
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: Fix reboot-recovery selftest + through-server shell exit code
+
+**Date**: 2026-06-15
+**Task**: Fix reboot-recovery selftest + through-server shell exit code
+**Branch**: `main`
+
+### Summary
+
+Interactive selftest surfaced two defects. (1) interactive.reboot_recovery failed with 'session channel closed': reboot was issued over shell:reboot and the read hit BrokenPipe when the device tore the stream down. Added PersistentUsbConnection::reboot using the dedicated reboot: service (open_session confirms OKAY, no EOF read). (2) through_server.shell_exit_code was SKIPPED. Diagnostics revealed the proxy's host:features (sent after host:transport:<serial> on the same connection) was rejected by the server frontend as 'service not supported', forcing fallback to v1 shell with no exit codes. Fixed the frontend to answer post-transport host:features/host:version from negotiated caps. Also hardened the proxy shell-v2 decoder to return the captured exit code on trailing EOF (Ok(exit) not Ok(None)) and extracted it into a unit-tested free function. reboot_recovery verified PASS on hardware; shell_exit_code fix verified by diagnostics + new server unit test. 168 adb_client tests + 21 cli tests green, clippy clean.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c7a09d1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
