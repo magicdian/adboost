@@ -790,3 +790,36 @@ Closed the tcpip gap vs official adb and fixed 'unknown host service: connect:'.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: Rename library crate adb_client -> adboost (main line)
+
+**Date**: 2026-06-15
+**Task**: Rename library crate adb_client -> adboost (main line)
+**Branch**: `main`
+
+### Summary
+
+Completed the long-deferred library crate rename adb_client -> adboost across the two active workspace members (library + adboost_cli). Decision context: the fork is fully detached from upstream cocool97/adb_client (async rewrite + reshaped API: proxy/ rename, new server/ module, nusb), so upstream patch-pulling is already manual-only and the old crate name no longer served as a compat anchor. git mv adb_client/ -> adboost/ (129 renames, history preserved); name='adboost'. Updated workspace root (members, header comment, dropped the now-meaningless [patch.crates-io] adb_client stanza), adboost_cli's 16 .rs files + path dep, library handshake host identity (adb_client@ -> adboost@ in adb_rsa_key.rs — note: already-authorized devices may re-prompt for USB debugging), rustdoc/log-target/docs.rs-badge docs, benches, release CI (cargo publish -p adboost), and 8 backend spec docs (retired the 'reserved for future rename' note). Three reference classes handled distinctly: crate-name -> adboost; cocool97/adb_client attribution links PRESERVED (courtesy); bug-report links RETARGETED to magicdian/adboost/issues so our issues don't disturb upstream. pyadb_client/ and examples/ intentionally untouched (off main line, already broken vs current API; path deps dangle by design, separate future migration). Verified green: workspace build, feature combos (server/usb/mdns), lib(4 doc)+cli(21) tests, doctests(5 all-features), clippy pedantic 0 warnings, bench compile, fmt. Both acceptance greps empty. trellis-implement + trellis-check both passed with no fixes.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0a55c91` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
