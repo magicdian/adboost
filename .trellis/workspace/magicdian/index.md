@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
+- **Total Sessions**: 17
 - **Last Active**: 2026-06-15
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~669 | Active |
+| `journal-1.md` | ~792 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-06-15 | tcpip mainline parity (PR1-5 + PR4a/b) | `c6447d7` | `feat/tcpip-mainline-parity` |
 | 16 | 2026-06-15 | Fix reboot-recovery selftest + through-server shell exit code | `c7a09d1` | `main` |
 | 15 | 2026-06-15 | Fix tport:any error wording for multi-device (no -s) | `087ee85` | `main` |
 | 14 | 2026-06-13 | Export composable usb::ReverseEngine for external DeviceBackend impls | `3e96e47`, `ec22bd2`, `c19e7c6` | `main` |

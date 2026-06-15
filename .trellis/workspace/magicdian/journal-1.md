@@ -737,3 +737,56 @@ TLS adbd). Ordering now mirrors the device-verified direct-TCP path. Plain
 (non-TLS) `host:connect` is fully exercised in logic.
 
 PR1–5 + PR4a/b all complete. Awaiting user acceptance, then commit.
+
+## 2026-06-15 — ACCEPTED (real-device selftest)
+
+User ran `adboost_cli selftest` on 2 real devices (XPENG d02, SA8155P-ADP).
+28/29 passed. The single FAILED — `tcpip.shell_through_tcp_device` — is an
+ENVIRONMENT limitation, not a code defect: the device's adb-over-tcp IP
+(172.20.1.45, its ethernet internal IP) is not routable from the host, so
+`host:connect` times out. Validating it needs device+host on the same reachable
+network (WiFi / USB-tethering), unavailable here.
+
+Crucially, the `host:connect` ROUTING itself IS verified on hardware:
+`parity.official_adb_connect_routing` PASSED (real `adb` client → adboost server),
+which is the exact path of the originally-reported `unknown host service:
+connect:` bug. Also green on real devices: through_server shell/shell_v2/
+push-pull/forward/reverse/iperf3 (both devices), interactive usb_replug +
+reboot_recovery.
+
+User accepts: tcpip mainline parity complete; the TCP-link end-to-end is
+deferred to an environment that has a reachable wireless link. Per user
+decision, the interactive case stays FAILED-on-unreachable (no skip softening).
+
+
+## Session 17: tcpip mainline parity (PR1-5 + PR4a/b)
+
+**Date**: 2026-06-15
+**Task**: tcpip mainline parity (PR1-5 + PR4a/b)
+**Branch**: `feat/tcpip-mainline-parity`
+
+### Summary
+
+Closed the tcpip gap vs official adb and fixed 'unknown host service: connect:'. Added tcpip/usb to ADBDeviceExt (direct+proxy) + CLI verbs; server bridges device control services (tcpip/usb/root/reboot/remount/verity); added host:connect/disconnect, wait-for-*, reconnect-offline with a unified USB+TCP device table; renamed UsbDeviceBackend->DefaultDeviceBackend; generalized the persistent multiplexer to PersistentConnection<T> so the server bridges shell/sync/tcp through to host:connect'd TCP devices (3 wire regressions preserved; STLS double-read bug caught+fixed in review). Real-device selftest 28/29; the one FAILED is an env-only unreachable TCP link, host:connect routing itself verified green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c6447d7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
