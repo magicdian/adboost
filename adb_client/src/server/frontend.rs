@@ -147,19 +147,45 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 let Some(local) = read_request(&mut stream).await? else {
                     return Ok(()); // client selected a transport then hung up
                 };
-                // After selecting a transport, a client may issue a forward-family
-                // *host* request (this is how our own `ADBProxyDevice::forward`
-                // works: `host:transport:<serial>` then `host:forward:...`). Route
-                // those to the forward handler against the already-chosen serial
-                // rather than treating them as a local service to bridge.
-                if let Some(svc) = local.strip_prefix("host:")
-                    && is_forward_family(svc)
-                {
-                    return match svc {
-                        "list-forward" => self.serve_list_forward(&mut stream).await,
-                        "killforward-all" => self.serve_killforward_all(&mut stream).await,
-                        _ => self.serve_forward_family(&mut stream, svc, &serial).await,
-                    };
+                // After selecting a transport, a client may still issue a `host:*`
+                // request on the same connection rather than a local service to
+                // bridge. AOSP `adb` does this: e.g. `ADBProxyDevice::shell_command`
+                // sends `host:transport:<serial>` then `host:features` to decide
+                // shell v1 vs v2, and `ADBProxyDevice::forward` sends
+                // `host:transport:<serial>` then `host:forward:...`. Route these
+                // post-transport host requests to their host handlers against the
+                // already-chosen serial instead of `map_local_service` (which would
+                // reject them as "service not supported").
+                if let Some(svc) = local.strip_prefix("host:") {
+                    if is_forward_family(svc) {
+                        return match svc {
+                            "list-forward" => self.serve_list_forward(&mut stream).await,
+                            "killforward-all" => self.serve_killforward_all(&mut stream).await,
+                            _ => self.serve_forward_family(&mut stream, svc, &serial).await,
+                        };
+                    }
+                    // `host:features` / `host:version` are answered from the
+                    // server's negotiated capabilities (the transport is already
+                    // chosen; these are not transport-specific in our backend).
+                    match svc {
+                        "features" => {
+                            stream
+                                .write_all(&reply_or_overflow(protocol::okay_data(
+                                    &self.caps.features_csv(),
+                                )))
+                                .await?;
+                            return Ok(());
+                        }
+                        "version" => {
+                            stream
+                                .write_all(&reply_or_overflow(protocol::okay_data(
+                                    self.caps.version_hex(),
+                                )))
+                                .await?;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
                 self.serve_local_service(stream, &local, &serial).await
             }
@@ -1093,6 +1119,58 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("invalid transport id"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_features_after_transport_select_is_answered_not_rejected() {
+        // Regression: `ADBProxyDevice::shell_command` sends `host:transport:<serial>`
+        // and THEN `host:features` on the same connection to choose shell v1 vs v2.
+        // The post-transport `host:features` must be answered from the server's
+        // capabilities, not routed to `map_local_service` (which rejected it with
+        // "service not supported", forcing the proxy down the v1 path with no exit
+        // codes — observed as a SKIPPED `through_server.shell_exit_code`).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = f.handle_client(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+
+        // 1) Select the transport — server replies OKAY and keeps the socket open.
+        let req = "host:transport:solo";
+        client
+            .write_all(format!("{:04x}{req}", req.len()).as_bytes())
+            .await
+            .expect("write transport");
+        client.flush().await.expect("flush");
+        let mut okay = [0u8; 4];
+        client.read_exact(&mut okay).await.expect("read OKAY");
+        assert_eq!(&okay, b"OKAY", "transport selection must succeed");
+
+        // 2) Post-transport host:features — must be OKAY + the advertised features,
+        //    NOT a FAIL.
+        let req = "host:features";
+        client
+            .write_all(format!("{:04x}{req}", req.len()).as_bytes())
+            .await
+            .expect("write features");
+        client.flush().await.expect("flush");
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.expect("read features");
+        let body = String::from_utf8(rest).unwrap();
+        assert!(
+            body.starts_with("OKAY"),
+            "post-transport host:features must be answered, got: {body}"
+        );
+        assert!(
+            body.contains("cmd"),
+            "features must list the server's caps: {body}"
+        );
+
+        server.await.expect("server task");
     }
 
     #[tokio::test]

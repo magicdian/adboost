@@ -67,7 +67,7 @@ use crate::message_devices::usb::flow_control::{
 use crate::message_devices::usb::shell_v2_session::ShellV2Session;
 use crate::message_devices::usb::sync_session::SyncSession;
 use crate::message_devices::usb::usb_transport::USBTransport;
-use crate::models::{ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK};
+use crate::models::{ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK, RebootType};
 use crate::utils::get_default_adb_key_path;
 use crate::{Result, RustADBError};
 
@@ -1445,6 +1445,24 @@ impl PersistentUsbConnection {
 
         let text = String::from_utf8_lossy(&output).to_string();
         Ok((text, None))
+    }
+
+    /// Reboot the device via the dedicated `reboot:` local service.
+    ///
+    /// Unlike issuing `reboot` over a shell ([`Self::shell_exec`]), this does
+    /// NOT read the stream to EOF: the reboot tears the connection down
+    /// immediately, so a shell read would surface the teardown as a
+    /// `BrokenPipe` ("session channel closed") error. The `reboot:` service is
+    /// request-only — [`Self::open_session`] already confirms the device's OKAY
+    /// before returning, which is the full success criterion (mirrors
+    /// `ADBMessageDevice::reboot`). We then drop the session without reading.
+    pub async fn reboot(&self, reboot_type: RebootType) -> Result<()> {
+        // open_session confirms the device accepted the service (OKAY). The
+        // device reboots and drops the connection; there is nothing to read.
+        let _session = self
+            .open_session(&ADBLocalCommand::Reboot(reboot_type))
+            .await?;
+        Ok(())
     }
 
     /// Check if the connection is still alive (reader task running).

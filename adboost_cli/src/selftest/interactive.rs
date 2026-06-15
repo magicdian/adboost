@@ -17,6 +17,7 @@ use tokio::time::sleep;
 use super::cases;
 use super::channels::{DiscoveredDevice, discover_devices};
 use super::report::{CaseResult, Outcome, Reporter};
+use adb_client::RebootType;
 use adb_client::usb::PersistentUsbConnection;
 
 /// How long to wait for a device to disappear / reappear before failing.
@@ -98,10 +99,13 @@ async fn case_reboot_recovery(serial: &str) -> Outcome {
         return Outcome::Skipped("operator declined reboot".into());
     }
 
-    // Issue the reboot over a fresh persistent connection (reboot: local service).
+    // Issue the reboot over the dedicated `reboot:` local service on a fresh
+    // persistent connection. NOT `shell_exec("reboot")`: the reboot tears the
+    // stream down immediately, which a shell read surfaces as a "session
+    // channel closed" error; the `reboot:` service is request-only (OKAY ⇒ done).
     match PersistentUsbConnection::new_from_serial(serial, None).await {
         Ok(conn) => {
-            if let Err(e) = conn.shell_exec("reboot").await {
+            if let Err(e) = conn.reboot(RebootType::System).await {
                 return Outcome::Failed(format!("reboot command failed: {e}"));
             }
             conn.close().await;

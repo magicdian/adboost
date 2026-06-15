@@ -183,8 +183,8 @@ impl ADBProxyDevice {
     async fn shell_command_v2(
         &mut self,
         command: &(dyn AsRef<str> + Sync),
-        mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
-        mut stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
         let mut args = vec!["v2".to_string()];
 
@@ -202,87 +202,8 @@ impl ADBProxyDevice {
 
         // Now decode the shell v2 protocol packets, reference:
         // https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/shell_protocol.h
-
-        let mut exit = None;
         let input = self.transport.get_raw_connection()?;
-
-        let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
-        loop {
-            // 1 byte of channel
-            // 4 bytes of payload size
-            let mut pckt_metadata = [0u8; 5];
-            if let Err(err) = input.read_exact(&mut pckt_metadata).await {
-                match err.kind() {
-                    ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(None),
-                    _ => return Err(RustADBError::IOError(err)),
-                }
-            }
-
-            let (channel, payload_size) = {
-                let channel = pckt_metadata[0];
-                let payload_size = u32::from_le_bytes(pckt_metadata[1..5].try_into()?) as usize;
-                (ShellChannel::try_from(channel)?, payload_size)
-            };
-
-            if payload_size == 0 {
-                continue;
-            }
-
-            match channel {
-                ShellChannel::Stdout | ShellChannel::Stderr => {
-                    let mut remainder = payload_size;
-                    while remainder > 0 {
-                        let to_read = std::cmp::min(remainder, BUFFER_SIZE);
-                        match input.read(&mut buffer[0..to_read]).await {
-                            Ok(size) => {
-                                if size == 0 {
-                                    return Ok(exit);
-                                }
-
-                                match channel {
-                                    ShellChannel::Stdout => {
-                                        if let Some(stdout) = stdout.as_mut() {
-                                            stdout.write_all(&buffer[..size]).await?;
-                                        }
-                                    }
-                                    ShellChannel::Stderr => {
-                                        // first stderr if existing, else a merged output into stdout
-                                        if let Some(writer) = stderr.as_mut() {
-                                            writer.write_all(&buffer[..size]).await?;
-                                        } else if let Some(writer) = stdout.as_mut() {
-                                            writer.write_all(&buffer[..size]).await?;
-                                        }
-                                    }
-                                    ShellChannel::ExitStatus => {
-                                        // unreachable
-                                    }
-                                }
-
-                                remainder -= size;
-                            }
-                            Err(e) => {
-                                return Err(RustADBError::IOError(e));
-                            }
-                        }
-                    }
-                }
-                ShellChannel::ExitStatus => {
-                    if payload_size != 1 {
-                        return Err(RustADBError::ADBShellV2ParseError(format!(
-                            "Spurious exit status packet with size of {payload_size} (should be 1)"
-                        )));
-                    }
-
-                    match input.read_u8().await {
-                        Ok(status) => exit = Some(status),
-                        Err(err) => match err.kind() {
-                            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(None),
-                            _ => return Err(RustADBError::IOError(err)),
-                        },
-                    }
-                }
-            }
-        }
+        decode_shell_v2_stream(input, stdout, stderr).await
     }
 
     async fn bidirectional_session(
@@ -344,5 +265,199 @@ impl ADBProxyDevice {
             res = reader_fut => res,
             res = writer_fut => res,
         }
+    }
+}
+
+/// Decode a shell-v2 protocol byte stream (channel-tagged frames) from `input`,
+/// routing stdout/stderr payloads to the given writers and returning the exit
+/// code once the stream ends.
+///
+/// The exit-status frame is followed by the device tearing the stream down, so
+/// the END OF STREAM is the normal terminator of a v2 shell command. Every EOF
+/// site therefore returns the exit code captured SO FAR (`Ok(exit)`), never an
+/// unconditional `Ok(None)` — a between-frames EOF after the exit-status frame
+/// must not discard the code we already decoded. This mirrors
+/// [`crate::message_devices::usb::shell_v2_session::ShellV2Session::execute`].
+///
+/// Extracted as a free function over `AsyncRead` so the EOF/exit-code behavior
+/// is unit-testable from an in-memory cursor without a live device.
+async fn decode_shell_v2_stream<R: AsyncRead + Unpin>(
+    input: &mut R,
+    mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+    mut stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+) -> Result<Option<u8>> {
+    let mut exit = None;
+    let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
+    loop {
+        // 1 byte of channel + 4 bytes of payload size.
+        let mut pckt_metadata = [0u8; 5];
+        if let Err(err) = input.read_exact(&mut pckt_metadata).await {
+            match err.kind() {
+                // Stream closed cleanly between frames — return whatever exit
+                // code we already captured. Returning `Ok(None)` here would
+                // discard a code decoded from a prior exit-status frame (the
+                // through-server path always hits this trailing EOF).
+                ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(exit),
+                _ => return Err(RustADBError::IOError(err)),
+            }
+        }
+
+        let (channel, payload_size) = {
+            let channel = pckt_metadata[0];
+            let payload_size = u32::from_le_bytes(pckt_metadata[1..5].try_into()?) as usize;
+            (ShellChannel::try_from(channel)?, payload_size)
+        };
+
+        if payload_size == 0 {
+            continue;
+        }
+
+        match channel {
+            ShellChannel::Stdout | ShellChannel::Stderr => {
+                let mut remainder = payload_size;
+                while remainder > 0 {
+                    let to_read = std::cmp::min(remainder, BUFFER_SIZE);
+                    match input.read(&mut buffer[0..to_read]).await {
+                        Ok(size) => {
+                            if size == 0 {
+                                return Ok(exit);
+                            }
+
+                            match channel {
+                                ShellChannel::Stdout => {
+                                    if let Some(stdout) = stdout.as_mut() {
+                                        stdout.write_all(&buffer[..size]).await?;
+                                    }
+                                }
+                                ShellChannel::Stderr => {
+                                    // first stderr if existing, else a merged output into stdout
+                                    if let Some(writer) = stderr.as_mut() {
+                                        writer.write_all(&buffer[..size]).await?;
+                                    } else if let Some(writer) = stdout.as_mut() {
+                                        writer.write_all(&buffer[..size]).await?;
+                                    }
+                                }
+                                ShellChannel::ExitStatus => {
+                                    // unreachable
+                                }
+                            }
+
+                            remainder -= size;
+                        }
+                        Err(e) => {
+                            return Err(RustADBError::IOError(e));
+                        }
+                    }
+                }
+            }
+            ShellChannel::ExitStatus => {
+                if payload_size != 1 {
+                    return Err(RustADBError::ADBShellV2ParseError(format!(
+                        "Spurious exit status packet with size of {payload_size} (should be 1)"
+                    )));
+                }
+
+                match input.read_u8().await {
+                    Ok(status) => exit = Some(status),
+                    Err(err) => match err.kind() {
+                        // A truncated exit-status frame: `exit` is still None here,
+                        // so this is equivalent to `Ok(None)` — kept as `Ok(exit)`
+                        // for symmetry with the between-frames EOF above.
+                        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(exit),
+                        _ => return Err(RustADBError::IOError(err)),
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a shell-v2 frame: 1-byte channel + 4-byte LE payload size + payload.
+    fn frame(channel: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![channel];
+        v.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// The regression: stdout frame, then an exit-status frame, then EOF. The
+    /// trailing EOF on the next header read must NOT discard the captured code.
+    #[tokio::test]
+    async fn exit_code_survives_trailing_eof_after_exit_frame() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&frame(1, b"hi\n")); // stdout
+        stream.extend_from_slice(&frame(3, &[1])); // exit status = 1
+        // stream simply ends here (device tore the connection down)
+
+        let mut out = Vec::new();
+        let mut cursor = Cursor::new(stream);
+        let code = decode_shell_v2_stream(
+            &mut cursor,
+            Some(&mut out as &mut (dyn AsyncWrite + Unpin + Send)),
+            None,
+        )
+        .await
+        .expect("decode must succeed");
+
+        assert_eq!(code, Some(1), "exit code must survive the trailing EOF");
+        assert_eq!(out, b"hi\n");
+    }
+
+    /// A non-zero exit code with no preceding output still decodes.
+    #[tokio::test]
+    async fn exit_code_only_stream() {
+        let stream = frame(3, &[42]);
+        let mut cursor = Cursor::new(stream);
+        let code = decode_shell_v2_stream(&mut cursor, None, None)
+            .await
+            .expect("decode must succeed");
+        assert_eq!(code, Some(42));
+    }
+
+    /// A stream that closes before any exit-status frame yields `None` (no code
+    /// was ever sent) — not an error.
+    #[tokio::test]
+    async fn no_exit_frame_yields_none() {
+        let stream = frame(1, b"output");
+        let mut out = Vec::new();
+        let mut cursor = Cursor::new(stream);
+        let code = decode_shell_v2_stream(
+            &mut cursor,
+            Some(&mut out as &mut (dyn AsyncWrite + Unpin + Send)),
+            None,
+        )
+        .await
+        .expect("decode must succeed");
+        assert_eq!(code, None, "no exit-status frame ⇒ None");
+        assert_eq!(out, b"output");
+    }
+
+    /// stdout and stderr route to their respective writers.
+    #[tokio::test]
+    async fn stdout_stderr_split() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&frame(1, b"out"));
+        stream.extend_from_slice(&frame(2, b"err"));
+        stream.extend_from_slice(&frame(3, &[0]));
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut cursor = Cursor::new(stream);
+        let code = decode_shell_v2_stream(
+            &mut cursor,
+            Some(&mut out as &mut (dyn AsyncWrite + Unpin + Send)),
+            Some(&mut err as &mut (dyn AsyncWrite + Unpin + Send)),
+        )
+        .await
+        .expect("decode must succeed");
+
+        assert_eq!(code, Some(0));
+        assert_eq!(out, b"out");
+        assert_eq!(err, b"err");
     }
 }
