@@ -15,7 +15,7 @@
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
-use adb_client::server::{AdbServerFrontend, UsbDeviceBackend};
+use adb_client::server::{AdbServerFrontend, DefaultDeviceBackend};
 use adb_client::usb::{ADBDeviceInfo, find_all_connected_adb_devices};
 
 /// One discovered USB device, classified for suite selection.
@@ -57,7 +57,7 @@ pub struct InProcessServer {
     /// Handle to the backend whose cached device connections must be gracefully
     /// closed (connection-level CLSE flushed) before the process tears down — see
     /// [`InProcessServer::shutdown`].
-    backend: Arc<UsbDeviceBackend>,
+    backend: Arc<DefaultDeviceBackend>,
 }
 
 impl InProcessServer {
@@ -88,7 +88,7 @@ impl InProcessServer {
         // reserve+discover the port, so drop it before the frontend rebinds.
         drop(listener);
 
-        let backend = Arc::new(UsbDeviceBackend::new());
+        let backend = Arc::new(DefaultDeviceBackend::new());
         // Keep a handle to gracefully close the backend's cached device
         // connections on shutdown (the frontend takes ownership of its own clone).
         let shutdown_backend = Arc::clone(&backend);

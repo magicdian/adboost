@@ -12,8 +12,11 @@
 //!
 //! 1. **Discover** — enumerate USB devices; abort with a clear message if none.
 //! 2. **Automated** — for each addressable device, run the case suite on each
-//!    channel. tcpip devices are reported as SKIPPED (pre-wired, see PRD).
-//! 3. **Interactive** — (PR6) re-plug / reboot recovery, gated behind a prompt.
+//!    channel (USB-direct + through-server), plus the non-destructive parity
+//!    cases (incl. `host:connect` routing).
+//! 3. **Interactive** — re-plug / reboot recovery and the tcpip end-to-end
+//!    (switch to TCP/IP mode, shell through the server, switch back), each gated
+//!    behind a prompt.
 
 mod cases;
 mod channels;
@@ -100,11 +103,12 @@ pub async fn run(cmd: SelftestCommand) -> ADBCliResult<()> {
     }
     run_through_server_phase(&mut reporter, &serials, multi).await;
 
-    // tcpip pre-wired placeholder (no tcpip detection wired yet — see PRD).
-    report_tcpip_skipped(&mut reporter);
-
     if cmd.no_interactive {
         println!("Skipping interactive phase (--no-interactive).");
+        // The tcpip end-to-end (shell through a host:connect'd TCP/IP device)
+        // is operator-gated and lives in the interactive phase; report it
+        // SKIPPED here so the suite still surfaces the entry.
+        report_tcpip_skipped(&mut reporter);
     } else {
         interactive::run_interactive_phase(&mut reporter, &addressable).await;
     }
@@ -176,6 +180,9 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
     if multi {
         run_ambiguous_parity_against_server(reporter, server.addr()).await;
     }
+    // host:connect routing parity: a whole-server property (not per serial), and
+    // non-destructive (dials an unreachable port), so run it ONCE.
+    run_connect_parity_against_server(reporter, server.addr()).await;
     // Gracefully shut the server down: flush a connection-level CLSE to every
     // cached device connection while their writer tasks are still alive, then
     // free the port. This prevents orphaned device streams that would otherwise
@@ -263,6 +270,25 @@ async fn run_ambiguous_parity_against_server(
     }
 }
 
+/// Run the `host:connect` routing parity case against the running adboost
+/// server, or SKIP when no `adb` binary is available. Non-destructive (dials an
+/// unreachable loopback port), so it runs once per run regardless of device
+/// count. This is the runtime guard for the originally-reported
+/// `unknown host service: connect:` bug.
+async fn run_connect_parity_against_server(reporter: &mut Reporter, addr: std::net::SocketAddrV4) {
+    if parity::adb_available().await {
+        let outcome = parity::case_official_adb_connect_routing(addr).await;
+        run_one(reporter, "parity", "official_adb_connect_routing", outcome);
+    } else {
+        run_one(
+            reporter,
+            "parity",
+            "official_adb_connect_routing",
+            Outcome::Skipped("official `adb` binary not found on PATH".into()),
+        );
+    }
+}
+
 /// Forward control-plane case (through-server only): add an auto-assigned
 /// forward rule via the proxy client, then remove it. This drives the server's
 /// `host:forward` / `host:killforward` family end-to-end through a real client.
@@ -338,8 +364,7 @@ async fn run_usb_direct_suite(reporter: &mut Reporter, serial: &str) {
 /// — macOS `IOKit` `kIOReturnAborted` / `0xe00002ed` — under back-to-back
 /// multi-device claims). Used both to short-circuit a case and to annotate a
 /// case that failed *because* the reader died mid-run.
-const READER_DEAD_REASON: &str =
-    "persistent connection died: USB reader task exited (e.g. the OS aborted the \
+const READER_DEAD_REASON: &str = "persistent connection died: USB reader task exited (e.g. the OS aborted the \
 device claim). The remaining usb_direct cases cannot run on this connection.";
 
 /// Run one `usb_direct` case with connection-liveness guarding so a dead reader
@@ -450,15 +475,23 @@ fn skip_suite(reporter: &mut Reporter, suite: &str, reason: &str) {
     }
 }
 
-/// tcpip support is pre-wired but not implemented (no debug environment yet).
-/// Report a single SKIPPED placeholder so the intent is visible in output.
+/// Report the tcpip end-to-end case (shell over a `host:connect`ed TCP/IP
+/// device, *through* the adboost server) as SKIPPED. The real case runs in the
+/// interactive phase (it needs a live device to switch to TCP/IP mode and back);
+/// this placeholder keeps the entry visible when the interactive phase is
+/// skipped (`--no-interactive`). The control-plane pieces it depends on are
+/// already covered automatically: `host:connect` routing by the
+/// `official_adb_connect_routing` parity case, and the device-side
+/// `tcpip:`/`usb:` wire encoding + ack parsing by the library unit tests.
 fn report_tcpip_skipped(reporter: &mut Reporter) {
     run_one(
         reporter,
         "tcpip",
-        "shell_echo",
+        "shell_through_tcp_device",
         Outcome::Skipped(
-            "tcpip channel not implemented yet (pre-wired; pending emulator debug env)".into(),
+            "tcpip end-to-end is operator-gated and runs in the interactive phase \
+             (skipped via --no-interactive)"
+                .into(),
         ),
     );
 }
@@ -526,7 +559,10 @@ mod tests {
     fn passing_outcome_is_never_annotated() {
         // Even if the reader is reported not-alive after a pass (e.g. a benign
         // race at teardown), a Passed/Skipped outcome passes through untouched.
-        assert_eq!(annotate_if_reader_died(false, Outcome::Passed), Outcome::Passed);
+        assert_eq!(
+            annotate_if_reader_died(false, Outcome::Passed),
+            Outcome::Passed
+        );
         let skip = Outcome::Skipped("n/a".to_string());
         assert_eq!(annotate_if_reader_died(false, skip.clone()), skip);
     }

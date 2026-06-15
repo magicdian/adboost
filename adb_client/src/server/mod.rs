@@ -26,7 +26,7 @@
 //!
 //! - [`crate::server::protocol`] — pure, I/O-free smartsocket host-protocol wire encode/decode.
 //! - [`crate::server::DeviceBackend`] — the seam: where devices come from and how
-//!   a local service is opened. adboost ships [`crate::server::UsbDeviceBackend`]
+//!   a local service is opened. adboost ships [`crate::server::DefaultDeviceBackend`]
 //!   over the existing [`PersistentUsbConnection`][crate::usb::PersistentUsbConnection];
 //!   inject your own to add custom discovery / relay / auth.
 //! - the listening [`crate::server::AdbServerFrontend`] ties them together.
@@ -35,11 +35,13 @@ pub mod protocol;
 
 mod backend;
 mod capabilities;
+mod default_backend;
 mod forward;
 mod frontend;
-mod usb_backend;
 
 pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, ReversePolicy};
 pub use capabilities::{KillPolicy, ServerCapabilities};
+pub use default_backend::DefaultDeviceBackend;
+#[allow(deprecated)]
+pub use default_backend::UsbDeviceBackend;
 pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
-pub use usb_backend::UsbDeviceBackend;

@@ -667,3 +667,73 @@ Interactive selftest surfaced two defects. (1) interactive.reboot_recovery faile
 ### Next Steps
 
 - None - task complete
+
+---
+
+## 2026-06-15 — tcpip mainline parity (PR1–5 + PR4a/b split)
+
+Task: `06-15-tcpip-mainline-parity-...`. Closes the tcpip gap vs official adb and
+fixes the reported `error: unknown host service: connect:127.0.0.1:8885`.
+
+Shipped (all green: 192 lib + 5 doc + 21 cli tests, clippy clean, all feature combos build):
+- **PR1**: `tcpip(port)->Result<String>` + `usb()` on `ADBDeviceExt`; impl for
+  `ADBMessageDevice` (direct USB/TCP) + `ADBProxyDevice` (folded in existing
+  proxy cmds). `commands/tcpip.rs` reads the WRTE ack; proxy reads the streamed
+  tail via new `TCPProxyTransport::read_raw_to_end`.
+- **PR2**: CLI `tcpip`/`usb`/`remount`/`disable-verity`/`enable-verity` on
+  usb/tcp/local (extracted `run_control_command` to stay under clippy line cap).
+- **PR3**: server `map_local_service` bridges control services verbatim via
+  `is_control_service` (tcpip/usb/root/reboot/remount/verity) — they're shaped
+  like `shell:` v1 so `bridge_tcp_session` already handles them; no new path.
+- **PR4a**: renamed `UsbDeviceBackend`→`DefaultDeviceBackend` (deprecated alias),
+  added TCP device registry + `host:connect`/`disconnect` arms + unified device
+  table (`merge_device_sets`). **Fixes the user's bug.**
+- **PR5**: `host:wait-for-*-device` (poll, 60s bound) + `host:reconnect-offline`.
+- selftest: `official_adb_connect_routing` parity case (non-destructive,
+  loopback:1) guards the connect bug at runtime; tcpip SKIP message updated.
+
+### Non-obvious finding (recorded in server-host-protocol.md)
+`MultiplexedSession` + the 3140-line `PersistentUsbConnection` multiplexer are
+hard-typed to `USBTransport`. So "register a TCP device" (cheap) and "bridge a
+client shell THROUGH to a TCP device" (deep refactor) are different jobs — hence
+the PR4/PR4a+PR4b split. PR4a lists/selects TCP devices; `open_local_service`
+against a TCP serial returns a stable "not yet supported".
+
+### Deferred
+- **PR4b** (task #6, blocked-by #4): generalize the multiplexer over
+  `ADBMessageTransport` for TCP shell/sync bridging. HIGH RISK — must preserve the
+  3 device-verified wire regressions. Not started.
+- PR6 (pair/mDNS) + PR7 (keygen/sideload/...) out of this task's scope.
+
+### Verification gap (honest)
+`connect` happy-path (real TCP handshake) + shell-over-TCP aren't unit-tested
+(need hardware / PR4b). Covered by the connect-routing parity case + pure-helper
+tests. No git commit made (awaiting user acceptance).
+
+## 2026-06-15 (cont.) — PR4b: transport-generic multiplexer
+
+Generalized `PersistentUsbConnection` → `PersistentConnection<T: ADBMessageTransport = USBTransport>`
+(alias kept) so the server bridges shell/sync/tcp THROUGH to `host:connect`d TCP
+devices. Sessions stay non-generic (channel-only), so `open_*` return types are
+unchanged. USB ctors in `impl PersistentConnection<USBTransport>`; `new_from_tcp_addr`
+in the TCP impl. Backend TCP registry now holds `Arc<PersistentConnection<TcpTransport>>`;
+TCP serials route to it in all three open methods (guard removed).
+
+Done via trellis-implement → trellis-check sub-agents.
+- **trellis-check caught a serious latent bug**: the STLS branch had a post-upgrade
+  double-read (`finish_after_stls`) that would HANG `host:connect` to any TLS device,
+  because `TcpTransport::upgrade_connection()` already consumes the post-STLS CNXN
+  (matches `ADBMessageDevice::connect`). Fixed: return `(A_VERSION_LEGACY, "")` right
+  after `upgrade_connection()`. Recorded the gotcha in adb-wire-protocol-contract.md.
+- 3 regression-locked behaviors confirmed byte-equivalent (delayed_ack/version/data_check,
+  CNXN no-NUL banner, CLSE-on-data fast-fail). All their unit tests pass.
+- Green: adb_client 195 lib + 5 doc, adboost_cli 21; clippy pedantic 0 warnings;
+  fmt clean; default + no-default + usb-only builds all pass.
+
+### Verification gap (hardware)
+The live TLS `host:connect` handshake (new STLS branch) and the interactive
+tcpip→connect→shell-through→usb end-to-end are NOT run (need a wireless device +
+TLS adbd). Ordering now mirrors the device-verified direct-TCP path. Plain
+(non-TLS) `host:connect` is fully exercised in logic.
+
+PR1–5 + PR4a/b all complete. Awaiting user acceptance, then commit.

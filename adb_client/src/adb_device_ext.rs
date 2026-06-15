@@ -150,6 +150,20 @@ pub trait ADBDeviceExt {
     /// Disable dm-verity on the device
     async fn disable_verity(&mut self) -> Result<()>;
 
+    /// Restart the device's adbd in TCP/IP mode, listening on `port` (the
+    /// `adb tcpip <port>` operation).
+    ///
+    /// Returns the device's textual acknowledgement (e.g.
+    /// `restarting in TCP mode port: 5555`). After this succeeds adbd restarts,
+    /// so a direct (USB) connection that issued it is expected to drop; reconnect
+    /// over TCP with [`crate::usb::ADBUSBDevice`]'s TCP counterpart or
+    /// `adb connect <ip>:<port>`.
+    async fn tcpip(&mut self, port: u16) -> Result<String>;
+
+    /// Restart the device's adbd in USB mode (the `adb usb` operation), undoing a
+    /// previous [`Self::tcpip`]. Like `tcpip`, adbd restarts on success.
+    async fn usb(&mut self) -> Result<()>;
+
     #[cfg(feature = "framebuffer")]
     /// Inner method requesting framebuffer from an Android device
     async fn framebuffer_inner(&mut self) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>>;

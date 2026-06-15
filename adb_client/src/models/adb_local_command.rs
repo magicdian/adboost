@@ -117,6 +117,19 @@ fn test_reverse_remove_command() {
 }
 
 #[test]
+fn test_tcpip_command_encoding() {
+    // `adb tcpip <port>` opens the `tcpip:<port>` device service.
+    assert_eq!(ADBLocalCommand::TcpIp(5555).to_string(), "tcpip:5555");
+    assert_eq!(ADBLocalCommand::TcpIp(0).to_string(), "tcpip:0");
+}
+
+#[test]
+fn test_usb_command_encoding() {
+    // `adb usb` opens the `usb:` device service (no argument).
+    assert_eq!(ADBLocalCommand::Usb.to_string(), "usb:");
+}
+
+#[test]
 fn test_raw_command_is_verbatim() {
     // Raw formats the service string with no transformation — this is what lets
     // the server bridge a client's exact `sync:` / `shell,v2,raw:` verbatim.

@@ -12,7 +12,7 @@
 //!
 //! [`ReverseEngine`] is the data path an **"acts-as-a-server"** backend uses when
 //! it *is* the ADB server for a directly-attached device (the bundled
-//! [`UsbDeviceBackend`][crate::server::UsbDeviceBackend] and downstreams like xdb
+//! [`DefaultDeviceBackend`][crate::server::DefaultDeviceBackend] and downstreams like xdb
 //! that hold their own [`PersistentUsbConnection`]). Such a backend has no other
 //! adb server to service the device's inbound opens, so it must run the pump
 //! itself — that is exactly what this engine does.

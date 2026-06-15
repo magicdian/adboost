@@ -72,6 +72,19 @@ impl TCPProxyTransport {
         }
     }
 
+    /// Read the raw connection to EOF and return it as UTF-8 (lossy), trimmed.
+    ///
+    /// Some device control services (e.g. `tcpip:<port>`) reply OKAY and then
+    /// stream a single human-readable status line with **no** length prefix,
+    /// closing the socket afterwards. Those replies cannot go through
+    /// [`Self::proxy_connection`] (which expects a 4-hex length), so callers read
+    /// the streamed tail here after `send_adb_request` has consumed the OKAY.
+    pub(crate) async fn read_raw_to_end(&mut self) -> Result<String> {
+        let mut body = Vec::new();
+        self.get_raw_connection()?.read_to_end(&mut body).await?;
+        Ok(String::from_utf8_lossy(&body).trim().to_string())
+    }
+
     pub(crate) fn get_raw_connection(&mut self) -> Result<&mut TcpStream> {
         self.tcp_stream
             .as_mut()

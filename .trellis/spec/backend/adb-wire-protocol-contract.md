@@ -317,3 +317,28 @@ the previous connection had open, so the multi-session server path can queue
 several — a fixed-3 bound under-counted and failed the handshake. This is
 belt-and-suspenders behind the graceful-teardown fix above: even if a CLSE is
 ever missed, the next connect self-heals instead of failing.
+
+## STLS upgrade: `upgrade_connection()` already consumes the post-STLS CNXN — do NOT read again
+
+When adbd replies to CNXN with `A_STLS` (TCP/IP transports; USB never does), the
+persistent multiplexer's `do_connect` must: ACK with an `STLS` frame, call
+`transport.upgrade_connection().await`, and then **return immediately** — it must
+NOT issue another `read_message()`.
+
+`TcpTransport::upgrade_connection()` (`tcp/tcp_transport.rs`) performs the TLS
+handshake AND reads+consumes the device's post-STLS CNXN banner internally before
+returning `Ok(())`. This matches the proven direct path
+`ADBMessageDevice::connect`, which likewise returns right after
+`upgrade_connection()` with no further read. A second read in the persistent path
+(e.g. a `finish_after_stls` helper that re-reads the banner) **blocks forever on a
+frame the device never sends** → `host:connect` to any TLS-requiring wireless
+device hangs. (Caught in PR4b review; the multiplexer is transport-generic now, so
+this path is exercised for the first time over TCP.)
+
+Because the post-STLS banner/version are swallowed by `upgrade_connection`, the
+persistent path reports `(A_VERSION_LEGACY, "")` after the upgrade →
+`delayed_ack_negotiated == false` → classic stop-and-wait over the TLS channel.
+That is the safe, AOSP-faithful default for a freshly TLS-upgraded link; the
+USB/non-STLS branch is unchanged and still negotiates `delayed_ack` from the real
+CNXN banner. USB's `upgrade_connection` is the trait-default no-op, so USB never
+enters this branch and its behavior is unaffected.

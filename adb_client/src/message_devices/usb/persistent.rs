@@ -41,6 +41,8 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -54,7 +56,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::adb_transport::ADBTransport;
 use crate::message_devices::adb_message_transport::ADBMessageTransport;
 use crate::message_devices::adb_transport_message::{
     ADBTransportMessage, AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN,
@@ -68,6 +69,7 @@ use crate::message_devices::usb::shell_v2_session::ShellV2Session;
 use crate::message_devices::usb::sync_session::SyncSession;
 use crate::message_devices::usb::usb_transport::USBTransport;
 use crate::models::{ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK, RebootType};
+use crate::tcp::tcp_transport::TcpTransport;
 use crate::utils::get_default_adb_key_path;
 use crate::{Result, RustADBError};
 
@@ -337,11 +339,22 @@ fn negotiate_delayed_ack(
         && device_version >= A_VERSION_SKIP_CHECKSUM
 }
 
-/// A persistent USB connection to an ADB device that supports concurrent sessions.
+/// A persistent connection to an ADB device that supports concurrent sessions,
+/// generic over the underlying [`ADBMessageTransport`] (USB or TCP/IP).
 ///
-/// Unlike the per-operation model in `ADBUSBDevice`, this holds the USB handle
-/// permanently and multiplexes multiple sessions over a single authenticated connection.
-pub struct PersistentUsbConnection {
+/// Unlike the per-operation model in `ADBUSBDevice`, this holds the transport
+/// handle permanently and multiplexes multiple sessions over a single
+/// authenticated connection. The transport itself lives entirely inside the
+/// reader/writer tasks (it is moved in at construction); the struct keeps only
+/// transport-free channels + task handles, so the connection's whole public
+/// session surface ([`MultiplexedSession`] / [`SyncSession`] / [`ShellV2Session`])
+/// is identical regardless of transport. `T` survives only as a marker so the
+/// USB- and TCP-specific constructors can be split into per-`T` `impl` blocks.
+///
+/// The default `T = USBTransport` keeps the historical
+/// [`PersistentUsbConnection`] alias and all existing USB call sites compiling
+/// unchanged.
+pub struct PersistentConnection<T: ADBMessageTransport = USBTransport> {
     /// Handle to enqueue outbound frames onto the single writer task.
     writer: WriterHandle,
     /// Control channel to mutate the reader task's private session registry.
@@ -371,17 +384,27 @@ pub struct PersistentUsbConnection {
     /// intentionally retired — re-enqueueing per-session CLSEs would only race
     /// the writer's teardown and emit spurious "writer task gone" warnings.
     conn_closed: Arc<AtomicBool>,
+    /// Marker for the transport type. The transport is owned by the reader /
+    /// writer tasks, not the struct, so it appears only here; `fn() -> T` keeps
+    /// the struct `Send`/`Sync` regardless of `T`'s auto-traits and imposes no
+    /// drop/variance obligations.
+    _transport: PhantomData<fn() -> T>,
 }
 
-impl PersistentUsbConnection {
-    /// Create a new persistent connection from a USB transport.
+/// Historical name of the (now transport-generic) [`PersistentConnection`],
+/// fixed to the USB transport. Kept so existing `use ... PersistentUsbConnection`
+/// imports and `Arc<PersistentUsbConnection>` types keep compiling unchanged.
+pub type PersistentUsbConnection = PersistentConnection<USBTransport>;
+
+impl<T: ADBMessageTransport> PersistentConnection<T> {
+    /// Create a new persistent connection from an already-built transport.
     ///
     /// Performs CNXN+AUTH handshake, then spawns reader + writer tasks for
     /// message demuxing and serialized writes.
     ///
     /// Advertises the honest [`DeviceFeatureSet::default`] banner. To advertise a
     /// custom feature set, use [`Self::new_with_features`].
-    pub async fn new(transport: USBTransport, private_key_path: Option<PathBuf>) -> Result<Self> {
+    pub async fn new(transport: T, private_key_path: Option<PathBuf>) -> Result<Self> {
         Self::new_with_features(transport, private_key_path, DeviceFeatureSet::default()).await
     }
 
@@ -391,7 +414,7 @@ impl PersistentUsbConnection {
     /// banner. Only advertise features this end actually implements — see
     /// [`DeviceFeatureSet`].
     pub async fn new_with_features(
-        transport: USBTransport,
+        transport: T,
         private_key_path: Option<PathBuf>,
         features: DeviceFeatureSet,
     ) -> Result<Self> {
@@ -458,9 +481,15 @@ impl PersistentUsbConnection {
             delayed_ack_negotiated,
             pending_opens_rx: std::sync::Mutex::new(Some(pending_opens_rx)),
             conn_closed: Arc::new(AtomicBool::new(false)),
+            _transport: PhantomData,
         })
     }
+}
 
+/// USB-only constructors. These build a [`USBTransport`] from USB identifiers, so
+/// they cannot be generic over `T` — they live on the concrete
+/// `PersistentConnection<USBTransport>` (the [`PersistentUsbConnection`] alias).
+impl PersistentConnection<USBTransport> {
     /// Create from `vendor_id/product_id`.
     ///
     /// Advertises the honest [`DeviceFeatureSet::default`] banner. To advertise a
@@ -501,7 +530,36 @@ impl PersistentUsbConnection {
         let transport = USBTransport::new_by_serial(serial).await?;
         Self::new(transport, private_key_path).await
     }
+}
 
+/// TCP/IP-only constructor. Builds a [`TcpTransport`] from a socket address, so
+/// it lives on the concrete `PersistentConnection<TcpTransport>`.
+impl PersistentConnection<TcpTransport> {
+    /// Create a persistent connection to a `host:connect`ed TCP/IP device.
+    ///
+    /// Builds a [`TcpTransport`] for `addr` and runs the same transport-generic
+    /// CNXN(+AUTH, +STLS) handshake the USB path uses — the handshake only calls
+    /// [`ADBMessageTransport`] methods, and STLS rides
+    /// [`ADBMessageTransport::upgrade_connection`] (a no-op for USB, the TLS
+    /// upgrade for TCP). Advertises the honest [`DeviceFeatureSet::default`]
+    /// banner, so windowed `delayed_ack` is negotiated exactly as on USB.
+    pub async fn new_from_tcp_addr(
+        addr: SocketAddr,
+        private_key_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        // `TcpTransport::new` needs a key path for its TLS client cert; fall back
+        // to the default ADB key location when none is configured, matching
+        // `ADBTcpDevice::new`.
+        let key_path = match &private_key_path {
+            Some(p) => p.clone(),
+            None => get_default_adb_key_path()?,
+        };
+        let transport = TcpTransport::new(addr, &key_path);
+        Self::new(transport, private_key_path).await
+    }
+}
+
+impl<T: ADBMessageTransport> PersistentConnection<T> {
     /// The feature set advertised to the device in the CNXN banner.
     #[must_use]
     pub fn device_features(&self) -> &DeviceFeatureSet {
@@ -607,7 +665,7 @@ impl PersistentUsbConnection {
     /// `>= A_VERSION_SKIP_CHECKSUM`).
     #[tracing::instrument(name = "connect", skip(transport, private_key, features))]
     async fn do_connect(
-        transport: &mut USBTransport,
+        transport: &mut T,
         private_key: &ADBRsaKey,
         features: &DeviceFeatureSet,
     ) -> Result<(u32, String)> {
@@ -664,9 +722,37 @@ impl PersistentUsbConnection {
                     return Self::do_auth(transport, response, private_key).await;
                 }
                 MessageCommand::Stls => {
-                    return Err(RustADBError::ADBRequestFailed(
-                        "STLS not supported in persistent USB connection".into(),
-                    ));
+                    // The device asked to upgrade to TLS (TCP/IP transports;
+                    // USB never sends STLS). Acknowledge, then upgrade the
+                    // transport in place. `ADBMessageTransport::upgrade_connection`
+                    // is the TLS handshake for TCP (no-op for USB) and — crucially
+                    // — it ALSO reads and consumes the device's post-STLS CNXN
+                    // banner internally (see `TcpTransport::upgrade_connection`,
+                    // matching the proven direct path `ADBMessageDevice::connect`,
+                    // which likewise returns immediately after the upgrade with no
+                    // further read). We must therefore NOT read again here — doing
+                    // so would block on a frame the device never sends.
+                    //
+                    // The version/banner from that post-STLS CNXN are swallowed by
+                    // `upgrade_connection`, so we report the legacy version with an
+                    // empty banner: `delayed_ack` then negotiates to `false`
+                    // (banner lacks the feature AND version < A_VERSION_SKIP_CHECKSUM),
+                    // i.e. classic stop-and-wait over the TLS channel. That is the
+                    // safe, AOSP-faithful default for a freshly TLS-upgraded link.
+                    tracing::debug!("PersistentUsb: device requested STLS upgrade");
+                    transport
+                        .write_message(ADBTransportMessage::try_new(
+                            MessageCommand::Stls,
+                            1,
+                            0,
+                            &[],
+                        )?)
+                        .await?;
+                    transport.upgrade_connection().await?;
+                    tracing::debug!(
+                        "PersistentUsb: connection upgraded to TLS (post-STLS CNXN consumed by upgrade_connection)"
+                    );
+                    return Ok((A_VERSION_LEGACY, String::new()));
                 }
                 MessageCommand::Clse => {
                     // Stale CLSE from a previous session — drain any sibling stale
@@ -695,7 +781,7 @@ impl PersistentUsbConnection {
     /// them as its response. Reads with a short per-frame timeout until the pipe
     /// goes quiet. Best-effort and bounded by `STALE_DRAIN_MAX_FRAMES` so a device
     /// that keeps chattering cannot wedge the drain forever.
-    async fn drain_stale(transport: &mut USBTransport) {
+    async fn drain_stale(transport: &mut T) {
         for _ in 0..STALE_DRAIN_MAX_FRAMES {
             match transport
                 .read_message_with_timeout(Duration::from_millis(100))
@@ -717,7 +803,7 @@ impl PersistentUsbConnection {
     /// response — see [`Self::do_connect`].
     #[tracing::instrument(name = "auth", skip(transport, message, private_key))]
     async fn do_auth(
-        transport: &mut USBTransport,
+        transport: &mut T,
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
     ) -> Result<(u32, String)> {
@@ -778,7 +864,7 @@ impl PersistentUsbConnection {
     // inherits the `reader` label so interleaved lines are attributable to the task.
     #[tracing::instrument(name = "reader", skip(transport, control_rx, pending_opens_tx))]
     async fn reader_loop(
-        mut transport: USBTransport,
+        mut transport: T,
         mut control_rx: mpsc::Receiver<ReaderControl>,
         pending_opens_tx: mpsc::Sender<ADBTransportMessage>,
     ) {
@@ -959,7 +1045,7 @@ impl PersistentUsbConnection {
     /// queued control message waits and lets a closed control channel be noticed
     /// between frames.
     async fn read_or_control(
-        transport: &mut USBTransport,
+        transport: &mut T,
         control_rx: &mut mpsc::Receiver<ReaderControl>,
         sessions: &mut HashMap<u32, SessionChannels>,
         raw_subscribers: &mut Vec<RawSubscriber>,
@@ -1020,10 +1106,7 @@ impl PersistentUsbConnection {
     /// halves) has been dropped, draining the channel first.
     // Task-label span (single bulk-OUT pump for all sessions; no per-session id).
     #[tracing::instrument(name = "writer", skip(transport, writer_rx))]
-    async fn writer_loop(
-        mut transport: USBTransport,
-        mut writer_rx: mpsc::Receiver<OutboundFrame>,
-    ) {
+    async fn writer_loop(mut transport: T, mut writer_rx: mpsc::Receiver<OutboundFrame>) {
         while let Some(frame) = writer_rx.recv().await {
             match frame {
                 OutboundFrame::FireForget(msg) => {
@@ -1096,6 +1179,40 @@ impl PersistentUsbConnection {
             .await;
     }
 
+    /// Frame and send the `A_OPEN` for `cmd` on session `local_id`, awaiting the
+    /// writer's confirmation. The service string is NUL-terminated (ADB
+    /// requirement) and `arg1` carries the opener's receive-window grant when
+    /// `delayed_ack` is negotiated (else MUST be 0 — AOSP rejects a mismatch).
+    /// Caller registers the session BEFORE calling this and unregisters on error.
+    async fn send_open(&self, local_id: u32, cmd: &ADBLocalCommand) -> Result<()> {
+        let mut service_bytes = cmd.to_string().into_bytes();
+        if !service_bytes.ends_with(&[0]) {
+            service_bytes.push(0);
+        }
+        let open_arg1 = if self.delayed_ack_negotiated {
+            u32::try_from(INITIAL_DELAYED_ACK_BYTES).map_err(|_| RustADBError::ConversionError)?
+        } else {
+            0
+        };
+        tracing::debug!(
+            "PersistentUsb: OPEN local_id={} service={:?} delayed_ack={} window_grant={}",
+            local_id,
+            String::from_utf8_lossy(&service_bytes),
+            self.delayed_ack_negotiated,
+            open_arg1
+        );
+        let open_msg = ADBTransportMessage::try_new(
+            MessageCommand::Open,
+            local_id,
+            open_arg1,
+            &service_bytes,
+        )?;
+        self.writer
+            .send_with_ack(open_msg)
+            .await
+            .map_err(|_| RustADBError::SendError)
+    }
+
     // Per-session span: every OPEN/OKAY/CLSE/negotiation event emitted during this
     // handshake inherits `local_id`, so a `[session{local_id=...}]` `RUST_LOG`
     // filter narrows to one session. `#[instrument]` instruments the returned
@@ -1145,34 +1262,13 @@ impl PersistentUsbConnection {
             .await
             .map_err(|_| RustADBError::SendError)?;
 
-        // Send OPEN message (ADB protocol requires null-terminated service string)
-        let mut service_bytes = cmd.to_string().into_bytes();
-        if !service_bytes.ends_with(&[0]) {
-            service_bytes.push(0);
-        }
-        // OPEN arg1 carries the opener's receive-window grant when delayed_ack is
-        // negotiated; otherwise it MUST be 0. AOSP rejects a mismatch as fatal.
-        let open_arg1 = if self.delayed_ack_negotiated {
-            u32::try_from(INITIAL_DELAYED_ACK_BYTES).map_err(|_| RustADBError::ConversionError)?
-        } else {
-            0
-        };
-        tracing::debug!(
-            "PersistentUsb: OPEN local_id={} service={:?} delayed_ack={} window_grant={}",
-            local_id,
-            String::from_utf8_lossy(&service_bytes),
-            self.delayed_ack_negotiated,
-            open_arg1
-        );
-        let open_msg = ADBTransportMessage::try_new(
-            MessageCommand::Open,
-            local_id,
-            open_arg1,
-            &service_bytes,
-        )?;
-        if self.writer.send_with_ack(open_msg).await.is_err() {
+        // Send OPEN; on a write failure, undo the registration above. Extracted
+        // into `send_open` so `open_session` stays within the line budget — the
+        // OPEN framing (NUL-terminated service, windowed `arg1` grant) is
+        // mechanical and unchanged.
+        if let Err(e) = self.send_open(local_id, cmd).await {
             self.unregister_session(local_id).await;
-            return Err(RustADBError::SendError);
+            return Err(e);
         }
 
         // Wait for the device's first response, racing the ACK channel (OKAY →
@@ -1216,8 +1312,12 @@ impl PersistentUsbConnection {
             self.delayed_ack_negotiated,
             usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX),
         );
-        let ready_msg =
-            ADBTransportMessage::try_new(MessageCommand::Okay, local_id, remote_id, &ready_payload)?;
+        let ready_msg = ADBTransportMessage::try_new(
+            MessageCommand::Okay,
+            local_id,
+            remote_id,
+            &ready_payload,
+        )?;
         self.writer
             .try_send_fire_forget(ready_msg)
             .map_err(|_| RustADBError::SendError)?;
@@ -1543,7 +1643,7 @@ enum ControlDrain {
     Closed,
 }
 
-impl Drop for PersistentUsbConnection {
+impl<T: ADBMessageTransport> Drop for PersistentConnection<T> {
     fn drop(&mut self) {
         // If `shutdown`/`close` already flushed a connection-level CLSE (awaiting
         // the writer), the device has been told cleanly — skip the fire-and-forget
@@ -2301,6 +2401,26 @@ mod tests {
         ADBTransportMessage::try_new(command, arg0, arg1, payload).expect("build message")
     }
 
+    // `PersistentConnection` is generic over the transport: the same concrete
+    // (transport-free) session types are produced regardless of `T`, and both the
+    // USB and TCP transports satisfy the bound. This compiles iff the
+    // generalization holds; the `PersistentUsbConnection` alias must still name
+    // the USB specialization so existing call sites keep resolving.
+    #[test]
+    fn persistent_connection_is_generic_over_transport() {
+        fn takes_connection<T: ADBMessageTransport>(_c: &PersistentConnection<T>) {}
+        let usb: fn(&PersistentConnection<USBTransport>) = takes_connection::<USBTransport>;
+        let tcp: fn(&PersistentConnection<TcpTransport>) = takes_connection::<TcpTransport>;
+        // The historical alias resolves to the same USB specialization.
+        let alias: fn(&PersistentUsbConnection) = takes_connection::<USBTransport>;
+        assert_eq!(
+            usb as usize, alias as usize,
+            "PersistentUsbConnection must be PersistentConnection<USBTransport>"
+        );
+        // Touch the TCP monomorphization so it is exercised, not just declared.
+        assert_ne!(tcp as usize, 0, "TCP specialization must instantiate");
+    }
+
     #[test]
     fn wrte_to_known_session_routes_to_data() {
         let sessions = sessions_with(&[42]);
@@ -3025,7 +3145,10 @@ mod tests {
 
         // Then EOF, driven purely by the `closed` flag (the CLSE msg was dropped).
         let n2 = session.read(&mut buf).await.expect("read after close flag");
-        assert_eq!(n2, 0, "a dropped CLSE still surfaces as EOF via the closed flag");
+        assert_eq!(
+            n2, 0,
+            "a dropped CLSE still surfaces as EOF via the closed flag"
+        );
     }
 
     /// PR3 (C2): the windowed send credit is sourced from the shared `recv_credit`
@@ -3044,7 +3167,10 @@ mod tests {
         let recv_credit = session.recv_credit_handle();
 
         let write = tokio::spawn(async move {
-            session.write_all(b"xyz").await.expect("write after atomic credit");
+            session
+                .write_all(b"xyz")
+                .await
+                .expect("write after atomic credit");
             session
         });
 

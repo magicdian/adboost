@@ -87,10 +87,10 @@ any protocol code:
 ```rust,ignore
 // requires the `server` feature
 use std::sync::Arc;
-use adb_client::server::{AdbServerFrontend, UsbDeviceBackend};
+use adb_client::server::{AdbServerFrontend, DefaultDeviceBackend};
 
 # async fn run() -> std::io::Result<()> {
-let backend = Arc::new(UsbDeviceBackend::new());
+let backend = Arc::new(DefaultDeviceBackend::new());
 AdbServerFrontend::builder(backend)
     .addr("127.0.0.1:5037".parse().unwrap())
     .serve()
@@ -100,8 +100,14 @@ AdbServerFrontend::builder(backend)
 
 Supported today: `host:version`/`features`/`devices`/`devices-l`/`track-devices`,
 transport selection (`transport`/`transport-any`/`transport-id`/`tport`),
-`host-serial:*` queries, and the `shell:` (v1) / `tcp:` local services. Port
-`forward` and `shell_v2`/`sync` are not yet implemented.
+`host-serial:*` queries, `host:connect`/`disconnect` (TCP/IP devices join the
+device list), `host:wait-for-*-device` and `host:reconnect-offline`, the port
+`forward`/`reverse` families, and the `shell:` (v1) / `tcp:` / `sync:` /
+`shell,v2` local services plus the device **control** services
+(`tcpip:`/`usb:`/`root:`/`reboot:`/`remount:`/`*-verity:`). Local services are
+bridged through to **both** USB and `host:connect`ed TCP/IP devices — the
+persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
+`push`/`pull` against a wireless device works the same as against a USB one.
 
 [`DeviceBackend`]: https://docs.rs/adb_client
 

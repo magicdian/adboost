@@ -127,3 +127,54 @@ what issues `host:tport:any` before `shell:`). Covered by a parity case:
   serial), never emitted in single-device mode, `Skipped` when no `adb` on PATH.
   Note the rest of the multi-device suite selects by serial (the `-s`
   equivalent), so this is the one case that exercises the ambiguous path.
+
+---
+
+## Device control services are bridged verbatim like `shell:` v1
+
+`map_local_service` (`frontend.rs`) recognizes a **control-service** family —
+`tcpip:<port>`, `usb:`, `root:`, `reboot:[mode]`, `remount:`, `enable-verity:`,
+`disable-verity:` — and forwards each as `ADBLocalCommand::Raw(service)` with
+**no capability gating**. The justification (and the reason this is safe) is that
+every one is structurally identical to bare `shell:` v1: a single OPEN, a short
+textual reply, then CLSE. `bridge_tcp_session`'s half-close copy already handles
+that request/response-then-close shape, so no separate "one-shot" path is
+needed. `is_control_service()` is the pure predicate; unit-tested for the exact
+member set (and against look-alikes like `usbfoo:` / `rebooting:` / `tcp:`).
+
+> **Gotcha**: `tcpip:`/`usb:`/`reboot:` restart adbd, which drops the USB
+> connection. The bridge observes EOF normally; the backend's `get_or_open`
+> replaces the now-stale cached connection on the next open. Do **not** treat the
+> post-`tcpip` connection drop as an error.
+
+## `host:connect` / `host:disconnect` and the unified device table
+
+`host:connect:<addr>` / `host:disconnect:<addr>` route to
+`DeviceBackend::connect` / `disconnect`. The default backend
+(`DefaultDeviceBackend`, formerly `UsbDeviceBackend` — kept as a `#[deprecated]`
+alias) holds a TCP-device registry alongside the USB connection cache;
+`list_devices` returns the **merged** set via the pure `merge_device_sets`
+helper, so `host:devices`/`devices-l`/`track-devices`/transport-id all see USB +
+TCP as one list (mirroring AOSP's single `transport_list`).
+
+Reply framing: both are host **data queries** — `OKAY` + `%04x`+status, where the
+status is the AOSP-style line the client prints (`connected to <addr>` /
+`already connected to <addr>` / `disconnected <addr>` / `disconnected everything
+(<n> device(s))`); a backend error is a single `FAIL`. `connect` is idempotent
+(re-connect to a tracked serial returns `already connected to`), defaults a
+missing port to 5555, and performs the full CNXN(+STLS) handshake synchronously
+so an unreachable device fails the client's `connect` rather than appearing in
+the list. Runtime-guarded by the `official_adb_connect_routing` parity case,
+which locks against the original `unknown host service: connect:` regression.
+
+> **Constraint for the TCP shell bridge (deferred follow-up)**: a `host:connect`d
+> device is currently **listed and transport-selectable but its local services
+> are not bridged** — `open_local_service` against a TCP serial returns a stable
+> "not yet supported" error. The blocker is that `MultiplexedSession` and the
+> whole `PersistentUsbConnection` multiplexer (`usb/persistent.rs`) are
+> hard-typed to `USBTransport`; bridging `shell:`/`sync:` *through* the server to
+> a TCP device needs that multiplexer generalized over `ADBMessageTransport`
+> (which `TcpTransport` already implements). That refactor must preserve the
+> three device-verified wire regressions documented in
+> `adb-wire-protocol-contract.md` (delayed_ack/data_check coupling, CNXN no-NUL
+> banner, CLSE routing).

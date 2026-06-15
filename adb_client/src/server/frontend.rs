@@ -219,37 +219,17 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return Ok(HostOutcome::Close);
         };
 
+        // Simple host *data queries* (version/features/devices/devices-l) all
+        // share the `OKAY` + framed-payload shape; compute the payload here and
+        // emit it uniformly, keeping this dispatcher focused on routing.
+        if let Some(payload) = self.host_data_query_payload(svc).await {
+            stream
+                .write_all(&reply_or_overflow(protocol::okay_data(&payload)))
+                .await?;
+            return Ok(HostOutcome::Close);
+        }
+
         match svc {
-            "version" => {
-                stream
-                    .write_all(&reply_or_overflow(protocol::okay_data(
-                        self.caps.version_hex(),
-                    )))
-                    .await?;
-                Ok(HostOutcome::Close)
-            }
-            "features" => {
-                stream
-                    .write_all(&reply_or_overflow(protocol::okay_data(
-                        &self.caps.features_csv(),
-                    )))
-                    .await?;
-                Ok(HostOutcome::Close)
-            }
-            "devices" => {
-                let listing = format_devices(&self.backend.list_devices().await, false);
-                stream
-                    .write_all(&reply_or_overflow(protocol::okay_data(&listing)))
-                    .await?;
-                Ok(HostOutcome::Close)
-            }
-            "devices-l" => {
-                let listing = format_devices(&self.backend.list_devices().await, true);
-                stream
-                    .write_all(&reply_or_overflow(protocol::okay_data(&listing)))
-                    .await?;
-                Ok(HostOutcome::Close)
-            }
             "track-devices" => {
                 self.serve_track_devices(stream).await?;
                 Ok(HostOutcome::Close)
@@ -290,12 +270,48 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 self.serve_host_forward(stream, svc).await?;
                 Ok(HostOutcome::Close)
             }
+            "reconnect-offline" => {
+                // We model no "offline" devices (a USB/TCP device is either listed
+                // as `device` or absent), so this is a success no-op: reply a bare
+                // OKAY (the status the client reads). Matches `ADBProxyServer::
+                // reconnect_offline`, which reads exactly one OKAY.
+                stream.write_all(&protocol::okay()).await?;
+                Ok(HostOutcome::Close)
+            }
+            _ if svc.starts_with("wait-for-") => {
+                self.serve_wait_for(stream, &svc["wait-for-".len()..])
+                    .await?;
+                Ok(HostOutcome::Close)
+            }
+            _ if svc.starts_with("connect:") => {
+                let addr = &svc["connect:".len()..];
+                self.serve_connect(stream, addr).await?;
+                Ok(HostOutcome::Close)
+            }
+            _ if svc.starts_with("disconnect:") => {
+                let addr = &svc["disconnect:".len()..];
+                self.serve_disconnect(stream, addr).await?;
+                Ok(HostOutcome::Close)
+            }
             other => {
                 stream
                     .write_all(&protocol::fail(&format!("unknown host service: {other}")))
                     .await?;
                 Ok(HostOutcome::Close)
             }
+        }
+    }
+
+    /// Payload for a simple host *data query* (`version`/`features`/`devices`/
+    /// `devices-l`), or `None` if `svc` is not one. The caller frames it as
+    /// `OKAY` + `%04x`+payload — these four share that exact shape.
+    async fn host_data_query_payload(&self, svc: &str) -> Option<String> {
+        match svc {
+            "version" => Some(self.caps.version_hex().to_string()),
+            "features" => Some(self.caps.features_csv()),
+            "devices" => Some(format_devices(&self.backend.list_devices().await, false)),
+            "devices-l" => Some(format_devices(&self.backend.list_devices().await, true)),
+            _ => None,
         }
     }
 
@@ -375,6 +391,86 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 };
                 self.serve_forward_family(stream, svc, &serial).await
             }
+        }
+    }
+
+    /// `host:connect:<addr>` — ask the backend to connect a TCP/IP device. AOSP
+    /// replies `OKAY` + a framed human-readable status string (e.g. `connected to
+    /// 127.0.0.1:5555`), which `adb` prints verbatim; a backend error is a FAIL.
+    async fn serve_connect(&self, stream: &mut TcpStream, addr: &str) -> std::io::Result<()> {
+        match self.backend.connect(addr).await {
+            Ok(status) => {
+                stream
+                    .write_all(&reply_or_overflow(protocol::okay_data(&status)))
+                    .await
+            }
+            Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+        }
+    }
+
+    /// `host:disconnect:<addr>` — ask the backend to drop a TCP/IP device (empty
+    /// `addr` drops all). Same `OKAY` + framed status framing as connect.
+    async fn serve_disconnect(&self, stream: &mut TcpStream, addr: &str) -> std::io::Result<()> {
+        match self.backend.disconnect(addr).await {
+            Ok(status) => {
+                stream
+                    .write_all(&reply_or_overflow(protocol::okay_data(&status)))
+                    .await
+            }
+            Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
+        }
+    }
+
+    /// `host:wait-for-<transport>-<state>` — block until a device matching the
+    /// request is present, then reply `OKAY`.
+    ///
+    /// `arg` is the suffix after `wait-for-`, i.e. `<transport>-<state>`
+    /// (`any-device`, `usb-device`, `local-device`, …). Our backend only observes
+    /// the `device` state (a listed device is ready; we cannot see
+    /// recovery/sideload/bootloader), so those states FAIL fast with a clear
+    /// reason rather than hanging forever. The transport token is accepted but not
+    /// filtered on — `DeviceEntry` carries no transport tag yet.
+    ///
+    /// Framing: a bare `OKAY` once the wait is satisfied. `ADBProxyServer::
+    /// wait_for_device` issues the request via `send_adb_request` (reads the
+    /// connect OKAY) then reads a second OKAY — both are bare OKAYs, so the
+    /// connection OKAY the smartsocket layer already implies plus this OKAY match
+    /// its two reads.
+    async fn serve_wait_for(&self, stream: &mut TcpStream, arg: &str) -> std::io::Result<()> {
+        // Poll cadence + overall bound for the device-present wait.
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Split `<transport>-<state>` on the LAST '-': the state is a single token
+        // (device/recovery/sideload/bootloader); the transport may be any/usb/local.
+        // A bare arg with no '-' (e.g. a hand-typed `wait-for-device`) is treated
+        // as the state directly — real `adb` always sends the `<transport>-<state>`
+        // form, but accepting the bare state is harmless and more forgiving.
+        let state = arg
+            .rsplit_once('-')
+            .map_or(arg, |(_transport, state)| state);
+
+        if state != "device" {
+            return stream
+                .write_all(&protocol::fail(&format!(
+                    "wait-for-{state} not supported (this server only observes the 'device' state)"
+                )))
+                .await;
+        }
+
+        // Poll the device set until at least one device is present, bounded so a
+        // never-arriving device does not pin the connection forever.
+        let deadline = tokio::time::Instant::now() + MAX_WAIT;
+        loop {
+            if !self.backend.list_devices().await.is_empty() {
+                return stream.write_all(&protocol::okay()).await;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return stream
+                    .write_all(&protocol::fail("wait-for timed out"))
+                    .await;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -719,7 +815,18 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return port_str
                 .parse::<u16>()
                 .map(ADBLocalCommand::TcpConnect)
-                .map_err(|_| format!("invalid tcp port: {port_str}"));
+                .map_err(|_| format!("invalid tcp port: {service}"));
+        }
+        // Device **control services** (`tcpip:<port>`, `usb:`, `root:`,
+        // `reboot:[mode]`, `remount:`, `enable-verity:`, `disable-verity:`) are
+        // structurally identical to bare `shell:` v1 — one OPEN, a short textual
+        // reply, then CLSE — so the transparent `bridge_tcp_session` already
+        // handles them. They need no capability gating (every adbd supports them)
+        // and are forwarded verbatim as `Raw`. Note `tcpip:`/`usb:`/`reboot:`
+        // restart adbd, which drops the USB connection; the bridge observes EOF
+        // and the cached connection self-heals on the next open (`get_or_open`).
+        if is_control_service(service) {
+            return Ok(ADBLocalCommand::Raw(service.to_string()));
         }
         // `reverse:*` is routed earlier (serve_reverse) and never reaches here.
         // jdwp/localabstract are not bridged. Everything else is a stable FAIL.
@@ -789,6 +896,26 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             )))
             .await
     }
+}
+
+/// Whether `service` is a device **control service** the server bridges
+/// verbatim: a single OPEN that yields a short textual reply then CLSE, exactly
+/// like bare `shell:` v1. These are the post-transport services behind
+/// `adb tcpip <port>` / `adb usb` / `adb root` / `adb reboot [mode]` /
+/// `adb remount` / `adb {enable,disable}-verity`.
+///
+/// `reboot:` is matched by prefix because the mode is appended
+/// (`reboot:bootloader`, `reboot:` for a plain reboot). The others are exact:
+/// `tcpip:` always carries a port, but the port is opaque to us (we forward the
+/// whole string), so a prefix match is enough and keeps an empty/garbage port a
+/// device-side error rather than a silent accept of an unrelated `tcpip`-prefixed
+/// service. `usb:` / `root:` / `remount:` / `*-verity:` take no argument.
+fn is_control_service(service: &str) -> bool {
+    matches!(
+        service,
+        "usb:" | "root:" | "remount:" | "enable-verity:" | "disable-verity:"
+    ) || service.starts_with("tcpip:")
+        || service.starts_with("reboot:")
 }
 
 /// Whether a (prefix-stripped) service is a member of the forward family:
@@ -937,6 +1064,29 @@ mod tests {
         }
         async fn reverse_remove_all(&self, _serial: &str) -> Result<()> {
             Ok(())
+        }
+        // connect/disconnect routing tests: echo AOSP-style status for a known
+        // address, FAIL otherwise, so the frontend's OKAY+framed vs FAIL framing
+        // can be asserted without real TCP devices.
+        async fn connect(&self, addr: &str) -> Result<String> {
+            if addr == "10.0.0.1:5555" {
+                Ok(format!("connected to {addr}"))
+            } else {
+                Err(crate::RustADBError::ADBRequestFailed(format!(
+                    "failed to connect to {addr}: refused"
+                )))
+            }
+        }
+        async fn disconnect(&self, addr: &str) -> Result<String> {
+            if addr.is_empty() {
+                Ok("disconnected everything (0 device(s))".to_string())
+            } else if addr == "10.0.0.1:5555" {
+                Ok(format!("disconnected {addr}"))
+            } else {
+                Err(crate::RustADBError::ADBRequestFailed(format!(
+                    "no such device {addr}"
+                )))
+            }
         }
     }
 
@@ -1206,6 +1356,110 @@ mod tests {
         assert!(body.starts_with("FAIL"));
     }
 
+    #[tokio::test]
+    async fn host_connect_success_replies_okay_plus_status() {
+        // `adb connect <addr>` → `host:connect:<addr>`; the arm routes to the
+        // backend and frames its status string as OKAY + %04x + body.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:connect:10.0.0.1:5555").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert!(body.contains("connected to 10.0.0.1:5555"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_connect_failure_replies_fail() {
+        // A backend connect error becomes a single FAIL with the reason.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:connect:1.2.3.4:5555").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("failed to connect"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_known_device_replies_okay_plus_status() {
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:disconnect:10.0.0.1:5555").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert!(body.contains("disconnected 10.0.0.1:5555"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_all_empty_addr_replies_okay() {
+        // `adb disconnect` (no addr) → `host:disconnect:` with an empty target.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:disconnect:").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert!(body.contains("disconnected everything"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_disconnect_unknown_device_fails() {
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:disconnect:9.9.9.9:5555").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no such device"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_reconnect_offline_replies_okay() {
+        // We model no offline devices, so reconnect-offline is a success no-op.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:reconnect-offline").await;
+        assert_eq!(resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_device_returns_okay_when_present() {
+        // `adb wait-for-device` (→ host:wait-for-any-device) returns immediately
+        // with OKAY when a device is already present.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:wait-for-any-device").await;
+        assert_eq!(resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_usb_device_token_is_accepted() {
+        // The transport token (usb/local/any) is accepted; we don't filter on it.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:wait-for-usb-device").await;
+        assert_eq!(resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_non_device_state_fails_fast() {
+        // recovery/sideload/bootloader are unobservable by this backend → FAIL
+        // immediately rather than hang.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:wait-for-usb-recovery").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("not supported"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_bare_state_form_is_accepted() {
+        // The forgiving bare-state form (no transport token) still works for the
+        // `device` state when a device is present.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:wait-for-device").await;
+        assert_eq!(resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_unknown_state_fails() {
+        // An unrecognized state is rejected (not the observable `device` state).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:wait-for-any-bogus").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("not supported"), "got: {body}");
+    }
+
     #[test]
     fn format_devices_short_and_long() {
         let devices = vec![DeviceEntry {
@@ -1368,6 +1622,61 @@ mod tests {
             f.map_local_service("shell,v2,TERM=xterm,raw:ls").unwrap(),
             ADBLocalCommand::Raw(s) if s == "shell,v2,TERM=xterm,raw:ls"
         ));
+    }
+
+    #[test]
+    fn map_local_service_control_services_bridged_verbatim() {
+        // Control services need no capability gate — default caps must accept
+        // them, forwarded verbatim as Raw so the transparent bridge relays the
+        // device's textual reply.
+        let f = frontend_with_caps(ServerCapabilities::default());
+        for svc in [
+            "tcpip:5555",
+            "usb:",
+            "root:",
+            "reboot:",
+            "reboot:bootloader",
+            "remount:",
+            "enable-verity:",
+            "disable-verity:",
+        ] {
+            match f.map_local_service(svc) {
+                Ok(ADBLocalCommand::Raw(s)) => assert_eq!(s, svc, "forwarded verbatim"),
+                Ok(_) => panic!("control service {svc} must map to Raw (got another command)"),
+                Err(e) => panic!("control service {svc} must be accepted, got FAIL: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn is_control_service_matches_only_known_control_verbs() {
+        for svc in [
+            "tcpip:5555",
+            "tcpip:0",
+            "usb:",
+            "root:",
+            "reboot:",
+            "reboot:recovery",
+            "remount:",
+            "enable-verity:",
+            "disable-verity:",
+        ] {
+            assert!(is_control_service(svc), "{svc} should be a control service");
+        }
+        // Not control services: bare shell, sync, tcp connect, look-alikes.
+        for svc in [
+            "shell:ls",
+            "sync:",
+            "tcp:5555",
+            "usbfoo:",
+            "rebooting:",
+            "tcpipx",
+        ] {
+            assert!(
+                !is_control_service(svc),
+                "{svc} should NOT be a control service"
+            );
+        }
     }
 
     #[test]

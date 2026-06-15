@@ -124,6 +124,60 @@ async fn run_command<D: ADBDeviceExt>(mut device: D, command: DeviceCommands) ->
                 tracing::info!("{dir}");
             }
         }
+        // Device control services (mode switch / partition / verity) share a
+        // helper to keep this dispatcher under the line limit.
+        control @ (DeviceCommands::Tcpip { .. }
+        | DeviceCommands::Usb
+        | DeviceCommands::Remount
+        | DeviceCommands::DisableVerity
+        | DeviceCommands::EnableVerity) => run_control_command(&mut device, control).await?,
+    }
+
+    Ok(())
+}
+
+/// Run a device **control service** (`tcpip`/`usb`/`remount`/`*-verity`) against
+/// any [`ADBDeviceExt`] device. Split out of [`run_command`] so each dispatcher
+/// stays small; every arm here restarts adbd or mutates partition/verity state.
+async fn run_control_command<D: ADBDeviceExt>(
+    device: &mut D,
+    command: DeviceCommands,
+) -> ADBCliResult<()> {
+    match command {
+        DeviceCommands::Tcpip { port } => {
+            let ack = device.tcpip(port).await?;
+            // Prefer adbd's own status line (e.g. "restarting in TCP mode port:
+            // 5555"); fall back to a generic message if the device sent nothing.
+            if ack.is_empty() {
+                tracing::info!("Restarted adbd in TCP/IP mode on port {port}");
+            } else {
+                tracing::info!("{ack}");
+            }
+        }
+        DeviceCommands::Usb => {
+            device.usb().await?;
+            tracing::info!("Restarted adbd in USB mode");
+        }
+        DeviceCommands::Remount => {
+            let infos = device.remount().await?;
+            for info in infos {
+                tracing::info!("{}: {}", info.path, info.mode);
+            }
+        }
+        DeviceCommands::DisableVerity => {
+            device.disable_verity().await?;
+            tracing::info!("Disabled dm-verity");
+        }
+        DeviceCommands::EnableVerity => {
+            device.enable_verity().await?;
+            tracing::info!("Enabled dm-verity");
+        }
+        // run_command only routes the control variants here.
+        other => {
+            return Err(ADBCliError::Standard(
+                format!("not a control command: {other:?}").into(),
+            ));
+        }
     }
 
     Ok(())

@@ -94,6 +94,14 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
         self.disable_verity().await
     }
 
+    async fn tcpip(&mut self, port: u16) -> Result<String> {
+        self.tcpip(port).await
+    }
+
+    async fn usb(&mut self) -> Result<()> {
+        self.usb().await
+    }
+
     #[cfg(feature = "framebuffer")]
     async fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         self.framebuffer_inner().await

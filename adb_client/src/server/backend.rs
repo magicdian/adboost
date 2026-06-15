@@ -4,12 +4,12 @@
 //! [`DeviceBackend`] is the single injection point of the server frontend. The
 //! frontend owns the host protocol, transport-id computation, and session
 //! bridging; the backend owns *where devices come from* and *how a local
-//! service is opened*. adboost ships [`UsbDeviceBackend`] (a thin wrapper over
+//! service is opened*. adboost ships [`DefaultDeviceBackend`] (a thin wrapper over
 //! [`PersistentUsbConnection`]); downstreams (e.g. xdb) can inject their own to
 //! weave in custom discovery / relay / auth without reimplementing any protocol.
 //!
 //! [`PersistentUsbConnection`]: crate::usb::PersistentUsbConnection
-//! [`UsbDeviceBackend`]: crate::server::UsbDeviceBackend
+//! [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
 
 use tokio::sync::mpsc;
 
@@ -104,7 +104,7 @@ pub struct BackendCapabilities {
 /// The device backend: the frontend gets its device list, change stream, and
 /// local-service sessions through this trait.
 ///
-/// adboost provides [`UsbDeviceBackend`] implementing it over the existing
+/// adboost provides [`DefaultDeviceBackend`] implementing it over the existing
 /// [`PersistentUsbConnection`]; callers may inject a custom implementation to
 /// weave in bespoke discovery / relay / auth in `list_devices` / `open_local_service`
 /// without rewriting any protocol.
@@ -114,7 +114,7 @@ pub struct BackendCapabilities {
 /// (matching [`crate::ADBDeviceExt`] / the crate-internal `ADBTransport`).
 ///
 /// [`PersistentUsbConnection`]: crate::usb::PersistentUsbConnection
-/// [`UsbDeviceBackend`]: crate::server::UsbDeviceBackend
+/// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
 #[trait_variant::make(Send)]
 pub trait DeviceBackend: Send + Sync + 'static {
     /// The authoritative device set for `host:devices` / `host:devices-l` and
@@ -156,10 +156,10 @@ pub trait DeviceBackend: Send + Sync + 'static {
     ///
     /// The default returns an `unsupported` error so existing backends keep
     /// compiling unchanged; override it (and set [`BackendCapabilities::sync`])
-    /// to enable `sync:` bridging. adboost's [`UsbDeviceBackend`] forwards to
+    /// to enable `sync:` bridging. adboost's [`DefaultDeviceBackend`] forwards to
     /// [`PersistentUsbConnection::open_sync_session`].
     ///
-    /// [`UsbDeviceBackend`]: crate::server::UsbDeviceBackend
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
     /// [`PersistentUsbConnection::open_sync_session`]: crate::usb::PersistentUsbConnection::open_sync_session
     async fn open_sync_session(&self, _serial: &str) -> Result<SyncSession> {
         async move {
@@ -175,10 +175,10 @@ pub trait DeviceBackend: Send + Sync + 'static {
     /// The default returns an `unsupported` error so existing backends keep
     /// compiling unchanged; override it (and set
     /// [`BackendCapabilities::shell_v2`]) to enable `shell,v2` bridging.
-    /// adboost's [`UsbDeviceBackend`] forwards to
+    /// adboost's [`DefaultDeviceBackend`] forwards to
     /// [`PersistentUsbConnection::open_shell_v2`].
     ///
-    /// [`UsbDeviceBackend`]: crate::server::UsbDeviceBackend
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
     /// [`PersistentUsbConnection::open_shell_v2`]: crate::usb::PersistentUsbConnection::open_shell_v2
     async fn open_shell_v2(&self, _serial: &str, _cmd: &str) -> Result<ShellV2Session> {
         async move {
@@ -230,6 +230,38 @@ pub trait DeviceBackend: Send + Sync + 'static {
         async move {
             Err(RustADBError::ADBRequestFailed(
                 "reverse not supported by this backend".into(),
+            ))
+        }
+    }
+
+    /// Connect to a device over TCP/IP (`adb connect <addr>` → `host:connect`).
+    ///
+    /// `addr` is the client-supplied target (`<host>` or `<host>:<port>`; a
+    /// missing port defaults to 5555, the adbd-over-TCP default). On success the
+    /// device joins [`Self::list_devices`] and the returned string is the
+    /// AOSP-style status the client prints (e.g. `connected to 127.0.0.1:5555`
+    /// or `already connected to …`).
+    ///
+    /// The default returns `unsupported`; set up a TCP registry and override to
+    /// enable. adboost's [`DefaultDeviceBackend`] connects via
+    /// [`crate::message_devices::tcp::ADBTcpDevice`].
+    ///
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
+    async fn connect(&self, _addr: &str) -> Result<String> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "connect not supported by this backend".into(),
+            ))
+        }
+    }
+
+    /// Disconnect a previously [`Self::connect`]ed TCP device (`adb disconnect`
+    /// → `host:disconnect`). An empty `addr` disconnects every TCP device. The
+    /// returned string is the AOSP-style status (e.g. `disconnected 127.0.0.1:5555`).
+    async fn disconnect(&self, _addr: &str) -> Result<String> {
+        async move {
+            Err(RustADBError::ADBRequestFailed(
+                "disconnect not supported by this backend".into(),
             ))
         }
     }

@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "PR3/PR4/PR5 直接改 server frontend：host:connect/disconnect 新 arm、控制服务桥接、host:wait-for/reconnect-offline、transport-id 统一排序——必须遵守 AOSP 错误措辞矩阵与 tport-before-local-service 约定。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "PR1 direct tcpip/usb 走 OPEN/WRTE/CLSE 一次性服务；PR4 host:connect 触发 CNXN+STLS 握手——CNXN 版本↔delayed_ack↔data_check 耦合与 magic 完整性不可破。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 trait 方法(ADBDeviceExt)、composable backend(TransportRegistry/TCP 池)、models/commands 拆分须遵循模块布局与设备 trait 分层约定。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "tcpip/connect 失败、设备 ack 解析、控制服务 FAIL 回传——RustADBError/Result/CLI ADBCliError 构造与不吞错约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic + sans-io 内联测试范式：每个协议/编码/host arm 改动都要按既有测试风格补单测。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "host:connect/disconnect、tcpip 切换导致连接重建、TCP 设备增删的 log 级别与措辞约定。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用 ADBTcpDevice 握手、get_or_open 的 stale 重建、ReverseEngine 范式；PR4 统一注册表避免与现有 USB 池双路径并存。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "PR4 USB+TCP 合并设备表/变更流/transport-id 跨 backend↔frontend 层一致；PR3 控制服务一次性语义贯穿 frontend↔backend↔persistent。"}

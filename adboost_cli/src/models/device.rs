@@ -61,4 +61,17 @@ pub enum DeviceCommands {
     },
     /// Restart adb daemon with root permissions
     Root,
+    /// Restart adbd listening on TCP/IP on the given port (`adb tcpip <port>`)
+    Tcpip {
+        /// TCP port adbd should listen on (e.g. 5555)
+        port: u16,
+    },
+    /// Restart adbd in USB mode (`adb usb`), undoing a previous `tcpip`
+    Usb,
+    /// Remount /system (and other) partitions read-write
+    Remount,
+    /// Disable dm-verity on the device
+    DisableVerity,
+    /// Enable dm-verity on the device
+    EnableVerity,
 }

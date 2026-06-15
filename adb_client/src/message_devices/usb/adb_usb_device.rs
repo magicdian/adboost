@@ -193,6 +193,14 @@ impl ADBDeviceExt for ADBUSBDevice {
         self.inner.disable_verity().await
     }
 
+    async fn tcpip(&mut self, port: u16) -> Result<String> {
+        self.inner.tcpip(port).await
+    }
+
+    async fn usb(&mut self) -> Result<()> {
+        self.inner.usb().await
+    }
+
     #[cfg(feature = "framebuffer")]
     async fn framebuffer_inner(&mut self) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         self.inner.framebuffer_inner().await

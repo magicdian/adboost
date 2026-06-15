@@ -142,6 +142,14 @@ impl ADBDeviceExt for ADBProxyDevice {
     async fn disable_verity(&mut self) -> Result<()> {
         self.disable_verity().await
     }
+
+    async fn tcpip(&mut self, port: u16) -> Result<String> {
+        self.tcpip(port).await
+    }
+
+    async fn usb(&mut self) -> Result<()> {
+        self.usb().await
+    }
 }
 
 impl ADBProxyDevice {

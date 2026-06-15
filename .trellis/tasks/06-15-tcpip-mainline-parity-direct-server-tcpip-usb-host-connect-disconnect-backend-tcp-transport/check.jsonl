@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "审查 host:connect/disconnect/wait-for/reconnect-offline 的 reply 措辞与 transport-id 排序是否符合 AOSP parity 矩阵。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "审查 tcpip/usb 一次性服务与 TCP 握手是否破坏 CNXN/delayed_ack/magic 完整性不变量。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门：clippy pedantic、MSRV、每个改动是否补了 sans-io 内联单测。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "审查失败路径是否用正确的 RustADBError 构造、不吞错、FAIL 措辞稳定。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "审查是否复用了既有握手/连接池/ReverseEngine，PR4 是否避免双路径。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "审查 USB+TCP 统一设备表/变更流跨层一致性，无遗漏快照或 id 冲突。"}

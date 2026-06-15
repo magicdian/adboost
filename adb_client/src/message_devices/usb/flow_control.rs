@@ -355,7 +355,10 @@ mod tests {
                 Some(i64::from(value)),
                 "parse_okay_delta decodes i32 LE {value}"
             );
-            assert!(apply_okay(&mut fc, &payload), "valid 4-byte payload for {value}");
+            assert!(
+                apply_okay(&mut fc, &payload),
+                "valid 4-byte payload for {value}"
+            );
             assert_eq!(
                 fc.available_bytes(),
                 Some(i64::from(value)),

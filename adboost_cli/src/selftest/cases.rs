@@ -335,6 +335,14 @@ mod tests {
             Ok(())
         }
 
+        async fn tcpip(&mut self, port: u16) -> Result<String, RustADBError> {
+            Ok(format!("restarting in TCP mode port: {port}"))
+        }
+
+        async fn usb(&mut self) -> Result<(), RustADBError> {
+            Ok(())
+        }
+
         async fn framebuffer_inner(
             &mut self,
         ) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>, RustADBError> {

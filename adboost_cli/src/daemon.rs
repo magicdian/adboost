@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use adb_client::server::{AdbServerFrontend, UsbDeviceBackend};
+use adb_client::server::{AdbServerFrontend, DefaultDeviceBackend};
 use tokio::process::Command;
 
 use crate::models::{ADBCliError, ADBCliResult};
@@ -214,7 +214,7 @@ async fn run_server(
             "daemon serving"
         }
     );
-    let backend = Arc::new(UsbDeviceBackend::new());
+    let backend = Arc::new(DefaultDeviceBackend::new());
     // Keep a handle to the backend so we can gracefully close its cached device
     // connections on shutdown (the frontend takes ownership of its own clone).
     let shutdown_backend = Arc::clone(&backend);

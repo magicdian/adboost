@@ -112,3 +112,149 @@ pub async fn case_official_adb_ambiguous_shell(addr: SocketAddrV4) -> Outcome {
         Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
     }
 }
+
+/// Drive the official `adb` client's `connect` against adboost's in-process
+/// server to prove the `host:connect` arm is routed and framed end-to-end —
+/// **without** mutating any real device. We connect to a deliberately
+/// unreachable loopback port: the server reaches the backend, the TCP dial
+/// fails, and `adb` prints a `failed to connect`/`cannot connect` line. This is
+/// non-destructive (no USB device is touched), so it is safe in the automated
+/// phase.
+///
+/// The regression it locks against is the originally-reported
+/// `unknown host service: connect:` — that means the arm is missing entirely.
+/// Any connect-machinery wording (connected / failed to connect / cannot
+/// connect / could not resolve) proves the arm is wired.
+pub async fn case_official_adb_connect_routing(addr: SocketAddrV4) -> Outcome {
+    let port = addr.port().to_string();
+    // Port 1 on loopback is unbound in practice → connect is refused fast.
+    let bad_target = "127.0.0.1:1";
+    let output = Command::new("adb")
+        .args(["-P", &port, "connect", bad_target])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if combined.contains("unknown host service") {
+                return Outcome::Failed(format!(
+                    "REGRESSION: `adb connect` reported `unknown host service` — the \
+                     host:connect arm is missing: {}",
+                    combined.trim()
+                ));
+            }
+            if combined.contains("connected to")
+                || combined.contains("failed to connect")
+                || combined.contains("cannot connect")
+                || combined.contains("could not resolve")
+            {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(format!(
+                    "`adb connect` produced unexpected output (no connect-machinery \
+                     wording): {}",
+                    combined.trim()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
+/// Run `adb -P <port> -s <tcp_serial> shell echo <marker>` against adboost's
+/// in-process server, where `tcp_serial` is a `host:connect`ed TCP/IP device.
+/// This is the `PR4b` end-to-end assertion: a client local service (`shell:`)
+/// bridged *through* the server to a TCP/IP device (not a USB one).
+///
+/// The caller is responsible for having already `host:connect`ed the device on
+/// the server; here we only drive the shell and check the marker round-trips.
+/// Hardware-only (needs a real reachable TCP/IP device), so it lives in the
+/// interactive phase.
+pub async fn case_official_adb_shell_through_tcp_device(
+    addr: SocketAddrV4,
+    tcp_serial: &str,
+) -> Outcome {
+    const MARKER: &str = "adboost_tcpip_through_server_marker";
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "-s", tcp_serial, "shell", "echo", MARKER])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.trim_end() == MARKER {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(format!(
+                    "shell through TCP/IP device returned {:?}, expected {MARKER:?}",
+                    stdout.trim_end()
+                ))
+            }
+        }
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The pre-PR4b symptom: the bridge refused TCP serials with a stable
+            // "not yet supported" reason. Flag it explicitly as a regression.
+            if combined.contains("not yet supported") {
+                Outcome::Failed(format!(
+                    "REGRESSION: shell through a host:connect'd TCP/IP device reported \
+                     `not yet supported` — the transport-generalized multiplexer is not wired: {}",
+                    combined.trim()
+                ))
+            } else {
+                Outcome::Failed(format!(
+                    "shell through TCP/IP device exited {}: {}",
+                    out.status,
+                    combined.trim()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
+/// `adb -P <port> connect <addr>` against adboost's in-process server; returns
+/// the combined stdout+stderr so the caller can confirm the device joined.
+/// Hardware-driving helper for the interactive tcpip end-to-end case.
+pub async fn adb_connect(addr: SocketAddrV4, target: &str) -> Result<String, String> {
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "connect", target])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("could not invoke adb connect: {e}"))?;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+/// `adb -P <port> disconnect <addr>` against adboost's in-process server.
+/// Best-effort teardown for the interactive tcpip case.
+pub async fn adb_disconnect(addr: SocketAddrV4, target: &str) {
+    let port = addr.port().to_string();
+    let _ = Command::new("adb")
+        .args(["-P", &port, "disconnect", target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
