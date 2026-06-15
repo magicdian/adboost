@@ -546,37 +546,48 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         let devices = self.backend.list_devices().await;
         let serials: Vec<String> = devices.iter().map(|d| d.serial.clone()).collect();
 
-        let chosen = if rest.is_empty() || rest == "any" || rest == "-any" {
-            match devices.as_slice() {
-                [one] => Some(one.serial.clone()),
-                _ => None,
-            }
-        } else if let Some(id_str) = rest
-            .strip_prefix("id:")
-            .or_else(|| rest.strip_prefix("-id:"))
-        {
-            id_str
-                .parse::<u64>()
-                .ok()
-                .and_then(|id| protocol::transport_id_for_index(id, &serials))
-        } else {
-            // `tport:serial:<serial>` or `tport:<serial>`
-            let serial = rest.strip_prefix("serial:").unwrap_or(rest);
-            devices
-                .iter()
-                .find(|d| d.serial == serial)
-                .map(|d| d.serial.clone())
-        };
+        // Each selector resolves to the chosen serial, or its own AOSP-correct
+        // failure reason. The `any`/empty branch must distinguish "no devices"
+        // from "more than one device" (matching `select_transport_any`); the
+        // `id:` branch matches `select_transport_by_id`'s messages. Collapsing
+        // these into a single `Option` would misreport every case as
+        // "device not found" (e.g. `adb shell` with no `-s` on multiple devices).
+        let chosen: std::result::Result<String, &str> =
+            if rest.is_empty() || rest == "any" || rest == "-any" {
+                match devices.as_slice() {
+                    [] => Err("no devices"),
+                    [one] => Ok(one.serial.clone()),
+                    _ => Err("more than one device"),
+                }
+            } else if let Some(id_str) = rest
+                .strip_prefix("id:")
+                .or_else(|| rest.strip_prefix("-id:"))
+            {
+                match id_str.parse::<u64>() {
+                    Ok(id) => protocol::transport_id_for_index(id, &serials)
+                        .ok_or("no device for transport id"),
+                    Err(_) => Err("invalid transport id"),
+                }
+            } else {
+                // `tport:serial:<serial>` or `tport:<serial>`
+                let serial = rest.strip_prefix("serial:").unwrap_or(rest);
+                devices
+                    .iter()
+                    .find(|d| d.serial == serial)
+                    .map(|d| d.serial.clone())
+                    .ok_or("device not found")
+            };
 
-        if let Some(serial) = chosen {
-            let id = protocol::transport_id_for(&serial, &serials).unwrap_or(0);
-            stream.write_all(&protocol::okay_tport(id)).await?;
-            Ok(HostOutcome::TransportSelected(serial))
-        } else {
-            stream
-                .write_all(&protocol::fail("device not found"))
-                .await?;
-            Ok(HostOutcome::Close)
+        match chosen {
+            Ok(serial) => {
+                let id = protocol::transport_id_for(&serial, &serials).unwrap_or(0);
+                stream.write_all(&protocol::okay_tport(id)).await?;
+                Ok(HostOutcome::TransportSelected(serial))
+            }
+            Err(reason) => {
+                stream.write_all(&protocol::fail(reason)).await?;
+                Ok(HostOutcome::Close)
+            }
         }
     }
 
@@ -1031,6 +1042,57 @@ mod tests {
 
         drop(client); // EOF → server's next read_request returns None → clean exit
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn tport_any_with_multiple_devices_fails_more_than_one() {
+        // Modern `adb` selects a transport via `host:tport:any` before sending
+        // `shell:` / forward / reverse. With multiple devices it must fail with
+        // the AOSP-correct "more than one device", NOT "device not found".
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("devA"),
+            DeviceEntry::new("devB"),
+        ]));
+        let resp = round_trip(f, "host:tport:any").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("more than one device"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_any_with_no_devices_fails_no_devices() {
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:tport:any").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_by_unknown_serial_fails_device_not_found() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("known")]));
+        let resp = round_trip(f, "host:tport:serial:nope").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("device not found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_by_unknown_id_fails_no_device_for_transport_id() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:tport:id:9").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no device for transport id"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_by_invalid_id_fails_invalid_transport_id() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:tport:id:notanumber").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("invalid transport id"), "got: {body}");
     }
 
     #[tokio::test]

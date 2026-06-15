@@ -1,0 +1,129 @@
+# Server Host Protocol — Transport Selection Contract
+
+> Executable contract for the **server frontend** (`adb_client/src/server/`,
+> feature `server`) smartsocket *host protocol* — adboost acting *as* an adb
+> server for native `adb` / `scrcpy` clients. This is the mirror of the USB
+> wire-protocol contract: that doc covers the device transport; this one covers
+> the host-side request routing in `frontend.rs`.
+
+---
+
+## Transport selection: every path must agree on AOSP error semantics
+
+There are **multiple parallel transport-selection entry points** in
+`frontend.rs`, and they must all report the *same* AOSP error wording for the
+*same* condition. They are easy to drift apart because each is a separate
+function with its own match:
+
+| Service | Function | Reply on success |
+|---|---|---|
+| `host:transport-any` | `select_transport_any` | bare `OKAY` |
+| `host:transport:<serial>` | `select_transport_by_serial` | bare `OKAY` |
+| `host:transport-id:<N>` | `select_transport_by_id` | bare `OKAY` |
+| `host:tport:<sel>` (`any`/`-any`/empty, `serial:<s>`/`<s>`, `id:<N>`/`-id:<N>`) | `select_tport` | `OKAY` + 8-byte LE id |
+| `host:*forward*` (no serial) | `serve_host_forward` → `resolve_single_serial` | forward-family framing |
+
+### Validation & Error Matrix (the canonical wording)
+
+| Selector | 0 devices | >1 devices | serial/id not found | bad id |
+|---|---|---|---|---|
+| `*-any` / empty / `forward` (implicit) | `FAIL("no devices")` | `FAIL("more than one device")` | — | — |
+| `:<serial>` | `FAIL("device not found")` | (n/a — serial is explicit) | `FAIL("device not found")` | — |
+| `-id:<N>` | — | — | `FAIL("no device for transport id")` | `FAIL("invalid transport id")` |
+
+`select_transport_any` and `resolve_single_serial` are the reference for the
+`any` column; `select_transport_by_id` is the reference for the id column.
+
+---
+
+## Gotcha: modern `adb` selects a transport via `host:tport:any` BEFORE the local service
+
+> **Warning**: `adb shell` / `adb forward --list` / `adb reverse --list` **with
+> no `-s`** do NOT send `shell:` (or the forward/reverse command) directly. The
+> client first sends `host:tport:any` to pick a transport, *then* sends the local
+> service on the same socket. So the error a multi-device user sees comes from
+> **`select_tport`**, not from the local-service dispatch and not from
+> `resolve_single_serial`.
+
+### Common Mistake: collapsing all `tport` failures into one `Option`
+
+**Symptom**: With multiple devices, `adb shell` (no `-s`) reports
+`error: device not found` instead of the AOSP-correct `more than one device`.
+`forward --remove/--list` and `reverse --list` show the same wrong wording —
+same root cause, because they all go through `tport:any` first.
+
+**Cause**: `select_tport` resolved every selector to a single
+`Option<String>`, so *no devices*, *multiple devices*, and *serial/id not found*
+all became `None` → one shared `FAIL("device not found")`. Only
+`[one] => Some` was distinguished.
+
+**Fix / Prevention**: each selector branch carries its own reason. Use a
+`Result<String, &str>` per branch so the `any` branch can distinguish empty vs
+multiple, matching `select_transport_any`:
+
+### Wrong
+
+```rust
+let chosen = if rest.is_empty() || rest == "any" || rest == "-any" {
+    match devices.as_slice() {
+        [one] => Some(one.serial.clone()),
+        _ => None,                       // [] AND multi-device collapse here
+    }
+} else { /* id / serial also -> Option */ };
+// ...
+} else {
+    stream.write_all(&protocol::fail("device not found")).await?;  // wrong for 0 / >1
+}
+```
+
+### Correct
+
+```rust
+let chosen: std::result::Result<String, &str> =
+    if rest.is_empty() || rest == "any" || rest == "-any" {
+        match devices.as_slice() {
+            [] => Err("no devices"),
+            [one] => Ok(one.serial.clone()),
+            _ => Err("more than one device"),
+        }
+    } else if let Some(id_str) = rest.strip_prefix("id:").or_else(|| rest.strip_prefix("-id:")) {
+        match id_str.parse::<u64>() {
+            Ok(id) => protocol::transport_id_for_index(id, &serials).ok_or("no device for transport id"),
+            Err(_) => Err("invalid transport id"),
+        }
+    } else {
+        let serial = rest.strip_prefix("serial:").unwrap_or(rest);
+        devices.iter().find(|d| d.serial == serial).map(|d| d.serial.clone()).ok_or("device not found")
+    };
+```
+
+---
+
+## Tests Required (assertion points)
+
+Inline `#[cfg(test)] mod tests` in `frontend.rs`, driven by `round_trip` against
+a `MockBackend`. Run with `--features "server,usb"` (the test module references
+`crate::usb::MultiplexedSession`, so `server` alone will not compile the tests).
+
+- `tport_any_with_multiple_devices_fails_more_than_one` → body contains `more than one device`
+- `tport_any_with_no_devices_fails_no_devices` → `no devices`
+- `tport_by_unknown_serial_fails_device_not_found` → `device not found`
+- `tport_by_unknown_id_fails_no_device_for_transport_id` → `no device for transport id`
+- `tport_by_invalid_id_fails_invalid_transport_id` → `invalid transport id`
+- single-device happy path (`tport_any_with_single_device_replies_okay_plus_8byte_id`) unchanged
+
+### Runtime selftest (device-backed, `adboost_cli selftest`)
+
+Unit tests use a `MockBackend`; the *reported* regression only manifests with a
+**real** multi-device setup driven by the **official `adb` client** (which is
+what issues `host:tport:any` before `shell:`). Covered by a parity case:
+
+- `adboost_cli/src/selftest/parity.rs::case_official_adb_ambiguous_shell` — runs
+  `adb -P <port> shell echo …` with **no `-s`** against adboost's in-process
+  server; `Passed` iff stderr contains `more than one device`, and explicitly
+  flags `device not found` as a REGRESSION.
+- Wired in `selftest/mod.rs::run_through_server_phase` under `if multi {}` —
+  runs **once per run** (ambiguity is a whole-device-set property, not per
+  serial), never emitted in single-device mode, `Skipped` when no `adb` on PATH.
+  Note the rest of the multi-device suite selects by serial (the `-s`
+  equivalent), so this is the one case that exercises the ambiguous path.

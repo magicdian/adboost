@@ -26,6 +26,7 @@ Read the relevant guideline before writing code in that area:
 - **Adding `log` calls**: [Logging Guidelines](./logging-guidelines.md)
 - **Persistence / RSA key / session state**: [Persistence & External State](./database-guidelines.md)
 - **CNXN version / `delayed_ack` / message integrity (crc/magic)**: [ADB Wire Protocol Contract](./adb-wire-protocol-contract.md)
+- **Server frontend host protocol / transport selection (`host:tport*` / `transport*` / forward routing)**: [Server Host Protocol](./server-host-protocol.md)
 - **Importing an upstream `.patch`**: [Upstream Patch Import](./upstream-patch-import.md)
 
 ---
@@ -40,6 +41,7 @@ Read the relevant guideline before writing code in that area:
 | [Quality Guidelines](./quality-guidelines.md) | clippy pedantic, MSRV, features, testing style, quality gate | Filled |
 | [Logging Guidelines](./logging-guidelines.md) | `log` facade, `log::<level>!` style, level conventions | Filled |
 | [ADB Wire Protocol Contract](./adb-wire-protocol-contract.md) | CNXN version ↔ `delayed_ack` ↔ `data_check` coupling; magic-only receive integrity; AOSP version constants | Filled |
+| [Server Host Protocol](./server-host-protocol.md) | Server frontend transport-selection parity (`tport`/`transport`/forward); AOSP error wording matrix; `tport:any`-before-local-service gotcha | Filled |
 | [Upstream Patch Import](./upstream-patch-import.md) | How to import patches into this fork (skip Cargo.toml, handle version drift) | Filled |
 
 ---

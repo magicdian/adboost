@@ -171,6 +171,11 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
         // client (auto-detected; SKIPPED when adb is absent).
         run_parity_against_server(reporter, server.addr(), serial).await;
     }
+    // Ambiguous-selection parity: only meaningful with >1 device, and it tests
+    // ambiguity across the whole device set, so it runs ONCE (not per serial).
+    if multi {
+        run_ambiguous_parity_against_server(reporter, server.addr()).await;
+    }
     // Gracefully shut the server down: flush a connection-level CLSE to every
     // cached device connection while their writer tasks are still alive, then
     // free the port. This prevents orphaned device streams that would otherwise
@@ -232,6 +237,27 @@ async fn run_parity_against_server(
             reporter,
             "parity",
             "official_adb_shell",
+            Outcome::Skipped("official `adb` binary not found on PATH".into()),
+        );
+    }
+}
+
+/// Run the ambiguous-selection parity case (no `-s` against multiple devices)
+/// against the running adboost server, or SKIP when no `adb` binary is
+/// available. Runs once per multi-device run; never emitted in single-device
+/// mode (where it is meaningless).
+async fn run_ambiguous_parity_against_server(
+    reporter: &mut Reporter,
+    addr: std::net::SocketAddrV4,
+) {
+    if parity::adb_available().await {
+        let outcome = parity::case_official_adb_ambiguous_shell(addr).await;
+        run_one(reporter, "parity", "official_adb_ambiguous_shell", outcome);
+    } else {
+        run_one(
+            reporter,
+            "parity",
+            "official_adb_ambiguous_shell",
             Outcome::Skipped("official `adb` binary not found on PATH".into()),
         );
     }

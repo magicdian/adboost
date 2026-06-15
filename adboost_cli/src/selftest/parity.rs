@@ -63,3 +63,52 @@ pub async fn case_official_adb_shell(addr: SocketAddrV4, serial: &str) -> Outcom
         Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
     }
 }
+
+/// Run `adb -P <port> shell echo <marker>` against adboost's in-process server
+/// with **no `-s`** while multiple devices are connected, and assert the client
+/// is told the selection is ambiguous (`more than one device`).
+///
+/// This reproduces the exact reported regression end-to-end: a modern `adb`
+/// selects a transport via `host:tport:any` *before* sending `shell:`, and the
+/// server frontend used to collapse the multi-device case into the misleading
+/// `device not found`. The AOSP-correct reply is `more than one device`.
+///
+/// Only meaningful in the multi-device scenario; the harness runs it once per
+/// run (not per serial) and only when `multi` is true.
+pub async fn case_official_adb_ambiguous_shell(addr: SocketAddrV4) -> Outcome {
+    const MARKER: &str = "adboost_parity_marker_ambiguous";
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "shell", "echo", MARKER])
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        // A no-`-s` shell against multiple devices must NOT succeed.
+        Ok(out) if out.status.success() => Outcome::Failed(
+            "official adb shell with no -s unexpectedly succeeded against multiple devices; \
+             expected `more than one device`"
+                .to_string(),
+        ),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("more than one device") {
+                Outcome::Passed
+            } else if stderr.contains("device not found") {
+                Outcome::Failed(format!(
+                    "REGRESSION: no--s shell against multiple devices reported `device not found` \
+                     instead of `more than one device`: {}",
+                    stderr.trim_end()
+                ))
+            } else {
+                Outcome::Failed(format!(
+                    "no--s shell against multiple devices failed with unexpected wording, \
+                     expected `more than one device`: {}",
+                    stderr.trim_end()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
