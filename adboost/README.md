@@ -1,19 +1,19 @@
-# `adb_client`
+# `adboost`
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../NOTICE)
-[![Documentation](https://docs.rs/adb_client/badge.svg)](https://docs.rs/adb_client)
-[![Crates.io Total Downloads](https://img.shields.io/crates/d/adb_client)](https://crates.io/crates/adb_client)
-![MSRV](https://img.shields.io/crates/msrv/adb_client)
+[![Documentation](https://docs.rs/adboost/badge.svg)](https://docs.rs/adboost)
+[![Crates.io Total Downloads](https://img.shields.io/crates/d/adboost)](https://crates.io/crates/adboost)
+![MSRV](https://img.shields.io/crates/msrv/adboost)
 
 Rust library implementing ADB protocol.
 
 ## Installation
 
-Add `adb_client` crate as a dependency by simply adding it to your `Cargo.toml`:
+Add `adboost` crate as a dependency by simply adding it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adb_client = "*"
+adboost = "*"
 ```
 
 ## Crate features
@@ -29,7 +29,7 @@ To deactivate some default features you can use the `default-features = false` o
 
 ```toml
 [dependencies]
-adb_client = { version = "*", default-features = false, features = ["mdns", "usb"] }
+adboost = { version = "*", default-features = false, features = ["mdns", "usb"] }
 ```
 
 ## Examples

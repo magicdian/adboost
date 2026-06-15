@@ -4,7 +4,7 @@
 
 ```rust no_run
 use std::net::IpAddr;
-use adb_client::{tcp::ADBTcpDevice, ADBDeviceExt};
+use adboost::{tcp::ADBTcpDevice, ADBDeviceExt};
 use tokio::io::{empty, sink};
 
 # async fn run() {

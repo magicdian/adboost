@@ -3,7 +3,7 @@
 ## Launch a command on device
 
 ```rust no_run
-use adb_client::{usb::ADBUSBDevice, ADBDeviceExt};
+use adboost::{usb::ADBUSBDevice, ADBDeviceExt};
 
 let vendor_id = 0x04e8;
 let product_id = 0x6860;
@@ -14,7 +14,7 @@ device.shell_command(&"df -h", Some(&mut std::io::stdout()), None);
 ## Push a file to the device
 
 ```rust no_run
-use adb_client::{usb::ADBUSBDevice, ADBDeviceExt};
+use adboost::{usb::ADBUSBDevice, ADBDeviceExt};
 use std::fs::File;
 use std::path::Path;
 

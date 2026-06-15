@@ -1,4 +1,4 @@
-use adb_client::RebootType;
+use adboost::RebootType;
 use clap::Parser;
 
 #[derive(Parser, Debug)]

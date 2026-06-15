@@ -30,7 +30,7 @@ jobs:
 
       - name: Publish crates
         run: |
-          cargo publish -p adb_client --token ${CRATES_IO_TOKEN}
+          cargo publish -p adboost --token ${CRATES_IO_TOKEN}
           cargo publish -p adboost_cli --token ${CRATES_IO_TOKEN}
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

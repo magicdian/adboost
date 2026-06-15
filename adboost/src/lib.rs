@@ -48,13 +48,13 @@ pub mod mdns;
 /// With a subscriber installed (this helper, or any `tracing-subscriber` set up
 /// by the consumer), `RUST_LOG` selects output at runtime:
 ///
-/// - `RUST_LOG=adb_client=trace` — the whole crate.
-/// - `RUST_LOG=adb_client::message_devices::usb::persistent=trace` — just the
+/// - `RUST_LOG=adboost=trace` — the whole crate.
+/// - `RUST_LOG=adboost::message_devices::usb::persistent=trace` — just the
 ///   USB multiplexer.
 /// - `RUST_LOG=[reader]=trace` / `[writer]=trace` — just the reader / writer task.
 /// - `RUST_LOG=[session{local_id=...}]=trace` — only events for one session
 ///   (per-`local_id` attribution).
-/// - `RUST_LOG=adb_client=info,[session]=debug` — combine.
+/// - `RUST_LOG=adboost=info,[session]=debug` — combine.
 ///
 /// Because `tracing` is built with its `log` feature here, every event is also
 /// emitted as a `log` record, so consumers wired only with `env_logger`

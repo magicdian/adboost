@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use adb_client::usb::{
+use adboost::usb::{
     ADBTransportMessage, MessageCommand, PersistentUsbConnection, find_all_connected_adb_devices,
 };
-use adb_client::{DeviceFeatureSet, RustADBError};
+use adboost::{DeviceFeatureSet, RustADBError};
 use tokio::task::JoinError;
 use tokio::time::error::Elapsed;
 

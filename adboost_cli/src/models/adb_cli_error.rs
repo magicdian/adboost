@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use adb_client::RustADBError;
+use adboost::RustADBError;
 
 pub type ADBCliResult<T> = Result<T, ADBCliError>;
 
@@ -18,7 +18,7 @@ impl Display for ADBCliError {
                     f,
                     r"Error: {error}
                     An unexpected error occurred and may indicate a bug.
-                    Please report this issue on the project repository (including steps to reproduce if possible): https://github.com/cocool97/adb_client/issues.",
+                    Please report this issue on the project repository (including steps to reproduce if possible): https://github.com/magicdian/adboost/issues.",
                 )
             }
         }
@@ -39,8 +39,8 @@ impl From<String> for ADBCliError {
     }
 }
 
-impl From<adb_client::RustADBError> for ADBCliError {
-    fn from(value: adb_client::RustADBError) -> Self {
+impl From<adboost::RustADBError> for ADBCliError {
+    fn from(value: adboost::RustADBError) -> Self {
         let value = Box::new(value);
 
         match value.as_ref() {

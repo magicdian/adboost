@@ -1,14 +1,14 @@
 # Error Handling
 
 > How errors are handled across the three crates of `xp_adb_client`
-> (`adb_client` core lib, `adb_cli` binary, `pyadb_client` PyO3 bindings).
+> (`adboost` core lib, `adb_cli` binary, `pyadb_client` PyO3 bindings).
 > Each layer has a distinct, deliberate strategy.
 
 ---
 
 ## Overview
 
-- **Core lib (`adb_client`):** one `thiserror` enum `RustADBError` + a crate
+- **Core lib (`adboost`):** one `thiserror` enum `RustADBError` + a crate
   `Result<T>` alias. Foreign errors auto-convert via `#[from]`; domain errors
   are named variants with `{0}` format strings.
 - **CLI (`adb_cli`):** a hand-rolled classified enum `ADBCliError` (NOT
@@ -20,7 +20,7 @@
 
 ## Error Types
 
-### Core: `RustADBError` (`adb_client/src/error.rs`)
+### Core: `RustADBError` (`adboost/src/error.rs`)
 
 - Uses **`thiserror`**: `#[derive(Error, Debug)]` (`error.rs:7`).
 - ~45 variants (`error.rs:8-149`), public, re-exported from `lib.rs`.
@@ -29,7 +29,7 @@
   pub type Result<T> = std::result::Result<T, RustADBError>;
   ```
   Referenced as `crate::Result<T>` internally; the CLI imports
-  `adb_client::Result` directly.
+  `adboost::Result` directly.
 
 Variant conventions (use these patterns when adding a variant):
 
@@ -153,7 +153,7 @@ exists in the codebase.
   `ExitCode::FAILURE` (`main.rs:115-118`).
 - `fn inner_main() -> ADBCliResult<()>` (`main.rs:123`) uses `?` throughout,
   relying on the `From` impls to lift errors.
-- **`From<adb_client::RustADBError> for ADBCliError`** (`adb_cli_error.rs:35-86`)
+- **`From<adboost::RustADBError> for ADBCliError`** (`adb_cli_error.rs:35-86`)
   does the classification: an **exhaustive match (no `_` arm)** routes each
   `RustADBError` variant to `MayNeedAnIssue` (internal) or `Standard`
   (user-facing). The exhaustive match is intentional — adding a new

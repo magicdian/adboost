@@ -7,7 +7,7 @@ adboost's own ADB server — for that, see the [`crate::server`] module.
 ## Get available ADB devices
 
 ```rust no_run
-use adb_client::proxy::ADBProxyServer;
+use adboost::proxy::ADBProxyServer;
 use std::net::{SocketAddrV4, Ipv4Addr};
 
 // A custom server address can be provided
@@ -21,7 +21,7 @@ server.devices();
 ## Launch a command on device
 
 ```rust no_run
-use adb_client::{proxy::ADBProxyServer, ADBDeviceExt};
+use adboost::{proxy::ADBProxyServer, ADBDeviceExt};
 
 # async fn run() {
 let mut server = ADBProxyServer::default();
@@ -37,7 +37,7 @@ device
 ## Push a file to the device
 
 ```rust no_run
-use adb_client::proxy::ADBProxyServer;
+use adboost::proxy::ADBProxyServer;
 
 # async fn run() {
 let mut server = ADBProxyServer::default();

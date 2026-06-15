@@ -9,12 +9,12 @@ mod models;
 mod selftest;
 mod utils;
 
-use adb_client::ADBDeviceExt;
-use adb_client::mdns::MDNSDiscoveryService;
-use adb_client::proxy::ADBProxyDevice;
-use adb_client::proxy::ADBProxyServer;
-use adb_client::tcp::ADBTcpDevice;
-use adb_client::usb::{ADBDeviceInfo, ADBUSBDevice, find_all_connected_adb_devices};
+use adboost::ADBDeviceExt;
+use adboost::mdns::MDNSDiscoveryService;
+use adboost::proxy::ADBProxyDevice;
+use adboost::proxy::ADBProxyServer;
+use adboost::tcp::ADBTcpDevice;
+use adboost::usb::{ADBDeviceInfo, ADBUSBDevice, find_all_connected_adb_devices};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use adb_termios::ADBTermios;

@@ -8,7 +8,7 @@
 
 ## Overview
 
-This is a Rust Cargo workspace (edition 2024, MSRV 1.88.0): the `adb_client`
+This is a Rust Cargo workspace (edition 2024, MSRV 1.88.0): the `adboost`
 core library, the `adb_cli` binary, the `pyadb_client` PyO3 bindings, and an
 mDNS example. There is **no web/database backend** — "backend" here means the
 Rust library + CLI code. The guidelines below document the codebase's **actual**

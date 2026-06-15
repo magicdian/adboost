@@ -10,7 +10,7 @@ const fn parse_hex_id(id: &str) -> Result<u16, ParseIntError> {
 /// Persistent-USB exerciser: a one-command, in-tree reproducer for the async
 /// USB / windowed-`delayed_ack` path (where bugs #1/#2/#3 lived).
 ///
-/// Builds a [`adb_client::usb::PersistentUsbConnection`], prints a negotiation
+/// Builds a [`adboost::usb::PersistentUsbConnection`], prints a negotiation
 /// self-check (advertised feature set, banner, first inbound frame after OPEN —
 /// OKAY vs CLSE), then runs a shell command and prints its output. Read-only /
 /// non-invasive against the device.

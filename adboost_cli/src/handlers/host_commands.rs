@@ -1,4 +1,4 @@
-use adb_client::{
+use adboost::{
     Result,
     proxy::{ADBProxyServer, DeviceShort, MDNSBackend, WaitForDeviceState},
 };

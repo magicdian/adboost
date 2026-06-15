@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use adb_client::ADBDeviceExt;
-use adb_client::proxy::ADBProxyDevice;
+use adboost::ADBDeviceExt;
+use adboost::proxy::ADBProxyDevice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

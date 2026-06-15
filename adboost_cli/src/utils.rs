@@ -2,7 +2,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 /// Installs a stderr `tracing` subscriber.
 ///
-/// The CLI is the binary, so it owns subscriber installation (the `adb_client`
+/// The CLI is the binary, so it owns subscriber installation (the `adboost`
 /// library stays a pure emitter). Filtering follows the standard convention:
 /// - if `RUST_LOG` is set, use it (full `EnvFilter` directive syntax, including
 ///   per-span / per-`local_id` filters such as `[session{local_id=42}]=trace`);

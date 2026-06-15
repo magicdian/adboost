@@ -1,6 +1,6 @@
 # Server Host Protocol — Transport Selection Contract
 
-> Executable contract for the **server frontend** (`adb_client/src/server/`,
+> Executable contract for the **server frontend** (`adboost/src/server/`,
 > feature `server`) smartsocket *host protocol* — adboost acting *as* an adb
 > server for native `adb` / `scrcpy` clients. This is the mirror of the USB
 > wire-protocol contract: that doc covers the device transport; this one covers

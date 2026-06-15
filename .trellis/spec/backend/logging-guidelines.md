@@ -14,8 +14,8 @@ consumer — never by the library.
 
 | Crate | Logging deps |
 |---|---|
-| `adb_client` (lib) | `tracing = { features = ["log"] }` — emits events + spans, **never** installs a subscriber. `tracing-subscriber` is an **optional** dep, gated behind the off-by-default `tracing-init` feature (powers the `init_tracing_from_env()` convenience helper only). |
-| `adboost_cli` (bin) | owns subscriber install (via `adb_client::init_tracing_from_env()` or its own `tracing-subscriber`). |
+| `adboost` (lib) | `tracing = { features = ["log"] }` — emits events + spans, **never** installs a subscriber. `tracing-subscriber` is an **optional** dep, gated behind the off-by-default `tracing-init` feature (powers the `init_tracing_from_env()` convenience helper only). |
+| `adboost_cli` (bin) | owns subscriber install (via `adboost::init_tracing_from_env()` or its own `tracing-subscriber`). |
 | `pyadb_client` | no logging deps. |
 
 **Backward compatibility**: `tracing`'s `log` feature makes every event ALSO emit
@@ -33,7 +33,7 @@ library that installs a subscriber steals the process-global slot from the binar
 and every other consumer.
 
 The library exposes ONE optional convenience initializer, feature-gated and OFF by
-default (`adb_client/src/lib.rs`):
+default (`adboost/src/lib.rs`):
 
 ```rust
 #[cfg(feature = "tracing-init")]
@@ -54,11 +54,11 @@ build pulls in only the tiny `tracing` emit crate (no subscriber).
 With a subscriber installed, `RUST_LOG` (`EnvFilter`) selects output — including
 **per-span / per-field** filtering that plain `log` cannot do:
 
-- `RUST_LOG=adb_client=trace` — whole crate.
-- `RUST_LOG=adb_client::message_devices::usb::persistent=trace` — just the USB multiplexer.
+- `RUST_LOG=adboost=trace` — whole crate.
+- `RUST_LOG=adboost::message_devices::usb::persistent=trace` — just the USB multiplexer.
 - `RUST_LOG=[reader]=trace` / `[writer]=trace` — just the reader / writer task.
 - `RUST_LOG=[session{local_id=...}]=trace` — only one session (per-`local_id` attribution).
-- `RUST_LOG=adb_client=info,[session]=debug` — combine.
+- `RUST_LOG=adboost=info,[session]=debug` — combine.
 
 ---
 
@@ -110,7 +110,7 @@ level is disabled — *as long as they are written INSIDE the macro call*, not
 pre-computed into a binding first. Keep hot per-frame `trace!` args inline.
 
 **Never use `println!` / `eprintln!` / `print!` for logging in library code** —
-zero such calls exist in `adb_client/`. (`eprintln!` appears only in
+zero such calls exist in `adboost/`. (`eprintln!` appears only in
 `benches/benchmark_adb_push.rs`, which is acceptable for a bench harness.)
 
 ---
@@ -159,7 +159,7 @@ zero such calls exist in `adb_client/`. (`eprintln!` appears only in
 - **Holding a sync `span.enter()` guard across `.await`** in an `async fn` — use
   `#[tracing::instrument]` instead (see the async span rule above). This is the
   highest-impact mistake: it silently misattributes events across tasks.
-- Adding `tracing-subscriber` (or any subscriber) to `adb_client`'s **default**
+- Adding `tracing-subscriber` (or any subscriber) to `adboost`'s **default**
   dependencies — it must stay `optional` behind `tracing-init`.
 - Using `println!`/`eprintln!` for output in library code — use the `tracing`
   macros (CLI output goes through `tracing::info!`).

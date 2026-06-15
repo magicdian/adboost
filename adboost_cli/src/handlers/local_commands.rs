@@ -1,4 +1,4 @@
-use adb_client::proxy::ADBProxyDevice;
+use adboost::proxy::ADBProxyDevice;
 use tokio::io::AsyncWrite;
 
 use crate::models::{ADBCliResult, ForwardCommand, LocalDeviceCommand, ReverseCommand};

@@ -9,8 +9,8 @@
 //! Cases avoid leaving persistent device state: files are written under
 //! `/data/local/tmp` with unique names and removed at the end.
 
-use adb_client::ADBDeviceExt;
-use adb_client::usb::PersistentUsbConnection;
+use adboost::ADBDeviceExt;
+use adboost::usb::PersistentUsbConnection;
 
 use super::report::Outcome;
 
@@ -187,7 +187,7 @@ pub async fn case_stat_root<D: ADBDeviceExt>(device: &mut D) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adb_client::{ADBListItemType, AdbStatResponse, RustADBError};
+    use adboost::{ADBListItemType, AdbStatResponse, RustADBError};
     use std::pin::Pin;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -296,14 +296,11 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn reboot(
-            &mut self,
-            _reboot_type: adb_client::RebootType,
-        ) -> Result<(), RustADBError> {
+        async fn reboot(&mut self, _reboot_type: adboost::RebootType) -> Result<(), RustADBError> {
             Ok(())
         }
 
-        async fn remount(&mut self) -> Result<Vec<adb_client::RemountInfo>, RustADBError> {
+        async fn remount(&mut self) -> Result<Vec<adboost::RemountInfo>, RustADBError> {
             Ok(vec![])
         }
 

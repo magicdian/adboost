@@ -1,4 +1,4 @@
-use adb_client::proxy::ADBProxyServer;
+use adboost::proxy::ADBProxyServer;
 use anyhow::Result;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::{RngExt, rng};
@@ -30,11 +30,11 @@ fn generate_test_file(size_in_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Use `adb_client` crate to push a file on device.
+/// Use `adboost` crate to push a file on device.
 ///
-/// `adb_client` is now async-native (tokio); the benchmark owns the runtime and
+/// `adboost` is now async-native (tokio); the benchmark owns the runtime and
 /// drives the async API to completion via `block_on`.
-fn bench_adb_client_push(runtime: &tokio::runtime::Runtime) -> Result<()> {
+fn bench_adboost_push(runtime: &tokio::runtime::Runtime) -> Result<()> {
     runtime.block_on(async {
         let mut client = ADBProxyServer::default();
         let mut device = client.get_device().await?;
@@ -58,7 +58,7 @@ fn bench_adb_push_command() -> Result<()> {
     Ok(())
 }
 
-/// benchmarking `adb push INPUT DEST` and `adb_client` `ADBProxyDevice.push(INPUT, DEST)`
+/// benchmarking `adb push INPUT DEST` and `adboost` `ADBProxyDevice.push(INPUT, DEST)`
 fn benchmark_adb_push(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("cannot build tokio runtime");
 
@@ -74,9 +74,9 @@ fn benchmark_adb_push(c: &mut Criterion) {
         let mut group = c.benchmark_group("ADB Push Benchmark");
         group.sample_size(sample_size);
 
-        group.bench_function(BenchmarkId::new("adb_client", "push"), |b| {
+        group.bench_function(BenchmarkId::new("adboost", "push"), |b| {
             b.iter(|| {
-                bench_adb_client_push(&runtime).expect("Error while benchmarking adb_client push");
+                bench_adboost_push(&runtime).expect("Error while benchmarking adboost push");
             });
         });
 

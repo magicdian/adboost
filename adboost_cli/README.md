@@ -3,11 +3,11 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../NOTICE)
 
 Rust binary providing an improved version of `adb` CLI, built on the async
-`adb_client` library (adboost fork). Formerly `adb_cli`.
+`adboost` library (adboost fork). Formerly `adb_cli`.
 
 ## Rust binary
 
-This crate provides a lightweight binary based on the local `adb_client` crate.
+This crate provides a lightweight binary based on the local `adboost` crate.
 It is fully `async` (`#[tokio::main]`) and links the local workspace library.
 
 Usage is quite simple, and tends to look like `adb`:
@@ -157,12 +157,12 @@ syntax, including per-span and per-`local_id` filtering that plain `log` cannot
 do:
 
 ```bash
-RUST_LOG=adb_client=debug adboost_cli persistent shell getprop          # whole crate at debug
-RUST_LOG=adb_client::message_devices::usb::persistent=trace adboost_cli ...   # just the USB multiplexer
+RUST_LOG=adboost=debug adboost_cli persistent shell getprop          # whole crate at debug
+RUST_LOG=adboost::message_devices::usb::persistent=trace adboost_cli ...   # just the USB multiplexer
 RUST_LOG=[reader]=trace adboost_cli ...                                  # just the reader task
 RUST_LOG=[writer]=trace adboost_cli ...                                  # just the writer task
 RUST_LOG='[session{local_id=42}]=trace' adboost_cli ...                  # only one session
-RUST_LOG=adb_client=info,[session]=debug adboost_cli ...                 # combine
+RUST_LOG=adboost=info,[session]=debug adboost_cli ...                 # combine
 ```
 
 If `RUST_LOG` is unset, the `--debug` flag selects `debug` (vs the default

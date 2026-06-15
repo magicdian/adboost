@@ -15,8 +15,8 @@
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
-use adb_client::server::{AdbServerFrontend, DefaultDeviceBackend};
-use adb_client::usb::{ADBDeviceInfo, find_all_connected_adb_devices};
+use adboost::server::{AdbServerFrontend, DefaultDeviceBackend};
+use adboost::usb::{ADBDeviceInfo, find_all_connected_adb_devices};
 
 /// One discovered USB device, classified for suite selection.
 #[derive(Clone, Debug)]

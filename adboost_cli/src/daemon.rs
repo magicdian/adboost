@@ -1,6 +1,6 @@
 //! `server start` / `server kill` daemon control for the adboost ADB server.
 //!
-//! adboost's own ADB server (USB-backed, [`adb_client::server`]) is long-lived,
+//! adboost's own ADB server (USB-backed, [`adboost::server`]) is long-lived,
 //! unlike every other one-shot CLI command. `start` launches it as a detached
 //! background process and records its PID; `kill` stops that process.
 //!
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use adb_client::server::{AdbServerFrontend, DefaultDeviceBackend};
+use adboost::server::{AdbServerFrontend, DefaultDeviceBackend};
 use tokio::process::Command;
 
 use crate::models::{ADBCliError, ADBCliResult};

@@ -77,7 +77,7 @@ pub struct DefaultDeviceBackend {
 
 /// Deprecated former name of [`DefaultDeviceBackend`]. The default backend now
 /// also tracks TCP/IP devices, so the `Usb`-specific name no longer fits; this
-/// alias keeps existing `use adb_client::server::UsbDeviceBackend` compiling.
+/// alias keeps existing `use adboost::server::UsbDeviceBackend` compiling.
 #[deprecated(
     since = "3.2.2",
     note = "renamed to DefaultDeviceBackend (it now also tracks TCP/IP devices)"

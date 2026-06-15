@@ -14,7 +14,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-adb_client = { path = "../adb_client", features = ["mdns", "usb", "server"] }
+adboost = { path = "../adboost", features = ["mdns", "usb", "server"] }
 clap = { version = "4.6.1", features = ["derive"] }
 tabwriter = { version = "1.4.1" }
 tokio = { version = "1", features = ["full"] }
@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 # Only needed so the self-test unit tests can implement the framebuffer arm of
 # `ADBDeviceExt` (default `framebuffer` feature) on their hardware-free fake
-# device. Mirrors adb_client's image version/features.
+# device. Mirrors adboost's image version/features.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]

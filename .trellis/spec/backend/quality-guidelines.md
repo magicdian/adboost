@@ -37,7 +37,7 @@ Write code that passes `clippy::pedantic`.
 
 ### Lint attribute conventions
 
-- **`adb_client` core lib forbids `unsafe`**: `#![forbid(unsafe_code)]`
+- **`adboost` core lib forbids `unsafe`**: `#![forbid(unsafe_code)]`
   (`lib.rs:2`). Do not introduce `unsafe` in the library.
 - Allowed crate-level relaxations (inner attributes only):
   - `lib.rs:3` `#![allow(missing_debug_implementations)]`
@@ -55,7 +55,7 @@ silence a lint locally, justify it in a comment.
 
 ---
 
-## Feature flags (`adb_client/Cargo.toml:20-24`)
+## Feature flags (`adboost/Cargo.toml:20-24`)
 
 ```toml
 [features]
@@ -118,9 +118,9 @@ cargo clippy --all-targets -- -D warnings        # default features (what CI run
 cargo test
 
 # If you touched USB / mDNS / framebuffer code, also run with the feature on:
-cargo clippy -p adb_client --features usb --all-targets -- -D warnings
-cargo build  -p adb_client --features usb
-cargo test   -p adb_client
+cargo clippy -p adboost --features usb --all-targets -- -D warnings
+cargo build  -p adboost --features usb
+cargo test   -p adboost
 cargo build  -p adb_cli                          # dependents still build
 ```
 
@@ -128,7 +128,7 @@ cargo build  -p adb_cli                          # dependents still build
 
 ## Forbidden / discouraged patterns
 
-- `unsafe` in `adb_client` (forbidden by `#![forbid(unsafe_code)]`).
+- `unsafe` in `adboost` (forbidden by `#![forbid(unsafe_code)]`).
 - `println!`/`eprintln!` for output in library code — use the `log` macros
   (see `logging-guidelines.md`).
 - `.unwrap()`/`.expect()` on genuinely fallible paths in production code —

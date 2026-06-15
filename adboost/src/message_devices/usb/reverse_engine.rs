@@ -31,8 +31,8 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use adb_client::usb::{PersistentUsbConnection, ReverseEngine, ReversePolicy};
-//! # async fn demo(conn: Arc<PersistentUsbConnection>) -> adb_client::Result<()> {
+//! # use adboost::usb::{PersistentUsbConnection, ReverseEngine, ReversePolicy};
+//! # async fn demo(conn: Arc<PersistentUsbConnection>) -> adboost::Result<()> {
 //! let engine = ReverseEngine::new(conn, ReversePolicy::default());
 //! engine.open("tcp:5201", "tcp:5201").await?; // pump is ready before this returns
 //! let listing = engine.list().await;

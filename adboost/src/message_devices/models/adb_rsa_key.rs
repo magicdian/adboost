@@ -101,7 +101,7 @@ impl ADBRsaKey {
     fn encode_public_key(pub_key: Vec<u8>) -> Result<String> {
         let mut encoded = STANDARD.encode(pub_key);
         encoded.push(' ');
-        write!(encoded, "adb_client@{}", env!("CARGO_PKG_VERSION"))
+        write!(encoded, "adboost@{}", env!("CARGO_PKG_VERSION"))
             .map_err(|_| RustADBError::ConversionError)?;
 
         Ok(encoded)

@@ -7,10 +7,10 @@
 
 ## Why this exists
 
-Upstream `adb_client` rejected our changes, so we forked v3.2.2 and develop
+Upstream `adboost` rejected our changes, so we forked v3.2.2 and develop
 independently. Some changes still arrive as `.patch` files that were authored
 against a **different upstream version** and/or a **different repo layout**
-(e.g. the standalone-publish layout where `adb_client` is detached from the
+(e.g. the standalone-publish layout where `adboost` is detached from the
 workspace). Applying such patches naively corrupts our workspace or fails on
 context drift. This document is the standard import procedure.
 
@@ -19,7 +19,7 @@ context drift. This document is the standard import procedure.
 ## Convention: Importing an upstream/external patch
 
 **What**: When importing a `.patch` produced against a different version of
-`adb_client`, apply only the **functional** hunks and re-derive any hunk that
+`adboost`, apply only the **functional** hunks and re-derive any hunk that
 fails on context drift. Never apply packaging/manifest hunks blindly.
 
 **Why**: Patches authored for standalone publishing rewrite `Cargo.toml` to
@@ -42,7 +42,7 @@ so some hunks fail to apply at the recorded line context.
 3. **Apply functional hunks, excluding manifest + drifted files:**
    ```bash
    git apply \
-     --exclude='adb_client/Cargo.toml' \
+     --exclude='adboost/Cargo.toml' \
      --exclude='<each file that failed --check>' \
      <patch>
    ```
@@ -58,9 +58,9 @@ so some hunks fail to apply at the recorded line context.
 
 6. **Verify** (quality gate):
    ```bash
-   cargo build -p adb_client --features usb
-   cargo test  -p adb_client
-   cargo clippy -p adb_client --features usb   # pedantic warnings on verbatim
+   cargo build -p adboost --features usb
+   cargo test  -p adboost
+   cargo clippy -p adboost --features usb   # pedantic warnings on verbatim
                                                # patch code are acceptable
    cargo build -p adb_cli                      # dependents still build
    ```
@@ -85,11 +85,11 @@ so some hunks fail to apply at the recorded line context.
 
 **Why it's bad**: Our fork keeps the full workspace. Root `Cargo.toml` owns
 `authors` / `edition` / `license` / `version` (3.2.2) / `workspace.lints` via
-`*.workspace = true` inheritance in `adb_client/Cargo.toml`. Applying this hunk
+`*.workspace = true` inheritance in `adboost/Cargo.toml`. Applying this hunk
 detaches the crate, downgrades the version to 3.2.1, and duplicates lint config
 — breaking sibling workspace members and version consistency.
 
-**Instead**: Skip the hunk entirely (`--exclude='adb_client/Cargo.toml'`). Keep
+**Instead**: Skip the hunk entirely (`--exclude='adboost/Cargo.toml'`). Keep
 workspace inheritance and version 3.2.2.
 
 ---
@@ -97,7 +97,7 @@ workspace inheritance and version 3.2.2.
 ## Common Mistake: Enum/struct context drift across versions
 
 **Symptom**: `git apply` reports `patch does not apply` on a file like
-`adb_client/src/models/adb_local_command.rs`, even though the change itself is
+`adboost/src/models/adb_local_command.rs`, even though the change itself is
 trivial (e.g. add one enum variant).
 
 **Cause**: The patch was authored against v3.2.1. Between v3.2.1 and v3.2.2 the

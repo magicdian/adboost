@@ -27,9 +27,9 @@ mod reverse_cases;
 
 use std::time::{Duration, Instant};
 
-use adb_client::ADBDeviceExt;
-use adb_client::proxy::ADBProxyDevice;
-use adb_client::usb::PersistentUsbConnection;
+use adboost::ADBDeviceExt;
+use adboost::proxy::ADBProxyDevice;
+use adboost::usb::PersistentUsbConnection;
 
 use crate::models::{ADBCliError, ADBCliResult, SelftestCommand};
 use channels::{DiscoveredDevice, InProcessServer, discover_devices};

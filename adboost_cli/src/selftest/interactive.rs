@@ -17,8 +17,8 @@ use tokio::time::sleep;
 use super::channels::{DiscoveredDevice, InProcessServer, discover_devices};
 use super::report::{CaseResult, Outcome, Reporter};
 use super::{cases, parity};
-use adb_client::RebootType;
-use adb_client::usb::PersistentUsbConnection;
+use adboost::RebootType;
+use adboost::usb::PersistentUsbConnection;
 
 /// Port adbd listens on after `tcpip <port>` for the interactive end-to-end case.
 const TCPIP_PORT: u16 = 5555;
@@ -114,7 +114,7 @@ async fn case_tcpip_through_server(serial: &str) -> Outcome {
     // (request-only: `open_session` confirms the device's OKAY, then adbd
     // restarts and drops the connection — like `reboot:`).
     if let Err(e) = conn
-        .open_session(&adb_client::ADBLocalCommand::TcpIp(TCPIP_PORT))
+        .open_session(&adboost::ADBLocalCommand::TcpIp(TCPIP_PORT))
         .await
     {
         conn.close().await;
@@ -169,9 +169,9 @@ async fn restore_usb_mode(tcp_serial: &str) {
         tracing::warn!("[tcpip] cannot parse {tcp_serial} to restore USB mode");
         return;
     };
-    match adb_client::tcp::ADBTcpDevice::new(addr).await {
+    match adboost::tcp::ADBTcpDevice::new(addr).await {
         Ok(mut dev) => {
-            use adb_client::ADBDeviceExt as _;
+            use adboost::ADBDeviceExt as _;
             if let Err(e) = dev.usb().await {
                 tracing::warn!("[tcpip] failed to switch {tcp_serial} back to USB: {e}");
             }

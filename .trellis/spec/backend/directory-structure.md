@@ -8,13 +8,13 @@
 ## Overview
 
 This is a Cargo **workspace** (edition **2024**, MSRV **1.88.0**, resolver `2`).
-Active `members` (root `Cargo.toml`): **`adb_client`** + **`adboost_cli`**. Other
+Active `members` (root `Cargo.toml`): **`adboost`** + **`adboost_cli`**. Other
 crates exist on disk but are excluded from this round's build/CI.
 
 | Crate | Path | Type | Role |
 |-------|------|------|------|
-| `adb_client` | `adb_client/` | lib | Core ADB client library (async/tokio). Implements both ADB protocols (server + end-device) over USB / TCP. Pure log **emitter** (`tracing`). The bare name `adboost` is **reserved for this library's future rename**. |
-| `adboost_cli` | `adboost_cli/` | bin | Async CLI front-end over the **local** `adb_client` (path dep; `mdns` + `usb`). Owns the `tracing` subscriber install. Hosts the `persistent` exerciser (closed-loop validation of the async USB / windowed path). Renamed from `adb_cli` — it no longer tracks upstream's CLI (upstream patches re-import into the library only). |
+| `adboost` | `adboost/` | lib | Core ADB client library (async/tokio). Implements both ADB protocols (server + end-device) over USB / TCP. Pure log **emitter** (`tracing`). Renamed from `adb_client` (the upstream crate name) — the fork is fully detached, so the upstream-compat anchor is gone. |
+| `adboost_cli` | `adboost_cli/` | bin | Async CLI front-end over the **local** `adboost` (path dep; `mdns` + `usb`). Owns the `tracing` subscriber install. Hosts the `persistent` exerciser (closed-loop validation of the async USB / windowed path). Renamed from `adb_cli` — it no longer tracks upstream's CLI (upstream patches re-import into the library only). |
 | `pyadb_client` | `pyadb_client/` | cdylib + rlib | Python bindings via PyO3. On disk; **excluded** from the workspace this round. |
 | `mdns` | `examples/mdns/` | bin (example) | Standalone `mdns` + `usb` example. On disk; **excluded** this round. |
 
@@ -37,10 +37,10 @@ in it, and re-export the public types from there.
 
 ---
 
-## `adb_client/src` layout
+## `adboost/src` layout
 
 ```
-adb_client/src/
+adboost/src/
 ├── lib.rs                  crate root + re-exports (#![forbid(unsafe_code)])
 ├── adb_device_ext.rs       trait ADBDeviceExt  (the high-level device API)
 ├── adb_transport.rs        trait ADBTransport  (connect/disconnect)
@@ -68,7 +68,7 @@ adb_client/src/
 ```
 
 There is **no `transports/` directory** — each transport file is co-located
-with its owning module. There is **no `utils/` directory** in `adb_client/src`
+with its owning module. There is **no `utils/` directory** in `adboost/src`
 (it is the single file `utils.rs`; nested file-level utils exist, e.g.
 `message_devices/utils.rs`, `message_devices/commands/utils/`).
 
@@ -211,10 +211,10 @@ Crate root sets `#![forbid(unsafe_code)]`, doc-includes `../README.md`, and gate
 docs.rs cfg. It mixes two exposure styles — match the surrounding style:
 
 - **Namespaced** (`pub mod server`, `pub mod server_device`, `pub mod emulator`,
-  `#[cfg(feature = "mdns")] pub mod mdns`) → `adb_client::server::ADBServer`.
+  `#[cfg(feature = "mdns")] pub mod mdns`) → `adboost::server::ADBServer`.
 - **Flattened** (`pub use message_devices::*`, selective `pub use models::{...}`,
   `pub use adb_device_ext::ADBDeviceExt`, `pub use error::{Result, RustADBError}`)
-  → `adb_client::ADBDeviceExt`, `adb_client::usb::ADBUSBDevice`.
+  → `adboost::ADBDeviceExt`, `adboost::usb::ADBUSBDevice`.
 
 Per-leaf idiom: declare leaf modules private (`mod x;`), surface public types via
 `pub use x::Type;` in the parent `mod.rs`; use `pub(crate)` for internal
@@ -247,7 +247,7 @@ same definitions-vs-behavior split as the library.
 
 `server/`, `server_device/`, and `message_devices/tcp/` pull a sibling
 `README.md` into rustdoc via `#![doc = include_str!("./README.md")]` in their
-`mod.rs`. Crate roots do the same with `../README.md` (`adb_client/src/lib.rs:6`,
+`mod.rs`. Crate roots do the same with `../README.md` (`adboost/src/lib.rs:6`,
 `adb_cli/src/main.rs:1`, `pyadb_client/src/lib.rs:3`).
 
 **Known inconsistency:** `message_devices/usb/README.md` exists but its `mod.rs`
