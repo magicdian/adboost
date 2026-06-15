@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "shell-v2 framing + reboot: service semantics; defines how exit-status frame and stream teardown work"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "EOF vs error conventions — BrokenPipe/UnexpectedEof handling at stream end is the crux of both bugs"}
+{"file": ".trellis/spec/backend/upstream-patch-import.md", "reason": "proxy/adb_proxy_device_commands.rs is upstream-derived; note conventions before editing"}
