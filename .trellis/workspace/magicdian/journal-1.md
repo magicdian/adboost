@@ -601,3 +601,36 @@ Promoted the reverse data path from a server-private state machine to a public, 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: Fix tport:any error wording for multi-device (no -s)
+
+**Date**: 2026-06-15
+**Task**: Fix tport:any error wording for multi-device (no -s)
+**Branch**: `main`
+
+### Summary
+
+Fixed select_tport collapsing all failures to 'device not found'; multi-device adb shell with no -s now reports AOSP 'more than one device'. Each selector branch carries its own correct reason. Added 5 frontend unit tests + a device-backed selftest parity case, and a new backend spec documenting the transport-selection error-wording contract.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `087ee85` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
