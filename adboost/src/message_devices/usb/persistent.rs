@@ -69,7 +69,7 @@ use crate::message_devices::usb::shell_v2_session::ShellV2Session;
 use crate::message_devices::usb::sync_session::SyncSession;
 use crate::message_devices::usb::usb_transport::USBTransport;
 use crate::models::{ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK, RebootType};
-use crate::tcp::tcp_transport::TcpTransport;
+use crate::tcp::TcpTransport;
 use crate::utils::get_default_adb_key_path;
 use crate::{Result, RustADBError};
 
@@ -396,6 +396,14 @@ pub struct PersistentConnection<T: ADBMessageTransport = USBTransport> {
 /// imports and `Arc<PersistentUsbConnection>` types keep compiling unchanged.
 pub type PersistentUsbConnection = PersistentConnection<USBTransport>;
 
+/// A persistent multiplexed connection to a `host:connect`ed TCP/IP device — the
+/// TCP analogue of [`PersistentUsbConnection`]. Construct one with
+/// [`PersistentConnection::new_from_tcp_addr`] (zero-config) or
+/// [`PersistentConnection::new_from_tcp_addr_with_options`] (custom
+/// [`TcpConnectOptions`]); local services (`shell:` / `tcp:` / `sync:` /
+/// `shell,v2`) are bridged through it exactly as on USB.
+pub type PersistentTcpConnection = PersistentConnection<TcpTransport>;
+
 impl<T: ADBMessageTransport> PersistentConnection<T> {
     /// Create a new persistent connection from an already-built transport.
     ///
@@ -532,8 +540,56 @@ impl PersistentConnection<USBTransport> {
     }
 }
 
-/// TCP/IP-only constructor. Builds a [`TcpTransport`] from a socket address, so
-/// it lives on the concrete `PersistentConnection<TcpTransport>`.
+/// Optional knobs for building a [`PersistentTcpConnection`].
+///
+/// The library philosophy is *standard behavior out of the box, configuration
+/// to unlock customization*: [`TcpConnectOptions::default`] is exactly
+/// equivalent to the zero-config [`PersistentConnection::new_from_tcp_addr`]
+/// (honest [`DeviceFeatureSet::default`] banner, default ADB key location).
+/// Override individual knobs with the chainable setters, then pass to
+/// [`PersistentConnection::new_from_tcp_addr_with_options`].
+///
+/// `#[non_exhaustive]`: future knobs (timeouts, window size, TLS policy) can be
+/// added without a breaking change — construct via `..Default::default()` or the
+/// setters.
+///
+/// ```
+/// use adboost::{DeviceFeatureSet, TcpConnectOptions};
+///
+/// let opts = TcpConnectOptions::default()
+///     .with_features(DeviceFeatureSet { delayed_ack: false, ..Default::default() })
+///     .with_private_key_path("/home/me/.android/adbkey");
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct TcpConnectOptions {
+    /// The feature set advertised to the device in the CNXN banner. Defaults to
+    /// the honest [`DeviceFeatureSet::default`].
+    pub features: DeviceFeatureSet,
+    /// ADB private-key path used for the TLS client cert and AUTH. `None` falls
+    /// back to the default ADB key location (matching `ADBTcpDevice::new`).
+    pub private_key_path: Option<PathBuf>,
+}
+
+impl TcpConnectOptions {
+    /// Set the [`DeviceFeatureSet`] advertised in the CNXN banner.
+    #[must_use]
+    pub fn with_features(mut self, features: DeviceFeatureSet) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// Set the ADB private-key path (TLS client cert + AUTH).
+    #[must_use]
+    pub fn with_private_key_path(mut self, private_key_path: impl Into<PathBuf>) -> Self {
+        self.private_key_path = Some(private_key_path.into());
+        self
+    }
+}
+
+/// TCP/IP-only constructors. Build a [`TcpTransport`] from a socket address, so
+/// they live on the concrete `PersistentConnection<TcpTransport>` (the
+/// [`PersistentTcpConnection`] alias).
 impl PersistentConnection<TcpTransport> {
     /// Create a persistent connection to a `host:connect`ed TCP/IP device.
     ///
@@ -543,19 +599,41 @@ impl PersistentConnection<TcpTransport> {
     /// [`ADBMessageTransport::upgrade_connection`] (a no-op for USB, the TLS
     /// upgrade for TCP). Advertises the honest [`DeviceFeatureSet::default`]
     /// banner, so windowed `delayed_ack` is negotiated exactly as on USB.
+    ///
+    /// This is the zero-config path. To advertise a custom feature set, use
+    /// [`Self::new_from_tcp_addr_with_options`].
     pub async fn new_from_tcp_addr(
         addr: SocketAddr,
         private_key_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::new_from_tcp_addr_with_options(
+            addr,
+            TcpConnectOptions {
+                private_key_path,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Create a persistent connection to a `host:connect`ed TCP/IP device,
+    /// customized via [`TcpConnectOptions`].
+    ///
+    /// Same handshake as [`Self::new_from_tcp_addr`]; the options carry the
+    /// advertised [`DeviceFeatureSet`] and the ADB private-key path.
+    pub async fn new_from_tcp_addr_with_options(
+        addr: SocketAddr,
+        opts: TcpConnectOptions,
+    ) -> Result<Self> {
         // `TcpTransport::new` needs a key path for its TLS client cert; fall back
         // to the default ADB key location when none is configured, matching
         // `ADBTcpDevice::new`.
-        let key_path = match &private_key_path {
+        let key_path = match &opts.private_key_path {
             Some(p) => p.clone(),
             None => get_default_adb_key_path()?,
         };
         let transport = TcpTransport::new(addr, &key_path);
-        Self::new(transport, private_key_path).await
+        Self::new_with_features(transport, opts.private_key_path, opts.features).await
     }
 }
 
@@ -2419,6 +2497,53 @@ mod tests {
         );
         // Touch the TCP monomorphization so it is exercised, not just declared.
         assert_ne!(tcp as usize, 0, "TCP specialization must instantiate");
+    }
+
+    // Simulates the external-backend integration path: name the public
+    // `PersistentTcpConnection` alias, store it as a struct field (behind `Arc`,
+    // as a real backend would), and build the `TcpConnectOptions` knobs. Builds
+    // iff the public TCP building blocks are nameable from outside this module —
+    // no device or network I/O.
+    #[test]
+    fn tcp_connection_building_blocks_are_nameable_and_storable() {
+        // A backend would hold the connection like this.
+        struct ExternalBackend {
+            conn: Option<Arc<PersistentTcpConnection>>,
+        }
+        let backend = ExternalBackend { conn: None };
+        assert!(
+            backend.conn.is_none(),
+            "PersistentTcpConnection must be nameable as a stored field type"
+        );
+
+        // Default options == the zero-config `new_from_tcp_addr` semantics.
+        let default_opts = TcpConnectOptions::default();
+        assert_eq!(
+            default_opts.features,
+            DeviceFeatureSet::default(),
+            "default TcpConnectOptions must advertise the honest default banner"
+        );
+        assert!(
+            default_opts.private_key_path.is_none(),
+            "default TcpConnectOptions must fall back to the default key location"
+        );
+
+        // Customized options via the chainable setters.
+        let custom = TcpConnectOptions::default()
+            .with_features(DeviceFeatureSet {
+                delayed_ack: false,
+                ..DeviceFeatureSet::default()
+            })
+            .with_private_key_path(PathBuf::from("/tmp/adbkey"));
+        assert!(
+            !custom.features.delayed_ack,
+            "with_features must override the advertised feature set"
+        );
+        assert_eq!(
+            custom.private_key_path.as_deref(),
+            Some(std::path::Path::new("/tmp/adbkey")),
+            "with_private_key_path must set the key path"
+        );
     }
 
     #[test]

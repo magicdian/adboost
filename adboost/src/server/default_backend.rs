@@ -2,7 +2,8 @@
 //!
 //! [`DefaultDeviceBackend`] is the default [`DeviceBackend`]: it enumerates ADB
 //! USB devices, tracks `host:connect`ed TCP/IP devices, opens local services
-//! over a [`PersistentConnection`], and reports device-set changes via nusb
+//! over a [`PersistentConnection`](crate::usb::PersistentConnection), and
+//! reports device-set changes via nusb
 //! hotplug. Both paths are thin wrappers — all device-side transport,
 //! multiplexing, and flow control come from the (now transport-generic)
 //! persistent connection; this type only maps serials to connections and caches
@@ -24,18 +25,11 @@ use tokio::sync::{Mutex, mpsc};
 
 use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry};
 use crate::models::ADBLocalCommand;
-use crate::tcp::tcp_transport::TcpTransport;
-use crate::usb::persistent::PersistentConnection;
 use crate::usb::{
-    MultiplexedSession, PersistentUsbConnection, ReverseEngine, ReversePolicy, ShellV2Session,
-    SyncSession, find_all_connected_adb_devices,
+    MultiplexedSession, PersistentTcpConnection, PersistentUsbConnection, ReverseEngine,
+    ReversePolicy, ShellV2Session, SyncSession, find_all_connected_adb_devices,
 };
 use crate::{Result, RustADBError};
-
-/// A persistent multiplexed connection to a `host:connect`ed TCP/IP device —
-/// the TCP analogue of [`PersistentUsbConnection`]. Local services (`shell:` /
-/// `tcp:` / `sync:` / `shell,v2`) are bridged through it exactly as on USB.
-type PersistentTcpConnection = PersistentConnection<TcpTransport>;
 
 /// Channel depth for the `subscribe_changes` snapshot stream. Small: only the
 /// latest snapshot matters, and the consumer (one `host:track-devices` client)

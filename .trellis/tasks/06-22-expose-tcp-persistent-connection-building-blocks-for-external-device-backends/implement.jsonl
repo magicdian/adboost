@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "本任务核心是模块可见性与 re-export 决策（TcpTransport pub use、PersistentTcpConnection 别名、crate root 导出、device trait 分层），必须遵循既有 mod.rs / 模块布局约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "公开 API 变更须过 clippy pedantic + deny(warnings) 门禁；尤其 private_interfaces lint（pub 别名引用 pub(crate) 类型会挂）和 #[non_exhaustive] 用法"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "TcpConnectOptions 承载 private_key_path，需沿用现有 RSA key 路径 fallback（get_default_adb_key_path）与持久化/会话状态约定"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "new_from_tcp_addr 要委托 new_from_tcp_addr_with_options 避免逻辑重复；default_backend 私有别名改为复用公开别名——典型复用决策"}

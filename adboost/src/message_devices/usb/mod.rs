@@ -12,7 +12,8 @@ mod utils;
 pub use adb_usb_device::ADBUSBDevice;
 pub use bridge::bridge_tcp_session;
 pub use persistent::{
-    MultiplexedSession, PersistentUsbConnection, SessionReadHalf, SessionWriteHalf,
+    MultiplexedSession, PersistentConnection, PersistentTcpConnection, PersistentUsbConnection,
+    SessionReadHalf, SessionWriteHalf, TcpConnectOptions,
 };
 pub use reverse_engine::ReverseEngine;
 pub use reverse_policy::ReversePolicy;

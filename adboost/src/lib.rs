@@ -73,7 +73,27 @@ pub use adb_device_ext::ADBDeviceExt;
 use adb_transport::ADBTransport;
 pub use error::{Result, RustADBError};
 pub use message_devices::*;
+
 pub use models::{
     ADBListItem, ADBListItemType, ADBLocalCommand, ADBStatExtendedResponse, ADBStatMapping,
     AdbStatResponse, DeviceFeatureSet, HostFeatures, RebootType, RemountInfo,
+};
+pub use tcp::TcpTransport;
+/// Building blocks for holding a persistent ADB connection — re-exported at the
+/// crate root so external device backends can name and store them on a stable,
+/// transport-neutral path (rather than reaching into `usb::persistent`):
+///
+/// - [`PersistentConnection`] — the transport-generic connection.
+/// - [`PersistentTcpConnection`] / [`PersistentUsbConnection`] — its TCP / USB
+///   aliases.
+/// - [`TcpTransport`] — the concrete TCP transport (so
+///   `PersistentConnection<TcpTransport>` is nameable).
+/// - [`TcpConnectOptions`] — optional knobs for the TCP constructor.
+///
+/// See [`PersistentConnection::new_from_tcp_addr`] /
+/// [`PersistentConnection::new_from_tcp_addr_with_options`] for building a TCP
+/// connection from an external backend.
+#[cfg(feature = "usb")]
+pub use usb::{
+    PersistentConnection, PersistentTcpConnection, PersistentUsbConnection, TcpConnectOptions,
 };
