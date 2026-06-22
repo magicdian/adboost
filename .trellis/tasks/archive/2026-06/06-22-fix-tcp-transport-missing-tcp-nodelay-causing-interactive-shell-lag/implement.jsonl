@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "MSRV 1.88.0 + default rustfmt + pedantic clippy + testing style the new connect() edit and its unit test must satisfy"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "set_nodelay(true)? returns io::Error; confirms the RustADBError From<io::Error> auto-convert the fix relies on (same path as TcpStream::connect)"}
