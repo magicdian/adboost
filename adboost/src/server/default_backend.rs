@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
 use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry};
-use crate::models::ADBLocalCommand;
+use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 use crate::usb::{
     MultiplexedSession, PersistentTcpConnection, PersistentUsbConnection, ReverseEngine,
     ReversePolicy, ShellV2Session, SyncSession, find_all_connected_adb_devices,
@@ -138,8 +138,8 @@ impl DefaultDeviceBackend {
     /// `track-devices`, and transport-id all see the same merged list — mirroring
     /// AOSP's single `transport_list`.
     async fn enumerate_all(&self) -> Vec<DeviceEntry> {
-        let tcp_serials: Vec<String> = self.tcp_devices.lock().await.keys().cloned().collect();
-        merge_device_sets(Self::enumerate_usb(), tcp_serials)
+        let tcp_entries = tcp_device_entries(&self.tcp_devices).await;
+        merge_device_sets(Self::enumerate_usb(), tcp_entries)
     }
 
     /// Normalize an `adb connect`/`disconnect` target into a `<ip>:<port>`
@@ -249,8 +249,8 @@ impl DeviceBackend for DefaultDeviceBackend {
         let snapshot = move || {
             let tcp = Arc::clone(&tcp_devices);
             async move {
-                let tcp_serials: Vec<String> = tcp.lock().await.keys().cloned().collect();
-                merge_device_sets(Self::enumerate_usb(), tcp_serials)
+                let tcp_entries = tcp_device_entries(&tcp).await;
+                merge_device_sets(Self::enumerate_usb(), tcp_entries)
             }
         };
 
@@ -344,6 +344,43 @@ impl DeviceBackend for DefaultDeviceBackend {
         }
     }
 
+    async fn device_capabilities(
+        &self,
+        serial: &str,
+        timeout: std::time::Duration,
+    ) -> Option<DeviceFeatureSet> {
+        // Cache-first: a live TCP or USB connection already parsed this device's
+        // banner at handshake time, so return its peer_features() with no I/O.
+        if let Some(conn) = self.tcp_conn(serial).await {
+            return Some(conn.peer_features().clone());
+        }
+        if let Some(conn) = self.conns.lock().await.get(serial)
+            && conn.is_alive()
+        {
+            return Some(conn.peer_features().clone());
+        }
+        // Not yet connected: establish the USB connection (which performs the CNXN
+        // handshake and parses the banner), bounded by `timeout`. `get_or_open`
+        // caches it, so the cost is paid once and subsequent queries hit the cache
+        // above. On timeout or any open error, report `None` (unknown) so the
+        // frontend stays conservative rather than guessing capabilities.
+        match tokio::time::timeout(timeout, self.get_or_open(serial)).await {
+            Ok(Ok(conn)) => Some(conn.peer_features().clone()),
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    "device_capabilities({serial}): open failed: {e}; reporting unknown"
+                );
+                None
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    "device_capabilities({serial}): handshake exceeded {timeout:?}; reporting unknown"
+                );
+                None
+            }
+        }
+    }
+
     async fn open_reverse(&self, serial: &str, remote: &str, local: &str) -> Result<()> {
         self.reverse_engine(serial).await?.open(remote, local).await
     }
@@ -419,17 +456,36 @@ impl DeviceBackend for DefaultDeviceBackend {
     }
 }
 
-/// Merge the USB device entries with one [`DeviceEntry`] per `host:connect`ed
-/// TCP serial into the single unified device set. Pure (sans-io) so the merge
-/// shape is unit-tested without hardware; TCP devices use the default
-/// `DeviceState::Device` (a tracked TCP device is, by construction, connected).
+/// Merge the USB device entries with the pre-built `host:connect`ed TCP entries
+/// into the single unified device set. Pure (sans-io) so the merge shape is
+/// unit-tested without hardware.
 fn merge_device_sets(
     usb: Vec<DeviceEntry>,
-    tcp_serials: impl IntoIterator<Item = String>,
+    tcp_entries: impl IntoIterator<Item = DeviceEntry>,
 ) -> Vec<DeviceEntry> {
     let mut all = usb;
-    all.extend(tcp_serials.into_iter().map(DeviceEntry::new));
+    all.extend(tcp_entries);
     all
+}
+
+/// Build one [`DeviceEntry`] per `host:connect`ed TCP device, carrying the
+/// device's parsed banner capabilities ([`PersistentConnection::peer_features`]).
+///
+/// A tracked TCP device is, by construction, connected — its CNXN handshake
+/// already happened at `host:connect` time — so its capabilities are known
+/// (`Some`) here with no extra I/O. TCP devices use the default
+/// `DeviceState::Device`.
+async fn tcp_device_entries(
+    tcp_devices: &Mutex<HashMap<String, Arc<PersistentTcpConnection>>>,
+) -> Vec<DeviceEntry> {
+    tcp_devices
+        .lock()
+        .await
+        .iter()
+        .map(|(serial, conn)| {
+            DeviceEntry::new(serial.clone()).with_capabilities(conn.peer_features().clone())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -464,8 +520,11 @@ mod tests {
         // must include both kinds with no dropped entry. (Tested on the pure
         // merge helper since a real ADBTcpDevice needs hardware.)
         let usb = vec![DeviceEntry::new("USBSERIAL01")];
-        let tcp_serials = ["10.0.0.5:5555".to_string(), "10.0.0.6:5555".to_string()];
-        let merged = merge_device_sets(usb, tcp_serials.iter().cloned());
+        let tcp_entries = [
+            DeviceEntry::new("10.0.0.5:5555"),
+            DeviceEntry::new("10.0.0.6:5555"),
+        ];
+        let merged = merge_device_sets(usb, tcp_entries);
         let serials: Vec<&str> = merged.iter().map(|d| d.serial.as_str()).collect();
         assert!(serials.contains(&"USBSERIAL01"), "USB kept: {serials:?}");
         assert!(
@@ -531,5 +590,21 @@ mod tests {
         let backend = DefaultDeviceBackend::new();
         let err = backend.disconnect("127.0.0.1:5555").await.unwrap_err();
         assert!(format!("{err}").contains("no such device"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn device_capabilities_reports_none_for_unconnectable_serial() {
+        // No device of this serial is connected, and a fresh USB open will fail
+        // (no hardware) — possibly slowly — so the bounded query must report
+        // `None` (unknown) rather than block or guess. A tiny timeout keeps the
+        // test fast and also exercises the timeout arm.
+        let backend = DefaultDeviceBackend::new();
+        let caps = backend
+            .device_capabilities("USBSERIAL01", std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            caps.is_none(),
+            "an unconnectable device must report unknown (None) capabilities"
+        );
     }
 }

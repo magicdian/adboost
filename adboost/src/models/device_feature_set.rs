@@ -139,6 +139,72 @@ impl DeviceFeatureSet {
     pub fn to_banner_string(&self) -> String {
         format!("host::features={}", self.feature_names().join(","))
     }
+
+    /// Parse the **peer's** advertised feature set out of a CNXN banner.
+    ///
+    /// This is the inverse of [`to_banner_string`](Self::to_banner_string): given a
+    /// device banner such as
+    /// `device::ro.product.name=...;features=shell_v2,cmd,delayed_ack`, it returns
+    /// the [`DeviceFeatureSet`] the *device* advertised. It is the truth source for
+    /// per-device capability negotiation (so the server never offers `shell_v2` /
+    /// `sync_v2` to a device whose banner lacks it).
+    ///
+    /// Parsing mirrors adbd's own `StringToFeatureSet` (`Split(",")`, no trim) and
+    /// the existing `delayed_ack` scan: the banner is split on `;`/`\0` segment
+    /// separators, the `features=` segment's value is split on commas, and each
+    /// known token flips its flag. Unknown tokens are ignored (forward-compatible).
+    /// An absent or empty `features=` segment yields the all-`false` set — exactly
+    /// the conservative result wanted for a stripped adbd (or a TLS-upgraded link
+    /// whose post-STLS banner we report as empty).
+    ///
+    /// Note this is the device's *raw advertised* set, NOT what is negotiated: a
+    /// feature is only usable when BOTH ends agree (see the `delayed_ack`
+    /// intersection in the persistent connection).
+    #[must_use]
+    pub fn from_banner(banner: &str) -> Self {
+        let mut set = Self {
+            shell_v2: false,
+            cmd: false,
+            stat_v2: false,
+            ls_v2: false,
+            delayed_ack: false,
+            sendrecv_v2: false,
+            sendrecv_v2_brotli: false,
+            sendrecv_v2_lz4: false,
+            sendrecv_v2_zstd: false,
+            sendrecv_v2_dry_run_send: false,
+        };
+        // The banner may be NUL-terminated and is `<type>::` followed by a list of
+        // `;`-separated key=value props. The `features=` prop can be the first one
+        // (so it appears as `<type>::features=...`, e.g. our own
+        // `host::features=...`) or a later one (`...;features=...`). Drop any
+        // `<type>::` prefix on each segment (`rsplit("::").next()`) before matching
+        // `features=`, so both placements parse. Fold the CSV tokens into the set.
+        for token in banner
+            .split([';', '\0'])
+            .filter_map(|seg| {
+                seg.rsplit("::")
+                    .next()
+                    .and_then(|prop| prop.strip_prefix("features="))
+            })
+            .flat_map(|features| features.split(','))
+        {
+            match token {
+                FEATURE_SHELL_V2 => set.shell_v2 = true,
+                FEATURE_CMD => set.cmd = true,
+                FEATURE_STAT_V2 => set.stat_v2 = true,
+                FEATURE_LS_V2 => set.ls_v2 = true,
+                FEATURE_DELAYED_ACK => set.delayed_ack = true,
+                FEATURE_SENDRECV_V2 => set.sendrecv_v2 = true,
+                FEATURE_SENDRECV_V2_BROTLI => set.sendrecv_v2_brotli = true,
+                FEATURE_SENDRECV_V2_LZ4 => set.sendrecv_v2_lz4 = true,
+                FEATURE_SENDRECV_V2_ZSTD => set.sendrecv_v2_zstd = true,
+                FEATURE_SENDRECV_V2_DRY_RUN_SEND => set.sendrecv_v2_dry_run_send = true,
+                _ => {} // unknown / empty token — ignore (forward-compatible)
+            }
+        }
+        set
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +275,83 @@ mod tests {
         assert_eq!(
             last_token, FEATURE_DELAYED_ACK,
             "the last comma-separated feature token must be exactly delayed_ack with no embedded NUL"
+        );
+    }
+
+    #[test]
+    fn from_banner_parses_a_full_device_banner() {
+        // A realistic full-feature device banner (the `device::` prefix +
+        // product metadata segments before `features=`).
+        let banner = "device::ro.product.name=sdk;ro.product.model=X;\
+                      features=shell_v2,cmd,stat_v2,ls_v2,delayed_ack";
+        let set = DeviceFeatureSet::from_banner(banner);
+        assert!(set.shell_v2 && set.cmd && set.stat_v2 && set.ls_v2 && set.delayed_ack);
+        // Tokens not present must stay false.
+        assert!(!set.sendrecv_v2 && !set.sendrecv_v2_zstd);
+    }
+
+    #[test]
+    fn from_banner_empty_features_segment_is_all_false() {
+        // The stripped-adbd case from the bug report: a banner whose features
+        // segment is empty must parse to no optional capabilities, so the server
+        // never offers shell_v2 / sync_v2 to it.
+        let banner = "device::ro.product.name=;ro.product.model=;features=";
+        let set = DeviceFeatureSet::from_banner(banner);
+        assert_eq!(
+            set,
+            DeviceFeatureSet {
+                shell_v2: false,
+                cmd: false,
+                stat_v2: false,
+                ls_v2: false,
+                delayed_ack: false,
+                sendrecv_v2: false,
+                sendrecv_v2_brotli: false,
+                sendrecv_v2_lz4: false,
+                sendrecv_v2_zstd: false,
+                sendrecv_v2_dry_run_send: false,
+            },
+            "an empty features= segment must yield the all-false set"
+        );
+    }
+
+    #[test]
+    fn from_banner_with_no_features_segment_is_all_false() {
+        // A banner that carries no `features=` segment at all (older adbd) is
+        // treated as advertising nothing optional.
+        let set = DeviceFeatureSet::from_banner("device::ro.product.name=x");
+        assert!(!set.shell_v2 && !set.delayed_ack && !set.cmd);
+    }
+
+    #[test]
+    fn from_banner_ignores_nul_termination_and_unknown_tokens() {
+        // NUL-terminated payload (some transports include it) + an unknown future
+        // token must not break parsing: known tokens still register, the unknown
+        // is ignored, and the trailing NUL does not corrupt the last token.
+        let banner = "device::features=shell_v2,future_feature,delayed_ack\0";
+        let set = DeviceFeatureSet::from_banner(banner);
+        assert!(set.shell_v2, "shell_v2 before the unknown token registers");
+        assert!(
+            set.delayed_ack,
+            "delayed_ack must register even though a NUL follows it (split on \\0 first)"
+        );
+        assert!(!set.cmd, "an unknown token must not flip any known flag");
+    }
+
+    #[test]
+    fn from_banner_round_trips_with_to_banner_string() {
+        // Parsing our own emitted banner must recover the same set.
+        let original = DeviceFeatureSet {
+            shell_v2: true,
+            cmd: true,
+            stat_v2: true,
+            delayed_ack: true,
+            ..DeviceFeatureSet::default()
+        };
+        let reparsed = DeviceFeatureSet::from_banner(&original.to_banner_string());
+        assert_eq!(
+            reparsed, original,
+            "from_banner ∘ to_banner_string == identity"
         );
     }
 }

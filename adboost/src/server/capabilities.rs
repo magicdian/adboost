@@ -23,6 +23,7 @@
 //! [`DeviceFeatureSet`]: crate::DeviceFeatureSet
 
 use super::backend::BackendCapabilities;
+use crate::models::DeviceFeatureSet;
 
 /// Honest-minimal client-facing features. Every one is safe to advertise with
 /// the v1 `shell:`/`tcp:` bridge — none changes the client's wire framing in a
@@ -125,6 +126,61 @@ impl ServerCapabilities {
         self
     }
 
+    /// Intersect this server's advertised features with what a **specific
+    /// device** actually advertised in its CNXN banner, returning the honest
+    /// per-device feature CSV.
+    ///
+    /// This is the per-device half of honest-banner negotiation: the global
+    /// [`Self::negotiated_with`] already narrowed features to what the *backend*
+    /// can bridge; this narrows the two **wire-framing-changing** features
+    /// (`shell_v2`, `sync_v2`) further to what *this device* supports, so a
+    /// feature-less device (e.g. a stripped adbd whose banner has no `shell_v2`)
+    /// is never offered a framing the device will reject with `CLSE`.
+    ///
+    /// Mapping from device banner → server feature:
+    /// - `shell_v2` (server) requires `shell_v2` in the device banner.
+    /// - `sync_v2` (server) requires the device's sync-v2 capability, marked on
+    ///   the device side by `stat_v2` (the `STA2` extended-stat opcode AOSP gates
+    ///   the v2 sync protocol on).
+    ///
+    /// All other advertised features are **safe regardless of device** — the
+    /// always-on defaults (`cmd,stat_v2,fixed_push_mkdir,apex`) do not change the
+    /// client's wire framing in a way the v1 bridge cannot satisfy — so they pass
+    /// through unchanged. `device` of `None` (capability unknown — device not yet
+    /// handshaked) is conservative: both framing features are dropped.
+    #[must_use]
+    pub fn intersected_with_device(&self, device: Option<&DeviceFeatureSet>) -> Vec<String> {
+        let device_shell_v2 = device.is_some_and(|d| d.shell_v2);
+        let device_sync_v2 = device.is_some_and(|d| d.stat_v2);
+        self.features
+            .iter()
+            .filter(|f| match f.as_str() {
+                "shell_v2" => device_shell_v2,
+                "sync_v2" => device_sync_v2,
+                _ => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `feature` is advertised AND supported by `device`'s banner.
+    ///
+    /// The per-device counterpart of [`Self::has_feature`], used by the
+    /// local-service gates so `shell,v2` / `sync:` are only opened against a
+    /// device that genuinely supports them (otherwise the device `CLSE`s the
+    /// OPEN). Uses the same banner mapping as [`Self::intersected_with_device`].
+    #[must_use]
+    pub fn device_has_feature(&self, feature: &str, device: Option<&DeviceFeatureSet>) -> bool {
+        if !self.has_feature(feature) {
+            return false;
+        }
+        match feature {
+            "shell_v2" => device.is_some_and(|d| d.shell_v2),
+            "sync_v2" => device.is_some_and(|d| d.stat_v2),
+            _ => true,
+        }
+    }
+
     /// Return a copy whose advertised features are widened to include the
     /// optional features the backend genuinely implements.
     ///
@@ -225,6 +281,99 @@ mod tests {
         assert!(
             !csv.contains("shell_v2"),
             "a sync-only backend must NOT advertise shell_v2"
+        );
+    }
+
+    #[test]
+    fn intersected_with_device_drops_shell_v2_for_feature_less_device() {
+        // Server advertises shell_v2 + sync_v2 (backend can bridge both), but the
+        // device banner has neither shell_v2 nor stat_v2 (a stripped adbd). The
+        // per-device CSV must drop BOTH framing features while keeping the
+        // always-safe defaults.
+        let caps = ServerCapabilities::default()
+            .with_feature("shell_v2")
+            .with_feature("sync_v2");
+        let stripped = DeviceFeatureSet {
+            shell_v2: false,
+            stat_v2: false,
+            delayed_ack: false,
+            ..DeviceFeatureSet::default()
+        };
+        let csv = caps.intersected_with_device(Some(&stripped)).join(",");
+        assert!(
+            !csv.contains("shell_v2"),
+            "feature-less device must NOT be offered shell_v2: {csv}"
+        );
+        assert!(
+            !csv.contains("sync_v2"),
+            "feature-less device must NOT be offered sync_v2: {csv}"
+        );
+        assert!(
+            csv.contains("cmd") && csv.contains("apex"),
+            "always-safe defaults must remain: {csv}"
+        );
+    }
+
+    #[test]
+    fn intersected_with_device_keeps_features_a_full_device_supports() {
+        let caps = ServerCapabilities::default()
+            .with_feature("shell_v2")
+            .with_feature("sync_v2");
+        let full = DeviceFeatureSet {
+            shell_v2: true,
+            stat_v2: true,
+            ..DeviceFeatureSet::default()
+        };
+        let csv = caps.intersected_with_device(Some(&full)).join(",");
+        assert!(
+            csv.contains("shell_v2"),
+            "full device keeps shell_v2: {csv}"
+        );
+        assert!(csv.contains("sync_v2"), "full device keeps sync_v2: {csv}");
+    }
+
+    #[test]
+    fn intersected_with_unknown_device_is_conservative() {
+        // None = capability unknown (device not yet handshaked) → drop both
+        // framing features.
+        let caps = ServerCapabilities::default()
+            .with_feature("shell_v2")
+            .with_feature("sync_v2");
+        let csv = caps.intersected_with_device(None).join(",");
+        assert!(
+            !csv.contains("shell_v2") && !csv.contains("sync_v2"),
+            "unknown device caps must drop both framing features (conservative): {csv}"
+        );
+    }
+
+    #[test]
+    fn device_has_feature_requires_both_server_and_device() {
+        let caps = ServerCapabilities::default().with_feature("shell_v2");
+        let full = DeviceFeatureSet {
+            shell_v2: true,
+            ..DeviceFeatureSet::default()
+        };
+        let no_shell = DeviceFeatureSet {
+            shell_v2: false,
+            ..DeviceFeatureSet::default()
+        };
+        assert!(
+            caps.device_has_feature("shell_v2", Some(&full)),
+            "server advertises + device supports → allowed"
+        );
+        assert!(
+            !caps.device_has_feature("shell_v2", Some(&no_shell)),
+            "server advertises but device lacks it → denied (would CLSE)"
+        );
+        assert!(
+            !caps.device_has_feature("shell_v2", None),
+            "unknown device caps → denied (conservative)"
+        );
+        // A feature the server never advertised is denied regardless of device.
+        let caps_no_shell = ServerCapabilities::default();
+        assert!(
+            !caps_no_shell.device_has_feature("shell_v2", Some(&full)),
+            "server does not advertise shell_v2 → denied even if device supports it"
         );
     }
 

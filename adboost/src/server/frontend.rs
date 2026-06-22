@@ -18,7 +18,7 @@ use super::backend::{DeviceBackend, DeviceEntry};
 use super::capabilities::{KillPolicy, ServerCapabilities};
 use super::forward::{ForwardRegistry, parse_forward, parse_killforward};
 use super::protocol;
-use crate::models::ADBLocalCommand;
+use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 
 /// Builder for [`AdbServerFrontend`].
 pub struct AdbServerFrontendBuilder<B: DeviceBackend> {
@@ -65,6 +65,15 @@ pub struct AdbServerFrontend<B: DeviceBackend> {
     /// created them.
     forwards: Arc<ForwardRegistry>,
 }
+
+/// How long a serial-aware capability query may spend establishing a device
+/// connection to learn its banner (see
+/// [`DeviceBackend::device_capabilities`](super::backend::DeviceBackend::device_capabilities)).
+/// Cache hits return instantly; this bounds only the cold-handshake case so a
+/// slow/unreachable device degrades to "unknown caps → conservative" instead of
+/// stalling a `host:features` reply or a `shell,v2` gate. 2s comfortably covers a
+/// healthy USB/TCP CNXN while staying well under a client's patience.
+const DEVICE_CAPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Outcome of dispatching the first (host) request on a client socket.
 enum HostOutcome {
@@ -164,15 +173,17 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                             _ => self.serve_forward_family(&mut stream, svc, &serial).await,
                         };
                     }
-                    // `host:features` / `host:version` are answered from the
-                    // server's negotiated capabilities (the transport is already
-                    // chosen; these are not transport-specific in our backend).
+                    // `host:features` / `host:version` are answered for the
+                    // already-chosen transport. `features` is **per-device**: the
+                    // transport is selected, so we intersect the server's features
+                    // with this device's banner — native `adb -s <serial> shell`
+                    // reads exactly this reply to pick shell v1 vs v2, so a device
+                    // lacking `shell_v2` is correctly steered to v1 here.
                     match svc {
                         "features" => {
+                            let csv = self.device_features_csv(&serial).await;
                             stream
-                                .write_all(&reply_or_overflow(protocol::okay_data(
-                                    &self.caps.features_csv(),
-                                )))
+                                .write_all(&reply_or_overflow(protocol::okay_data(&csv)))
                                 .await?;
                             return Ok(());
                         }
@@ -339,10 +350,12 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     .await?;
             }
             "features" => {
+                // Per-device: `host-serial:<serial>:features` names its device,
+                // so intersect with that device's banner (same honest reply as the
+                // post-transport `host:features` path).
+                let csv = self.device_features_csv(serial).await;
                 stream
-                    .write_all(&reply_or_overflow(protocol::okay_data(
-                        &self.caps.features_csv(),
-                    )))
+                    .write_all(&reply_or_overflow(protocol::okay_data(&csv)))
                     .await?;
             }
             "list-forward" => {
@@ -762,7 +775,18 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return self.serve_reverse(&mut stream, service, serial).await;
         }
 
-        let cmd = match self.map_local_service(service) {
+        // Look up the target device's real capabilities so the gate below can
+        // reject a wire-framing service (`shell,v2` / `sync:`) the device cannot
+        // satisfy, instead of passing the OPEN through to be `CLSE`d. Only the two
+        // framing services consult this, so the (possibly handshake-bound) query
+        // is skipped entirely for v1 `shell:` / `tcp:` / control services.
+        let device_caps = if service == "sync:" || service.starts_with("shell,") {
+            self.device_capabilities(serial).await
+        } else {
+            None
+        };
+
+        let cmd = match self.map_local_service(service, device_caps.as_ref()) {
             Ok(cmd) => cmd,
             Err(reason) => {
                 stream.write_all(&protocol::fail(&reason)).await?;
@@ -787,23 +811,58 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         Ok(())
     }
 
+    /// Query the backend for a device's banner-advertised capabilities, bounded
+    /// by [`DEVICE_CAPS_TIMEOUT`]. Thin wrapper that fixes the timeout policy in
+    /// one place; returns `None` (unknown → conservative) on timeout / error.
+    async fn device_capabilities(&self, serial: &str) -> Option<DeviceFeatureSet> {
+        self.backend
+            .device_capabilities(serial, DEVICE_CAPS_TIMEOUT)
+            .await
+    }
+
+    /// Per-device feature CSV for a serial-aware `host:features` reply: the
+    /// server's negotiated features intersected with what THIS device's banner
+    /// advertises, so a client gating `adb shell` on `host:features` picks v1 for
+    /// a device that lacks `shell_v2` (graceful, no failed OPEN).
+    async fn device_features_csv(&self, serial: &str) -> String {
+        let device_caps = self.device_capabilities(serial).await;
+        self.caps
+            .intersected_with_device(device_caps.as_ref())
+            .join(",")
+    }
+
     /// Pure mapping from a post-transport service string to the
     /// [`ADBLocalCommand`] to open, or an AOSP-style FAIL reason. Capability
     /// gating (sync/shell-v2) is consulted here so an un-advertised service is
     /// rejected before any device session is opened.
-    fn map_local_service(&self, service: &str) -> Result<ADBLocalCommand, String> {
-        // `sync:` — bridged verbatim, only when `sync_v2` was advertised.
+    ///
+    /// `device_caps` is the target device's banner-advertised feature set
+    /// (`None` when unknown — not yet handshaked). The two **wire-framing**
+    /// services (`sync:`, `shell,v2`) require BOTH that the server advertised the
+    /// feature AND that this device supports it: passing `shell,v2` to a device
+    /// whose banner lacks it makes the device `CLSE` the OPEN (the bug this gate
+    /// prevents). The primary defense is the per-device `host:features` reply
+    /// (the client then picks v1 itself); this is the defense-in-depth fallback
+    /// for a client that opens v2 anyway.
+    fn map_local_service(
+        &self,
+        service: &str,
+        device_caps: Option<&DeviceFeatureSet>,
+    ) -> Result<ADBLocalCommand, String> {
+        // `sync:` — bridged verbatim, only when `sync_v2` is advertised AND the
+        // target device supports it.
         if service == "sync:" {
-            return if self.caps.has_feature("sync_v2") {
+            return if self.caps.device_has_feature("sync_v2", device_caps) {
                 Ok(ADBLocalCommand::Raw(service.to_string()))
             } else {
                 Err(format!("service not supported: {service}"))
             };
         }
         // `shell,...` (shell-v2 and its modifiers) — verbatim, only when
-        // `shell_v2` was advertised. Bare `shell:` (v1) is handled below.
+        // `shell_v2` is advertised AND the target device supports it. Bare
+        // `shell:` (v1) is handled below and works on every device.
         if service.starts_with("shell,") {
-            return if self.caps.has_feature("shell_v2") {
+            return if self.caps.device_has_feature("shell_v2", device_caps) {
                 Ok(ADBLocalCommand::Raw(service.to_string()))
             } else {
                 Err(format!("service not supported: {service}"))
@@ -1095,6 +1154,19 @@ mod tests {
         ) -> Result<crate::usb::MultiplexedSession> {
             unimplemented!("bridge path needs USB hardware; not exercised in unit tests")
         }
+        // Report each device's banner capabilities straight from its entry — the
+        // realistic shape (a backend caches the parsed banner). `None` for an
+        // unknown serial mirrors the real "not connected → unknown" case.
+        async fn device_capabilities(
+            &self,
+            serial: &str,
+            _timeout: std::time::Duration,
+        ) -> Option<DeviceFeatureSet> {
+            self.devices
+                .iter()
+                .find(|d| d.serial == serial)
+                .and_then(|d| d.capabilities.clone())
+        }
         // Reverse routing tests use these hardware-free stubs: list returns a
         // canned body; the kill/forward arms just succeed so the frontend's
         // reply framing can be asserted.
@@ -1370,6 +1442,7 @@ mod tests {
             product: None,
             model: None,
             device: None,
+            capabilities: None,
         }]));
         let resp = round_trip(f.clone(), "host-serial:dev1:get-state").await;
         assert_eq!(resp, b"OKAY0006device");
@@ -1442,6 +1515,7 @@ mod tests {
             product: None,
             model: None,
             device: None,
+            capabilities: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:features").await;
         let body = String::from_utf8(resp).unwrap();
@@ -1453,6 +1527,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_serial_features_is_per_device() {
+        // The bug-fix end to end: the server advertises shell_v2 + sync_v2 (its
+        // backend can bridge both), but `host-serial:<serial>:features` must
+        // reflect EACH device's banner — so the feature-less device is NOT told
+        // shell_v2 (native `adb -s ... shell` then picks v1 and avoids the CLSE),
+        // while the full device still is.
+        let caps = ServerCapabilities::default()
+            .with_shell_v2()
+            .with_feature("sync_v2");
+        let full = DeviceEntry::new("full:5555").with_capabilities(DeviceFeatureSet {
+            shell_v2: true,
+            stat_v2: true,
+            ..DeviceFeatureSet::default()
+        });
+        let stripped = DeviceEntry::new("stripped:6665").with_capabilities(DeviceFeatureSet {
+            shell_v2: false,
+            stat_v2: false,
+            ..DeviceFeatureSet::default()
+        });
+        let f = Arc::new(frontend_with_caps_and_devices(caps, vec![full, stripped]));
+
+        let full_body =
+            String::from_utf8(round_trip(f.clone(), "host-serial:full:5555:features").await)
+                .unwrap();
+        assert!(
+            full_body.contains("shell_v2"),
+            "full device must still be offered shell_v2: {full_body}"
+        );
+        assert!(
+            full_body.contains("sync_v2"),
+            "full device must still be offered sync_v2: {full_body}"
+        );
+
+        let stripped_body =
+            String::from_utf8(round_trip(f, "host-serial:stripped:6665:features").await).unwrap();
+        assert!(
+            !stripped_body.contains("shell_v2"),
+            "feature-less device must NOT be offered shell_v2 (the bug): {stripped_body}"
+        );
+        assert!(
+            !stripped_body.contains("sync_v2"),
+            "feature-less device must NOT be offered sync_v2: {stripped_body}"
+        );
+        // The always-safe defaults are still present for the stripped device.
+        assert!(
+            stripped_body.contains("cmd") && stripped_body.contains("apex"),
+            "always-safe defaults must remain for the stripped device: {stripped_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn host_serial_get_state_with_tcp_ip_serial_routes_correctly() {
         let f = Arc::new(frontend_with(vec![DeviceEntry {
             serial: "172.20.1.45:5555".to_string(),
@@ -1460,6 +1585,7 @@ mod tests {
             product: None,
             model: None,
             device: None,
+            capabilities: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:get-state").await;
         assert_eq!(resp, b"OKAY0006device");
@@ -1476,6 +1602,7 @@ mod tests {
             product: None,
             model: None,
             device: None,
+            capabilities: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:forward:tcp:0;tcp:7777").await;
         let body = String::from_utf8(resp).unwrap();
@@ -1613,6 +1740,7 @@ mod tests {
             product: Some("prod".to_string()),
             model: Some("mod".to_string()),
             device: Some("dev".to_string()),
+            capabilities: None,
         }];
         assert_eq!(format_devices(&devices, false), "s1\tdevice");
         assert_eq!(
@@ -1721,52 +1849,128 @@ mod tests {
             .build()
     }
 
+    /// Build a frontend with explicit advertised capabilities AND a device list
+    /// (each device carrying its banner capabilities), for end-to-end per-device
+    /// `host:features` assertions.
+    fn frontend_with_caps_and_devices(
+        caps: ServerCapabilities,
+        devices: Vec<DeviceEntry>,
+    ) -> AdbServerFrontend<MockBackend> {
+        AdbServerFrontend::builder(Arc::new(MockBackend { devices }))
+            .capabilities(caps)
+            .build()
+    }
+
+    /// A device whose banner advertises everything (`shell_v2` + the `stat_v2`
+    /// that marks sync-v2 support) — used to isolate the *server-feature* axis of
+    /// the gate from the *device* axis in the pure `map_local_service` tests.
+    fn full_device_caps() -> DeviceFeatureSet {
+        DeviceFeatureSet {
+            shell_v2: true,
+            stat_v2: true,
+            ..DeviceFeatureSet::default()
+        }
+    }
+
     #[test]
     fn map_local_service_shell_v1_and_tcp_always_ok() {
         let f = frontend_with_caps(ServerCapabilities::default());
+        let dev = full_device_caps();
+        // v1 shell / tcp do not consult device caps, but pass them anyway to
+        // prove they are accepted regardless.
         assert!(matches!(
-            f.map_local_service("shell:ls").unwrap(),
+            f.map_local_service("shell:ls", Some(&dev)).unwrap(),
             ADBLocalCommand::ShellCommand(c, args) if c == "ls" && args.is_empty()
         ));
         assert!(matches!(
-            f.map_local_service("tcp:5555").unwrap(),
+            f.map_local_service("tcp:5555", Some(&dev)).unwrap(),
             ADBLocalCommand::TcpConnect(5555)
         ));
-        assert!(f.map_local_service("tcp:notaport").is_err());
+        assert!(f.map_local_service("tcp:notaport", Some(&dev)).is_err());
     }
 
     #[test]
     fn map_local_service_sync_gated_on_sync_v2_feature() {
-        // Default caps do NOT advertise sync_v2 → sync: must be rejected.
+        let dev = full_device_caps();
+        // Default caps do NOT advertise sync_v2 → sync: must be rejected even for
+        // a fully-capable device (the server-feature axis).
         let f = frontend_with_caps(ServerCapabilities::default());
         assert!(
-            f.map_local_service("sync:").is_err(),
+            f.map_local_service("sync:", Some(&dev)).is_err(),
             "sync: must FAIL when sync_v2 is not advertised (honest banner)"
         );
 
-        // With sync_v2 advertised → sync: is bridged verbatim via Raw.
+        // With sync_v2 advertised AND a device that supports it → bridged via Raw.
         let f = frontend_with_caps(ServerCapabilities::default().with_feature("sync_v2"));
         assert!(matches!(
-            f.map_local_service("sync:").unwrap(),
+            f.map_local_service("sync:", Some(&dev)).unwrap(),
             ADBLocalCommand::Raw(s) if s == "sync:"
         ));
     }
 
     #[test]
     fn map_local_service_shell_v2_gated_on_shell_v2_feature() {
+        let dev = full_device_caps();
         // Default caps do NOT advertise shell_v2 → shell,v2 must be rejected.
         let f = frontend_with_caps(ServerCapabilities::default());
         assert!(
-            f.map_local_service("shell,v2,raw:ls").is_err(),
+            f.map_local_service("shell,v2,raw:ls", Some(&dev)).is_err(),
             "shell,v2 must FAIL when shell_v2 is not advertised"
         );
 
-        // With shell_v2 advertised → bridged verbatim (modifiers preserved).
+        // With shell_v2 advertised AND a device that supports it → bridged
+        // verbatim (modifiers preserved).
         let f = frontend_with_caps(ServerCapabilities::default().with_shell_v2());
         assert!(matches!(
-            f.map_local_service("shell,v2,TERM=xterm,raw:ls").unwrap(),
+            f.map_local_service("shell,v2,TERM=xterm,raw:ls", Some(&dev)).unwrap(),
             ADBLocalCommand::Raw(s) if s == "shell,v2,TERM=xterm,raw:ls"
         ));
+    }
+
+    #[test]
+    fn map_local_service_shell_v2_denied_for_feature_less_device() {
+        // The bug-report case: the server advertises shell_v2 (backend can bridge
+        // it), but THIS device's banner lacks it (a stripped adbd). The gate must
+        // FAIL the v2 OPEN rather than pass it through to be CLSE'd by the device.
+        let f = frontend_with_caps(ServerCapabilities::default().with_shell_v2());
+        let stripped = DeviceFeatureSet {
+            shell_v2: false,
+            stat_v2: false,
+            ..DeviceFeatureSet::default()
+        };
+        assert!(
+            f.map_local_service("shell,v2,raw:ls", Some(&stripped))
+                .is_err(),
+            "shell,v2 must FAIL for a device whose banner lacks shell_v2 (would CLSE)"
+        );
+        assert!(
+            f.map_local_service("sync:", Some(&stripped)).is_err(),
+            "sync: must FAIL for a device whose banner lacks sync-v2 (stat_v2)"
+        );
+        // But bare v1 shell still works on that same device.
+        assert!(matches!(
+            f.map_local_service("shell:ls", Some(&stripped)).unwrap(),
+            ADBLocalCommand::ShellCommand(c, _) if c == "ls"
+        ));
+    }
+
+    #[test]
+    fn map_local_service_shell_v2_denied_for_unknown_device_caps() {
+        // Capabilities unknown (device not handshaked) → conservative deny of the
+        // framing services.
+        let f = frontend_with_caps(
+            ServerCapabilities::default()
+                .with_shell_v2()
+                .with_feature("sync_v2"),
+        );
+        assert!(
+            f.map_local_service("shell,v2,raw:ls", None).is_err(),
+            "unknown device caps must deny shell,v2 (conservative)"
+        );
+        assert!(
+            f.map_local_service("sync:", None).is_err(),
+            "unknown device caps must deny sync:"
+        );
     }
 
     #[test]
@@ -1785,7 +1989,9 @@ mod tests {
             "enable-verity:",
             "disable-verity:",
         ] {
-            match f.map_local_service(svc) {
+            // Control services need no device caps (every adbd supports them);
+            // pass None to prove they are accepted regardless.
+            match f.map_local_service(svc, None) {
                 Ok(ADBLocalCommand::Raw(s)) => assert_eq!(s, svc, "forwarded verbatim"),
                 Ok(_) => panic!("control service {svc} must map to Raw (got another command)"),
                 Err(e) => panic!("control service {svc} must be accepted, got FAIL: {e}"),
@@ -1833,8 +2039,8 @@ mod tests {
         );
         // reverse: is routed by serve_reverse before map_local_service, so it is
         // not exercised here. jdwp/localabstract remain unbridged.
-        assert!(f.map_local_service("jdwp:1234").is_err());
-        assert!(f.map_local_service("localabstract:foo").is_err());
+        assert!(f.map_local_service("jdwp:1234", None).is_err());
+        assert!(f.map_local_service("localabstract:foo", None).is_err());
     }
 
     /// Select a transport then send one post-transport request, returning the

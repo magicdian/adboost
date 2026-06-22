@@ -180,6 +180,52 @@ member set (and against look-alikes like `usbfoo:` / `rebooting:` / `tcp:`).
 > replaces the now-stale cached connection on the next open. Do **not** treat the
 > post-`tcpip` connection drop as an error.
 
+## `host:features` is **per-device** (capability negotiation is two-axis)
+
+Capability advertising/gating has **two axes**, and a wire-framing-changing
+feature (`shell_v2`, `sync_v2`) needs BOTH to be true before it is offered or
+opened:
+
+1. **Backend-can-bridge** (server-global): `DeviceBackend::capabilities()` →
+   `ServerCapabilities::negotiated_with` at `serve()` time. This is what
+   `adboost` *implements*.
+2. **Device-supports** (per-device): the target device's own CNXN banner,
+   parsed by `DeviceFeatureSet::from_banner` and exposed as
+   `PersistentConnection::peer_features()`. Looked up on demand via
+   `DeviceBackend::device_capabilities(serial, timeout)` (default impl `None`;
+   `DefaultDeviceBackend` returns the connection's cached banner set, handshaking
+   within the timeout if needed). `DeviceEntry.capabilities: Option<DeviceFeatureSet>`
+   carries it through `list_devices`/`track-devices` (`None` = not yet known →
+   conservative).
+
+**Why this exists** (the bug it fixes): one backend can front devices of
+differing capability — e.g. a full Android adbd (banner has `shell_v2`) and a
+stripped adbd reached via `adb forward tcp:N tcp:M` + `adb connect`
+(empty `features=` banner). A global-only `host:features` advertises `shell_v2`
+to **all** of them; the client then opens `shell,v2,...,pty:` against the
+stripped device, which `CLSE`s the OPEN (`open session failed`). Per-device
+`host:features` makes the client pick v1 itself for the feature-less device.
+
+**Where the two axes are consumed:**
+
+| Site | `frontend.rs` | Rule |
+|---|---|---|
+| pre-transport `host:features` (no serial) | `host_data_query_payload` | global caps only (no device chosen yet — unavoidable) |
+| post-transport `host:features` | after `TransportSelected` | `intersected_with_device(serial)` — **per-device** (native `adb -s … shell` gates v1/v2 on this) |
+| `host-serial:<serial>:features` | `dispatch_host_serial` | `intersected_with_device(serial)` — **per-device** |
+| `shell,v2` / `sync:` open gate | `map_local_service(svc, device_caps)` | `device_has_feature(feat, device_caps)` — **defense-in-depth fallback**: FAIL cleanly instead of passing an OPEN the device will `CLSE` |
+
+**Banner → server-feature mapping**: `shell_v2`(server) ⟸ `shell_v2`(banner);
+`sync_v2`(server) ⟸ `stat_v2`(banner) (the `STA2` opcode AOSP gates v2 sync on).
+The always-safe defaults (`cmd,stat_v2,fixed_push_mkdir,apex`) never change the
+client's wire framing, so they pass through regardless of device. `None` device
+caps (unknown) drops both framing features — conservative.
+
+> **Gotcha**: keep `PersistentConnection::device_features()` ("what *we*
+> advertise to the device") distinct from `peer_features()` ("what the *device*
+> advertised to us"). Per-device negotiation reads `peer_features()`. Conflating
+> them is exactly the misread the original bug report made.
+
 ## `host:connect` / `host:disconnect` and the unified device table
 
 `host:connect:<addr>` / `host:disconnect:<addr>` route to

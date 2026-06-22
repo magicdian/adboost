@@ -13,7 +13,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::models::ADBLocalCommand;
+use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 use crate::usb::{MultiplexedSession, ShellV2Session, SyncSession};
 use crate::{Result, RustADBError};
 
@@ -37,11 +37,23 @@ pub struct DeviceEntry {
     pub model: Option<String>,
     /// Optional `devices-l` device name.
     pub device: Option<String>,
+    /// The device's own advertised capabilities, parsed from its CNXN banner —
+    /// the per-device truth source the frontend negotiates `shell_v2` / `sync_v2`
+    /// against (so a feature-less device is never offered a framing it rejects).
+    ///
+    /// `None` means **not yet known**: the device is listed but has not completed
+    /// a CNXN handshake (e.g. a USB device enumerated from descriptors but never
+    /// opened). The frontend treats `None` conservatively — it does not offer the
+    /// wire-framing-changing optional features. A handshaked device (every
+    /// `host:connect`ed TCP device, and any USB device after first open) carries
+    /// `Some`. See [`DeviceBackend::device_capabilities`] for the authoritative,
+    /// on-demand query that can drive a handshake within a timeout.
+    pub capabilities: Option<DeviceFeatureSet>,
 }
 
 impl DeviceEntry {
     /// Construct a minimal entry: just a serial in the [`DeviceState::Device`]
-    /// state, with no `devices-l` extras.
+    /// state, with no `devices-l` extras and unknown capabilities (`None`).
     #[must_use]
     pub fn new(serial: impl Into<String>) -> Self {
         Self {
@@ -50,7 +62,16 @@ impl DeviceEntry {
             product: None,
             model: None,
             device: None,
+            capabilities: None,
         }
+    }
+
+    /// Set the device's advertised capabilities (parsed from its CNXN banner).
+    /// Builder for the enumeration paths that already hold a live connection.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: DeviceFeatureSet) -> Self {
+        self.capabilities = Some(capabilities);
+        self
     }
 }
 
@@ -150,6 +171,30 @@ pub trait DeviceBackend: Send + Sync + 'static {
     // would not type-check post-rewrite). Same for the two methods below.
     async fn capabilities(&self) -> BackendCapabilities {
         async move { BackendCapabilities::default() }
+    }
+
+    /// The advertised capabilities of **one specific device**, parsed from its
+    /// CNXN banner — the authoritative, on-demand per-device query.
+    ///
+    /// Unlike [`Self::list_devices`] (which stays lightweight and may report
+    /// `DeviceEntry::capabilities == None` for a device it has not handshaked),
+    /// this is allowed to *establish* the device connection to learn its banner,
+    /// bounded by `timeout`. The frontend calls it when it actually needs a
+    /// device's capabilities — answering a post-transport `host:features` or
+    /// gating `shell,v2` / `sync:` — so the cost of a handshake is paid only when
+    /// the capability is consumed, never for a bare `host:devices` listing.
+    ///
+    /// Returns `None` when the capability cannot be determined within `timeout`
+    /// (device unreachable, handshake slow, or serial unknown); the frontend
+    /// treats `None` conservatively (does not offer the framing-changing optional
+    /// features). The default implementation returns `None` so existing backends
+    /// keep compiling and simply never advertise per-device optional features.
+    async fn device_capabilities(
+        &self,
+        _serial: &str,
+        _timeout: std::time::Duration,
+    ) -> Option<DeviceFeatureSet> {
+        async move { None }
     }
 
     /// Open a SYNC v1 file-transfer session (`sync:`) for `adb push`/`pull`.
@@ -284,6 +329,17 @@ mod tests {
         assert_eq!(e.serial, "ABC123");
         assert_eq!(e.state, DeviceState::Device);
         assert!(e.product.is_none() && e.model.is_none() && e.device.is_none());
+        assert!(
+            e.capabilities.is_none(),
+            "a freshly-listed device has unknown (None) capabilities until handshaked"
+        );
+    }
+
+    #[test]
+    fn device_entry_with_capabilities_sets_some() {
+        let caps = DeviceFeatureSet::default();
+        let e = DeviceEntry::new("ABC123").with_capabilities(caps.clone());
+        assert_eq!(e.capabilities, Some(caps));
     }
 
     #[test]

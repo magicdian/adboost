@@ -365,6 +365,16 @@ pub struct PersistentConnection<T: ADBMessageTransport = USBTransport> {
     writer_handle: Option<JoinHandle<()>>,
     /// Features advertised to the device in the CNXN banner.
     features: DeviceFeatureSet,
+    /// Features the **peer device** advertised back in its own CNXN banner,
+    /// parsed from the handshake response (see [`DeviceFeatureSet::from_banner`]).
+    ///
+    /// This is the device's *real* capability set — the truth source for
+    /// per-device capability negotiation at the server frontend (so `shell_v2` /
+    /// `sync_v2` is never offered to a device whose banner lacks it). It is
+    /// distinct from [`Self::features`] above (what *we* advertise). A device that
+    /// sent an empty `features=` segment (e.g. a stripped adbd) or a TLS-upgraded
+    /// link whose post-STLS banner we report empty yields the all-`false` set.
+    peer_features: DeviceFeatureSet,
     /// Whether `delayed_ack` windowed flow control is negotiated for this
     /// connection: `true` iff BOTH this end advertised it (`features.delayed_ack`)
     /// AND the device's CNXN banner advertised it. When `false`, sessions use
@@ -461,6 +471,13 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
             banner_advertises_delayed_ack(&device_banner)
         );
 
+        // Parse the device's *own* advertised feature set from its banner. This is
+        // the per-device capability truth the server frontend negotiates against
+        // (so a feature-less device is never offered shell_v2 / sync_v2). An empty
+        // or absent `features=` segment (stripped adbd, or the empty post-STLS
+        // banner) yields the all-false set — the conservative result we want.
+        let peer_features = DeviceFeatureSet::from_banner(&device_banner);
+
         let (pending_opens_tx, pending_opens_rx) = mpsc::channel(PENDING_OPENS_CHANNEL_SIZE);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_SIZE);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_SIZE);
@@ -486,6 +503,7 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
             reader_handle: Some(reader_handle),
             writer_handle: Some(writer_handle),
             features,
+            peer_features,
             delayed_ack_negotiated,
             pending_opens_rx: std::sync::Mutex::new(Some(pending_opens_rx)),
             conn_closed: Arc::new(AtomicBool::new(false)),
@@ -642,6 +660,19 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     #[must_use]
     pub fn device_features(&self) -> &DeviceFeatureSet {
         &self.features
+    }
+
+    /// The feature set the **peer device** advertised in its own CNXN banner,
+    /// parsed at handshake time.
+    ///
+    /// Use this — NOT [`Self::device_features`] — when you need the *device's*
+    /// real capabilities (e.g. server-side per-device negotiation of `shell_v2` /
+    /// `sync_v2`). [`Self::device_features`] is what *we* advertise; this is what
+    /// the device advertised back. A stripped adbd (empty `features=`) yields the
+    /// all-`false` set.
+    #[must_use]
+    pub fn peer_features(&self) -> &DeviceFeatureSet {
+        &self.peer_features
     }
 
     /// Subscribe to device-originated `OPEN` messages (pull model).
