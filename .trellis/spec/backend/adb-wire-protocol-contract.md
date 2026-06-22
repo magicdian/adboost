@@ -259,6 +259,35 @@ before its session's first frame is routed (otherwise the reply misroutes to the
 device-OPEN queue). Frame-read latency bounds how long a queued control message
 waits, which is short.
 
+## A transport MUST let a blocked read and a concurrent write proceed independently
+
+The persistent multiplexer spawns a reader task and a writer task, each holding a
+`transport.clone()` (`usb/persistent.rs`). It relies on an **invariant the trait
+does not state**: a read blocked in `read_message_with_timeout` must NOT hold any
+lock the writer needs for `write_message_with_timeout`. The reader loops with a
+1s read timeout, so any lock it holds across that `await` is held ~continuously.
+
+- **USB** satisfies this by construction: bulk-IN and bulk-OUT are separate
+  endpoints with separate locks (`USBTransport`); reads never block writes.
+- **TCP** originally violated it: `TcpTransport` is `#[derive(Clone)]` over a
+  single `Arc<Mutex<Option<CurrentConnection>>>`, and `read_message_with_timeout`
+  held that one lock across the entire 1s read `await`. The writer (same lock) was
+  serialized behind it, so every interactive `adb shell` keystroke's WRTE/OKAY
+  waited up to a full read window → **constant ~2s per-key echo lag** (USB ~3ms).
+  Nagle/`set_nodelay` was NOT the cause (it adds one LAN RTT, not a 2s plateau);
+  three `set_nodelay` fixes never touched this lock contention.
+- **The fix**: `tokio::io::split` the socket into `ReadHalf`/`WriteHalf` behind
+  **independent** locks (`read_half` / `write_half`). `CurrentConnection` (the
+  `Tcp`/`Tls` enum) impls `AsyncRead`+`AsyncWrite` by delegating poll to the live
+  arm (both arms are `Unpin` → safe `Pin::new`, no `unsafe`). The TLS upgrade
+  `unsplit`s the two halves back into the whole socket for the handshake, then
+  re-`split`s and stores the new halves in the same `Arc` guards.
+
+> **Rule for any new transport**: if reads and writes can be in flight on separate
+> tasks, they must use separate locks (or a lock-free full-duplex primitive).
+> Never hold a lock across a blocking-read `await` that the write path also needs.
+> A single `Arc<Mutex<wholesocket>>` shared by reader+writer is the anti-pattern.
+
 ## Bug #3 status: RESOLVED (root cause found + device-verified)
 
 The TRUE root cause was the **CNXN banner trailing NUL** (see the no-NUL section
