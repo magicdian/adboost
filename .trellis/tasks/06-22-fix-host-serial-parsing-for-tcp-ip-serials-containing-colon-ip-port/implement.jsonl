@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "本任务核心是 host-serial 协议解析；需对齐 AOSP host-serial:<serial>:<sub> 语义、transport 选择 parity、错误措辞矩阵——决定切分策略 Q1 的关键依据"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic + deny(warnings) 门禁；新增单测须符合仓库测试风格"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "解析失败路径的 FAIL/Result 处理需符合 RustADBError 与协议错误措辞约定"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "修改解析逻辑前先搜既有 sub-service 集合/常量，避免硬编码重复；复用已有 sub-service 判定"}

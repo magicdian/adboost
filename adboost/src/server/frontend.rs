@@ -203,7 +203,9 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         // `host-serial:<serial>:<sub>` — a single-device query carrying its own
         // serial. Strip the prefix and dispatch the sub-service against it.
         if let Some(rest) = service.strip_prefix("host-serial:") {
-            if let Some((serial, sub)) = rest.split_once(':') {
+            // The serial may itself contain colons (TCP/IP `ip:port`), so split
+            // on the known sub-service anchor rather than the first colon.
+            if let Some((serial, sub)) = split_host_serial(rest) {
                 return self.dispatch_host_serial(stream, serial, sub).await;
             }
             stream
@@ -928,6 +930,43 @@ fn is_forward_family(svc: &str) -> bool {
         || svc.starts_with("killforward:")
 }
 
+/// Whether `sub` is a sub-service recognized by [`dispatch_host_serial`]. Used
+/// as the *anchor* to split `host-serial:<serial>:<sub>`: the serial itself may
+/// contain colons (a TCP/IP `ip:port` device), so the split point cannot be the
+/// first (or last) colon — it is the colon that separates the serial from a
+/// known sub-service. Mirror the exact member set of `dispatch_host_serial`'s
+/// `match sub`; keep them in lockstep.
+fn is_host_serial_sub(sub: &str) -> bool {
+    matches!(sub, "get-state" | "get-serialno" | "features")
+        || sub.starts_with("transport")
+        || sub == "tport"
+        || is_forward_family(sub)
+}
+
+/// Split `host-serial:<serial>:<sub>` into `(serial, sub)`, tolerating a serial
+/// that itself contains colons (TCP/IP `ip:port`, e.g. `172.20.1.45:5555`).
+///
+/// `rest` is the payload after the `host-serial:` prefix. Anchored on a *known*
+/// sub-service rather than a colon position: we scan colon split points and take
+/// the first one whose right-hand side is a recognized sub-service
+/// ([`is_host_serial_sub`]). Scanning left-to-right gives the longest serial that
+/// still leaves a valid sub-service, which is what AOSP's serial-prefix matching
+/// achieves for `ip:port` serials.
+///
+/// When no split yields a known sub-service we fall back to the *first* colon, so
+/// a request like `host-serial:dev1:bogus` still reaches
+/// [`dispatch_host_serial`]'s `other` arm and produces the precise
+/// `unknown host-serial sub-service: bogus` error (rather than collapsing to
+/// `malformed`). Returns `None` only when there is no colon at all.
+fn split_host_serial(rest: &str) -> Option<(&str, &str)> {
+    rest.match_indices(':')
+        .find_map(|(idx, _)| {
+            let sub = &rest[idx + 1..];
+            is_host_serial_sub(sub).then(|| (&rest[..idx], sub))
+        })
+        .or_else(|| rest.split_once(':'))
+}
+
 /// Read one smartsocket request: 4 ASCII hex length, then that many UTF-8 bytes.
 ///
 /// Returns `Ok(None)` on a clean EOF before any bytes (the client just closed),
@@ -1337,6 +1376,112 @@ mod tests {
 
         let resp = round_trip(f, "host-serial:ghost:get-state").await;
         assert_eq!(resp, b"OKAY0007offline");
+    }
+
+    #[test]
+    fn split_host_serial_handles_tcp_ip_serial_with_colon() {
+        // The bug: `ip:port` serials contain a colon, so first-colon splitting
+        // mis-parses serial=`172.20.1.45`, sub=`5555:features`. The anchor on a
+        // known sub-service must recover the full serial and full sub.
+        let serial = "172.20.1.45:5555";
+
+        for sub in [
+            "features",
+            "get-state",
+            "get-serialno",
+            "transport",
+            "tport",
+            "list-forward",
+            "killforward-all",
+            "forward:tcp:0;tcp:7777",
+            "killforward:tcp:7777",
+        ] {
+            let rest = format!("{serial}:{sub}");
+            assert_eq!(
+                split_host_serial(&rest),
+                Some((serial, sub)),
+                "tcp/ip serial+sub must split on the known-sub anchor: {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_host_serial_handles_usb_serial_without_colon() {
+        // USB serials carry no colon — the legacy path must keep working.
+        for sub in ["get-state", "features", "forward:tcp:0;tcp:7777"] {
+            let rest = format!("dev1:{sub}");
+            assert_eq!(
+                split_host_serial(&rest),
+                Some(("dev1", sub)),
+                "usb serial must not regress: {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_host_serial_unknown_sub_falls_back_to_first_colon() {
+        // An unknown sub-service finds no anchor; fall back to the first colon so
+        // `dispatch_host_serial` still emits the precise "unknown sub-service".
+        assert_eq!(
+            split_host_serial("dev1:bogus"),
+            Some(("dev1", "bogus")),
+            "unknown sub falls back to first-colon split"
+        );
+        // No colon at all → genuinely malformed.
+        assert_eq!(split_host_serial("dev1"), None);
+    }
+
+    #[tokio::test]
+    async fn host_serial_features_with_tcp_ip_serial_routes_correctly() {
+        // Regression: `host-serial:172.20.1.45:5555:features` must route to the
+        // features branch (OKAY + payload), not FAIL with
+        // `unknown host-serial sub-service: 5555:features`.
+        let f = Arc::new(frontend_with(vec![DeviceEntry {
+            serial: "172.20.1.45:5555".to_string(),
+            state: DeviceState::Device,
+            product: None,
+            model: None,
+            device: None,
+        }]));
+        let resp = round_trip(f, "host-serial:172.20.1.45:5555:features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert!(
+            body.contains("cmd,stat_v2,fixed_push_mkdir,apex"),
+            "features payload missing, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_serial_get_state_with_tcp_ip_serial_routes_correctly() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry {
+            serial: "172.20.1.45:5555".to_string(),
+            state: DeviceState::Device,
+            product: None,
+            model: None,
+            device: None,
+        }]));
+        let resp = round_trip(f, "host-serial:172.20.1.45:5555:get-state").await;
+        assert_eq!(resp, b"OKAY0006device");
+    }
+
+    #[tokio::test]
+    async fn host_serial_forward_with_tcp_ip_serial_routes_correctly() {
+        // The sub-service itself carries multiple colons
+        // (`forward:tcp:0;tcp:7777`); neither the serial nor the forward
+        // sub-arguments may be truncated.
+        let f = Arc::new(frontend_with(vec![DeviceEntry {
+            serial: "172.20.1.45:5555".to_string(),
+            state: DeviceState::Device,
+            product: None,
+            model: None,
+            device: None,
+        }]));
+        let resp = round_trip(f, "host-serial:172.20.1.45:5555:forward:tcp:0;tcp:7777").await;
+        let body = String::from_utf8(resp).unwrap();
+        // A bound forward replies OKAY (not the "unknown sub-service" / "device
+        // not found" failures the parsing bug would produce).
+        assert!(body.starts_with("OKAY"), "got: {body}");
     }
 
     #[tokio::test]

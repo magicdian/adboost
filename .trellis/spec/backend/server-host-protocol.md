@@ -36,6 +36,39 @@ function with its own match:
 
 ---
 
+## `host-serial:<serial>:<sub>` parsing — anchor on the sub-service, NOT a colon position
+
+`host-serial:` carries the serial *inside* the service string, then a
+sub-service. The split point between serial and sub is **not** a fixed colon
+position, because **both sides can contain colons**:
+
+- The serial of a TCP/IP device is `ip:port` (e.g. `172.20.1.45:5555`).
+- Some sub-services carry colons themselves: `forward:tcp:0;tcp:7777`,
+  `killforward:tcp:7777`.
+
+So neither `split_once(':')` (first colon) nor `rsplit_once(':')` (last colon)
+is correct. `split_host_serial` (`frontend.rs`) instead **anchors on a known
+sub-service**: it scans colon split points left-to-right and takes the first one
+whose right-hand side satisfies `is_host_serial_sub` (the exact member set of
+`dispatch_host_serial`'s `match sub`: `get-state` / `get-serialno` / `features`
+/ `transport*` / `tport` / forward-family). Left-to-right scan yields the
+longest serial that still leaves a valid sub-service — matching AOSP's
+serial-prefix matching for `ip:port` serials. When nothing anchors, it falls
+back to the first colon so a genuinely-unknown sub still reaches the precise
+`unknown host-serial sub-service: <sub>` error rather than collapsing to
+`malformed`.
+
+> **Gotcha — first-colon split breaks TCP/IP serials.** The original
+> `rest.split_once(':')` parsed `172.20.1.45:5555:features` as serial
+> `172.20.1.45`, sub `5555:features` → `FAIL("unknown host-serial sub-service:
+> 5555:features")`. USB serials (no colon) hid the bug; it surfaced once TCP
+> devices were transport-selectable. `is_host_serial_sub` MUST stay in lockstep
+> with `dispatch_host_serial`'s `match sub` — add a member to one, add it to the
+> other. Covered by `split_host_serial_*` unit tests plus
+> `host_serial_{features,get_state,forward}_with_tcp_ip_serial_routes_correctly`,
+> and end-to-end by the `tcpip.shell_through_tcp_device` selftest parity case
+> (modern `adb -s <ip:port>` sends `host-serial:<ip:port>:features` first).
+
 ## Gotcha: modern `adb` selects a transport via `host:tport:any` BEFORE the local service
 
 > **Warning**: `adb shell` / `adb forward --list` / `adb reverse --list` **with
