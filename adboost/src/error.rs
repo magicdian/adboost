@@ -100,6 +100,19 @@ pub enum RustADBError {
     /// the `tokio::time::timeout` deadline.
     #[error("read timed out before a full message arrived")]
     ReadTimeout,
+    /// A write stalled at a frame boundary before any byte of the frame was
+    /// committed to the transport.
+    ///
+    /// The write-side mirror of [`Self::ReadTimeout`], and likewise transport-
+    /// neutral and **non-feature-gated**. A transport's `write_message_with_timeout`
+    /// returns this when the per-write deadline elapses while the OUT path is under
+    /// backpressure but **zero bytes of the current frame have reached the wire** —
+    /// a fully recoverable condition (no truncated frame). The transport-generic
+    /// persistent writer matches on it to keep looping rather than tear the
+    /// connection down. A timeout/error that occurs AFTER a frame has started is NOT
+    /// this variant: a partially-written frame is unrecoverable and stays fatal.
+    #[error("write timed out at a frame boundary before any byte was sent")]
+    WriteTimeout,
     /// Selected device is busy.
     #[cfg(feature = "usb")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]

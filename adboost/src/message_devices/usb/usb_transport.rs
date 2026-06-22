@@ -26,6 +26,13 @@ const ADB_PROTOCOL: u8 = 0x01;
 /// packet still ends a transfer early, and any over-read is carried by the buffer.
 const READ_TRANSFER_LEN: usize = 64 * 1024;
 
+/// Once a frame's first bulk-OUT transfer has committed, the rest of the frame
+/// MUST be finished — a partially-written frame is unrecoverable for the framed
+/// peer. This generous upper bound drains the remainder of a started frame; far
+/// longer than any real flush, so normal backpressure never trips it. Mirrors the
+/// TCP transport's `WRITE_COMPLETION_TIMEOUT`.
+const WRITE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Address + max-packet-size pair for a discovered bulk endpoint.
 #[derive(Clone, Copy, Debug)]
 struct EndpointInfo {
@@ -137,7 +144,40 @@ impl USBTransport {
         self.device_info.product_id()
     }
 
-    async fn write_bulk_data(&self, data: &[u8], timeout: Duration) -> Result<()> {
+    /// Write one whole frame to the bulk-OUT endpoint with frame-atomic timeout
+    /// semantics (Scheme B), mirroring the TCP transport.
+    ///
+    /// `start_timeout` gates only the FIRST bulk transfer of the frame: while zero
+    /// bytes are committed, a timed-out transfer (`nusb` `Cancelled`) surfaces the
+    /// recoverable [`RustADBError::WriteTimeout`] — the OUT endpoint is back-pressured
+    /// but nothing was truncated, so the persistent writer keeps looping. Once any
+    /// bytes are committed, the rest of the frame is driven under the looser
+    /// [`WRITE_COMPLETION_TIMEOUT`]; a timeout or error there is fatal (a truncated
+    /// frame is unrecoverable — the caller's `writer_loop` tears the connection down).
+    ///
+    /// A single `nusb` transfer is atomic (a timeout cancels the WHOLE transfer; no
+    /// partial bytes are delivered), so "frame started" == "at least one transfer
+    /// completed", with no half-transfer ambiguity.
+    /// Write one bulk-OUT segment (header or payload) of the current frame.
+    ///
+    /// `frame_started` tracks whether ANY byte of the whole frame (across the
+    /// header segment and this payload segment) has already been committed. Only
+    /// the very first transfer of the frame is the recoverable start gate
+    /// (`start_timeout` → [`RustADBError::WriteTimeout`]); every transfer after that
+    /// is mid-frame and bounded by the looser [`WRITE_COMPLETION_TIMEOUT`], with a
+    /// timeout/error there being fatal (truncation). The flag is flipped to `true`
+    /// as soon as the first transfer commits, so it carries across the two calls
+    /// (header then payload) that make up one frame.
+    ///
+    /// The header and payload are kept as SEPARATE bulk transfers (matching the
+    /// original wire framing and per-segment zero-length-packet handling) rather
+    /// than concatenated; only the timeout semantics change here.
+    async fn write_segment(
+        &self,
+        data: &[u8],
+        start_timeout: Duration,
+        frame_started: &mut bool,
+    ) -> Result<()> {
         let mut connection = self.write_connection.lock().await;
         let max_packet_size = connection
             .write_info
@@ -159,9 +199,19 @@ impl USBTransport {
         while offset < data_len {
             let end = (offset + max_packet_size).min(data_len);
             let chunk = Buffer::from(&data[offset..end]);
+            // Recoverable start gate ONLY for the very first transfer of the frame.
+            let at_frame_start = !*frame_started;
+            let timeout = if at_frame_start {
+                start_timeout
+            } else {
+                WRITE_COMPLETION_TIMEOUT
+            };
             let completion = transfer_with_timeout(endpoint, chunk, timeout).await;
-            map_transfer_status(completion.status)?;
+            map_write_status(completion.status, at_frame_start)?;
             let write_amount = completion.actual_len;
+            if write_amount > 0 {
+                *frame_started = true;
+            }
             offset += write_amount;
 
             tracing::trace!("wrote chunk of size {write_amount} - {offset}/{data_len}");
@@ -169,8 +219,12 @@ impl USBTransport {
 
         if offset % max_packet_size == 0 {
             tracing::trace!("must send final zero-length packet");
-            let completion = transfer_with_timeout(endpoint, Buffer::from(&[][..]), timeout).await;
-            map_transfer_status(completion.status)?;
+            // The ZLP completes a segment already fully on the wire, so a failure
+            // here is mid-frame → fatal, never the recoverable start gate.
+            let completion =
+                transfer_with_timeout(endpoint, Buffer::from(&[][..]), WRITE_COMPLETION_TIMEOUT)
+                    .await;
+            map_write_status(completion.status, false)?;
         }
 
         Ok(())
@@ -288,6 +342,41 @@ fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result
     }
 }
 
+/// Map a `nusb` write-transfer status into the crate error type, with frame-atomic
+/// timeout semantics (Scheme B).
+///
+/// Unlike the read path ([`map_transfer_status`]), a write timeout's meaning
+/// depends on WHERE in the frame it lands. `at_frame_start` is true only for the
+/// frame's first transfer (zero bytes committed):
+/// - a timed-out transfer (`Cancelled`) at the start gate → recoverable
+///   [`RustADBError::WriteTimeout`] (the OUT endpoint is back-pressured, nothing was
+///   truncated; the persistent writer keeps looping);
+/// - a timed-out transfer once the frame has started → fatal `IOError(TimedOut)`
+///   (the frame is truncated and unrecoverable);
+/// - any non-timeout transfer error → the usual [`RustADBError::UsbTransferError`].
+///
+/// This is why the write path must NOT reuse `map_transfer_status` (which would
+/// turn every write `Cancelled` into the read-path `ReadTimeout`).
+fn map_write_status(
+    status: std::result::Result<(), TransferError>,
+    at_frame_start: bool,
+) -> Result<()> {
+    match status {
+        Ok(()) => Ok(()),
+        Err(TransferError::Cancelled) => {
+            if at_frame_start {
+                Err(RustADBError::WriteTimeout)
+            } else {
+                Err(RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "USB write stalled mid-frame past the completion deadline",
+                )))
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl ADBTransport for USBTransport {
     async fn connect(&mut self) -> crate::Result<()> {
         let device = self.device_info.open().await?;
@@ -362,14 +451,21 @@ impl ADBMessageTransport for USBTransport {
         message: ADBTransportMessage,
         timeout: Duration,
     ) -> Result<()> {
+        // Header and payload are written as separate bulk segments (original wire
+        // framing), but the start-gate timeout applies to the FRAME as a unit:
+        // `frame_started` carries across both calls, so only the frame's very first
+        // transfer is the recoverable start gate. A timeout after the header has
+        // been sent is mid-frame (truncation) → fatal, not a clean boundary.
         let message_bytes = message.header().as_bytes();
-        self.write_bulk_data(&message_bytes, timeout).await?;
-
+        let mut frame_started = false;
+        self.write_segment(&message_bytes, timeout, &mut frame_started)
+            .await?;
         tracing::trace!("successfully write header: {} bytes", message_bytes.len());
 
         let payload = message.into_payload();
         if !payload.is_empty() {
-            self.write_bulk_data(&payload, timeout).await?;
+            self.write_segment(&payload, timeout, &mut frame_started)
+                .await?;
             tracing::trace!("successfully write payload: {} bytes", payload.len());
         }
 
@@ -475,9 +571,53 @@ fn aligned_request_len(remaining: usize, max_packet_size: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{aligned_request_len, map_transfer_status};
+    use super::{aligned_request_len, map_transfer_status, map_write_status};
     use crate::RustADBError;
     use nusb::transfer::TransferError;
+
+    #[test]
+    fn write_cancelled_at_frame_start_is_recoverable_write_timeout() {
+        // Scheme B start gate: a timed-out write transfer with zero bytes of the
+        // frame committed is the recoverable WriteTimeout (back-pressure, no
+        // truncation) — NOT the read path's ReadTimeout and NOT fatal.
+        let mapped = map_write_status(Err(TransferError::Cancelled), true);
+        assert!(
+            matches!(mapped, Err(RustADBError::WriteTimeout)),
+            "a start-gate write timeout must map to WriteTimeout, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn write_cancelled_mid_frame_is_fatal_timeout() {
+        // Once the frame has started, a timed-out transfer means a truncated frame:
+        // fatal IOError(TimedOut), never the recoverable WriteTimeout.
+        let mapped = map_write_status(Err(TransferError::Cancelled), false);
+        assert!(
+            matches!(mapped, Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::TimedOut),
+            "a mid-frame write timeout must be a fatal IO timeout, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn write_non_timeout_error_is_transfer_error() {
+        // A genuine transfer failure (not a timeout) is a real USB error regardless
+        // of frame position.
+        for at_start in [true, false] {
+            let mapped = map_write_status(Err(TransferError::Disconnected), at_start);
+            assert!(
+                matches!(mapped, Err(RustADBError::UsbTransferError(_))),
+                "a non-timeout write error must map to UsbTransferError (at_start={at_start}), got {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_ok_status_maps_to_ok() {
+        assert!(
+            map_write_status(Ok(()), true).is_ok() && map_write_status(Ok(()), false).is_ok(),
+            "a successful write transfer must map to Ok at any frame position"
+        );
+    }
 
     #[test]
     fn cancelled_status_maps_to_read_timeout() {

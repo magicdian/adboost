@@ -1236,20 +1236,12 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     #[tracing::instrument(name = "writer", skip(transport, writer_rx))]
     async fn writer_loop(mut transport: T, mut writer_rx: mpsc::Receiver<OutboundFrame>) {
         while let Some(frame) = writer_rx.recv().await {
-            // A write error means the transport could not put a whole frame on the
-            // wire. `write_message_with_timeout` leaves a partial frame unrecoverable
-            // for the framed peer and poisons its write half, so the byte stream to
-            // the device is now desynced: pumping the NEXT frame would append it to
-            // the truncation and corrupt every session on this connection. The write
-            // direction is therefore fatal — stop the loop instead of warn-and-
-            // continue. The reader side observes the closed transport and tears the
-            // rest of the connection down.
             let write_result = match frame {
                 OutboundFrame::FireForget(msg) => transport.write_message(msg).await,
                 OutboundFrame::WithAck(msg, ack) => {
                     let result = transport.write_message(msg).await;
                     // Surface the per-frame result to the WRTE caller before we
-                    // decide to break; the receiver may have been dropped — ignore.
+                    // decide what to do; the receiver may have been dropped — ignore.
                     let ack_result = match &result {
                         Ok(()) => Ok(()),
                         Err(e) => Err(io::Error::other(e.to_string())),
@@ -1259,9 +1251,27 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
                 }
             };
 
-            if let Err(e) = write_result {
-                tracing::warn!("PersistentUsb writer: write failed, tearing down writer: {e}");
-                break;
+            match write_result {
+                Ok(()) => {}
+                // Frame-atomic write contract (Scheme B): `WriteTimeout` means the
+                // OUT path was back-pressured but NOTHING of the frame reached the
+                // wire — the stream is still aligned, so this is recoverable. Keep
+                // looping (mirrors the reader's `ReadTimeout => continue`). This is
+                // the case that, when wrongly treated as fatal, tore down a saturated
+                // reverse tunnel (iperf3 "control socket has closed unexpectedly").
+                Err(RustADBError::WriteTimeout) => {
+                    tracing::trace!("PersistentUsb writer: write backpressure timeout, retrying");
+                }
+                // Any other write error means a frame was started but not finished
+                // (truncation) or a real IO/transport failure. The transport has
+                // poisoned its write half, so the device-bound stream is desynced:
+                // pumping the next frame would append it to the truncation. Fatal —
+                // stop the loop; the reader observes the closed transport and tears
+                // the rest of the connection down.
+                Err(e) => {
+                    tracing::warn!("PersistentUsb writer: write failed, tearing down writer: {e}");
+                    break;
+                }
             }
         }
         tracing::debug!("PersistentUsb writer task exiting");

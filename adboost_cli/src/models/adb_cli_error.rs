@@ -92,6 +92,7 @@ impl From<adboost::RustADBError> for ADBCliError {
             | RustADBError::WrongFileExtension(_)
             | RustADBError::AddrParseError(_)
             | RustADBError::ReadTimeout
+            | RustADBError::WriteTimeout
             | RustADBError::DeviceBusy => Self::Standard(value),
         }
     }

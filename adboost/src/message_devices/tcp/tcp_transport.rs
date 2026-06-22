@@ -172,23 +172,82 @@ impl FrameReader {
     }
 }
 
-async fn write_all_timeout(
-    writer: &mut WriteHalf<CurrentConnection>,
-    data: &[u8],
-    timeout: Duration,
+/// Once a frame's first byte has reached the wire it MUST be finished — a
+/// partially-written frame is unrecoverable for the framed peer. This is the
+/// generous upper bound for draining the rest of a started frame; far longer than
+/// any real flush on local adbd / a healthy link, so normal backpressure never
+/// trips it. Exceeding it means the peer is genuinely wedged → fatal (see
+/// [`write_frame_atomic`]).
+const WRITE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write one whole frame with frame-atomic timeout semantics (Scheme B).
+///
+/// `start_timeout` gates only the **start** of the frame: while zero bytes have
+/// been committed, a single `write` that does not make progress within
+/// `start_timeout` returns the recoverable [`RustADBError::WriteTimeout`] (the OUT
+/// path is under backpressure but nothing was truncated — the persistent writer
+/// keeps looping). Once any byte is committed the frame is driven to completion
+/// under the looser [`WRITE_COMPLETION_TIMEOUT`]; an IO error or that deadline
+/// elapsing mid-frame is fatal (the caller poisons the write half).
+///
+/// A single `AsyncWrite::poll_write` is cancel-safe — it either commits `n > 0`
+/// bytes or makes no progress — so wrapping ONE `write` call in `timeout` never
+/// loses bytes. This is the write-side mirror of the read path's "a timeout is
+/// only ever observed at a frame boundary" invariant.
+///
+/// Generic over the writer and parameterized on both deadlines so the branch
+/// logic is unit-testable against a mock `AsyncWrite` without real sockets or
+/// 10-second waits.
+async fn write_frame_atomic<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &[u8],
+    start_timeout: Duration,
+    completion_timeout: Duration,
 ) -> Result<()> {
-    let fut = async {
-        writer.write_all(data).await?;
-        writer.flush().await
-    };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(res) => {
-            res?;
-            Ok(())
+    let mut offset = 0;
+    while offset < frame.len() {
+        // The first write of the frame is the start gate; every subsequent write is
+        // mid-frame and must complete within the (looser) completion deadline.
+        let timeout = if offset == 0 {
+            start_timeout
+        } else {
+            completion_timeout
+        };
+
+        match tokio::time::timeout(timeout, writer.write(&frame[offset..])).await {
+            Ok(res) => {
+                let n = res?;
+                if n == 0 {
+                    return Err(RustADBError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "TCP write returned 0 (peer closed)",
+                    )));
+                }
+                offset += n;
+            }
+            Err(_elapsed) => {
+                if offset == 0 {
+                    // Nothing of this frame is on the wire: recoverable, no truncation.
+                    return Err(RustADBError::WriteTimeout);
+                }
+                // Mid-frame stall past the completion deadline: the frame is
+                // truncated and unrecoverable. Fatal.
+                return Err(RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TCP write stalled mid-frame past the completion deadline",
+                )));
+            }
         }
+    }
+
+    // Flush is a no-op for an unbuffered TcpStream/TlsStream, but keep it for
+    // correctness under any buffering wrapper. A flush failure after the bytes are
+    // written is an IO error (fatal), not a frame-boundary timeout.
+    match tokio::time::timeout(completion_timeout, writer.flush()).await {
+        Ok(res) => Ok(res?),
         Err(_elapsed) => Err(RustADBError::IOError(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "TCP write timed out",
+            "TCP flush stalled past the completion deadline",
         ))),
     }
 }
@@ -316,35 +375,30 @@ impl ADBMessageTransport for TcpTransport {
         message: ADBTransportMessage,
         write_timeout: Duration,
     ) -> Result<()> {
-        let message_bytes = message.header().as_bytes();
+        // Serialize the whole frame (header followed by payload) into one
+        // contiguous buffer so it is written as a single byte stream: the
+        // start-gate timeout then applies to the frame as a unit, not to header and
+        // payload separately (a header-written-then-payload-timeout would otherwise
+        // be a truncation, not a clean frame boundary).
+        let mut frame = message.header().as_bytes();
+        frame.extend_from_slice(message.payload());
+
         let write_lock = self.get_write_half()?;
         let mut guard = write_lock.lock().await;
         let writer = half_mut(&mut guard)?;
 
-        // A frame is header followed by payload. `write_all` is NOT cancel-safe and
-        // reports no partial count on error, so ANY failure here (a timeout that
-        // drops the write future mid-flush, or an IO error) may have left an
-        // unknown-length prefix of the frame on the wire — a truncated frame the
-        // framed peer cannot recover from. Writing the next frame after that would
-        // append it to the truncation and permanently desync the device-bound
-        // stream. So on any error we POISON the write half (take it out of the
-        // guard): every subsequent write then fails fast with NotConnected instead
-        // of corrupting the stream, and the connection is torn down. This mirrors
-        // the read path's invariant — a partial frame must never be silently
-        // followed by the next one.
-        let payload = message.into_payload();
-        let result = async {
-            write_all_timeout(writer, &message_bytes, write_timeout).await?;
-            if !payload.is_empty() {
-                write_all_timeout(writer, &payload, write_timeout).await?;
-            }
-            Ok(())
-        }
-        .await;
+        let result =
+            write_frame_atomic(writer, &frame, write_timeout, WRITE_COMPLETION_TIMEOUT).await;
 
-        if result.is_err() {
-            // Poison: drop the write half so the truncated stream is never written
-            // to again.
+        // Frame-atomic outcomes (see `write_frame_atomic`):
+        //  - Ok: whole frame on the wire.
+        //  - WriteTimeout: nothing of the frame was committed — recoverable, the
+        //    stream is still aligned, so DO NOT poison (the persistent writer keeps
+        //    looping and the next frame writes cleanly).
+        //  - any other Err: a frame was started but not finished (truncation) or a
+        //    real IO error — unrecoverable. Poison the write half so the truncated
+        //    stream is never written to again; the connection is torn down.
+        if matches!(result, Err(ref e) if !matches!(e, RustADBError::WriteTimeout)) {
             *guard = None;
         }
         result
@@ -674,21 +728,118 @@ mod tests {
         server.abort();
     }
 
-    /// Regression lock for the write-side desync (#2): a write that fails part-way
-    /// through a frame MUST poison the write half so a subsequent write fails fast
-    /// rather than appending the next frame to the truncated one on the wire.
+    /// A mock `AsyncWrite` that accepts `accept_first` bytes immediately, then
+    /// stalls forever (always `Pending`). With `accept_first == 0` it models a
+    /// fully back-pressured OUT path (start-gate stall); with `accept_first > 0` it
+    /// models a peer that takes a frame's first bytes then wedges (mid-frame stall).
+    struct StallingWriter {
+        remaining_accept: usize,
+        written: usize,
+    }
+
+    impl StallingWriter {
+        fn new(accept_first: usize) -> Self {
+            Self {
+                remaining_accept: accept_first,
+                written: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining_accept == 0 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.remaining_accept);
+            self.remaining_accept -= n;
+            self.written += n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Scheme B start gate: a timeout with ZERO bytes of the frame committed is the
+    /// recoverable `WriteTimeout` — NOT a fatal/truncation error. This is the case
+    /// that broke `reverse_iperf3` when it was (wrongly) treated as fatal.
     #[tokio::test]
-    async fn write_timeout_poisons_write_half() {
+    async fn write_start_gate_timeout_is_recoverable() {
+        let mut writer = StallingWriter::new(0); // back-pressured from the first byte
+        let frame = vec![0xAB_u8; 64];
+        let result = write_frame_atomic(
+            &mut writer,
+            &frame,
+            Duration::from_millis(50), // start gate
+            Duration::from_secs(10),   // completion (not reached)
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RustADBError::WriteTimeout)),
+            "a stall before any byte is committed must be the recoverable WriteTimeout (got {result:?})"
+        );
+    }
+
+    /// Scheme B mid-frame: a stall AFTER the frame has started (some bytes already
+    /// on the wire) past the completion deadline is FATAL — a truncated frame is
+    /// unrecoverable, so it must NOT be reported as the recoverable `WriteTimeout`.
+    #[tokio::test]
+    async fn write_mid_frame_stall_is_fatal() {
+        let mut writer = StallingWriter::new(8); // accept 8 bytes, then wedge
+        let frame = vec![0xAB_u8; 64];
+        let result = write_frame_atomic(
+            &mut writer,
+            &frame,
+            Duration::from_millis(50), // start gate (passes — 8 bytes accepted)
+            Duration::from_millis(50), // completion (trips mid-frame)
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::TimedOut),
+            "a stall after the frame started must be a fatal IO timeout, not WriteTimeout (got {result:?})"
+        );
+    }
+
+    /// A frame that fits is written whole with no error.
+    #[tokio::test]
+    async fn write_frame_completes_when_unblocked() {
+        let mut writer = StallingWriter::new(1024); // plenty of room
+        let frame = vec![0xCD_u8; 64];
+        let result = write_frame_atomic(
+            &mut writer,
+            &frame,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a frame that fits must write cleanly (got {result:?})"
+        );
+        assert_eq!(writer.written, 64, "all frame bytes must be committed");
+    }
+
+    /// End-to-end through the transport: a start-gate `WriteTimeout` must NOT poison
+    /// the write half (recoverable), but a mid-frame fatal error MUST poison it.
+    #[tokio::test]
+    async fn write_message_poisons_only_on_fatal() {
         let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .expect("bind loopback listener");
         let addr = listener.local_addr().expect("listener has a local addr");
-
-        // Peer that accepts and then NEVER reads, so once both the kernel send and
-        // receive buffers fill, our write_all blocks and trips the timeout mid-frame.
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.expect("accept");
-            // Hold the socket open without ever reading.
+            // Never read, so the client's OUT buffer fills and writes back-pressure.
             tokio::time::sleep(Duration::from_secs(5)).await;
             drop(sock);
         });
@@ -696,33 +847,49 @@ mod tests {
         let mut transport = TcpTransport::new(addr, "unused-key-path");
         transport.connect().await.expect("connect to loopback");
 
-        // A payload far larger than any socket buffer, with a short write timeout:
-        // write_all cannot complete, so the write times out mid-frame.
-        let big = vec![0xAB_u8; 8 * 1024 * 1024];
+        // A payload far larger than the socket buffer with a short start-gate
+        // timeout. The very first write may accept a chunk (kernel buffer) — but if
+        // it does, the buffer then fills and the next write times out mid-frame
+        // (fatal); if the buffer was already full it's a clean start-gate
+        // WriteTimeout (recoverable). Both outcomes are valid here; we assert the
+        // POISON INVARIANT matches the outcome.
+        let big = vec![0xAB_u8; 16 * 1024 * 1024];
         let msg = ADBTransportMessage::try_new(MessageCommand::Write, 1, 2, &big)
             .expect("build large frame");
         let first = transport
             .write_message_with_timeout(msg, Duration::from_millis(150))
             .await;
-        assert!(
-            first.is_err(),
-            "a write that cannot drain within the timeout must error (got {first:?})"
-        );
 
-        // The write half must now be poisoned: any further write fails fast with
-        // NotConnected instead of corrupting the stream by appending to the truncation.
         let next = ADBTransportMessage::try_new(MessageCommand::Okay, 0, 0, b"")
             .expect("build small frame");
         let second = transport
-            .write_message_with_timeout(next, Duration::from_secs(1))
+            .write_message_with_timeout(next, Duration::from_millis(150))
             .await;
-        assert!(
-            matches!(
-                second,
-                Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::NotConnected
-            ),
-            "after a mid-frame write failure the write half must be poisoned (got {second:?})"
-        );
+
+        match first {
+            Err(RustADBError::WriteTimeout) => {
+                // Recoverable: the half must NOT be poisoned, so the next write is
+                // attempted (it may itself time out, but never NotConnected).
+                assert!(
+                    !matches!(
+                        second,
+                        Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::NotConnected
+                    ),
+                    "a recoverable start-gate WriteTimeout must NOT poison the write half (got {second:?})"
+                );
+            }
+            Err(_) => {
+                // Fatal mid-frame: the half must be poisoned.
+                assert!(
+                    matches!(
+                        second,
+                        Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::NotConnected
+                    ),
+                    "a fatal mid-frame write must poison the write half (got {second:?})"
+                );
+            }
+            Ok(()) => panic!("a 16 MiB write to a non-draining peer should not succeed"),
+        }
 
         server.abort();
     }
