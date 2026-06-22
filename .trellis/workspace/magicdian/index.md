@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 22
+- **Total Sessions**: 23
 - **Last Active**: 2026-06-22
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~959 | Active |
+| `journal-1.md` | ~992 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 23 | 2026-06-22 | TcpTransport split read/write halves — fix interactive shell ~2s lag | `1e28628` | `fix/tcp-transport-split-read-write-halves` |
 | 22 | 2026-06-22 | SEG A nodelay miss — client-facing frontend sockets (TCP shell lag follow-up) | `fd5e624` | `main` |
 | 21 | 2026-06-22 | Per-device capability negotiation (bug 2 of TCP shell report) | `67cc53e` | `main` |
 | 20 | 2026-06-22 | Fix TCP_NODELAY on TcpTransport connect (bug 1 of TCP shell report) | `e90ab60` | `main` |

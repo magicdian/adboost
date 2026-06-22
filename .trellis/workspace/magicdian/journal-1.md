@@ -957,3 +957,36 @@ Follow-up to the reported still-present nodelay lag. Confirmed the earlier fix (
 ### Next Steps
 
 - None - task complete
+
+
+## Session 23: TcpTransport split read/write halves — fix interactive shell ~2s lag
+
+**Date**: 2026-06-22
+**Task**: TcpTransport split read/write halves — fix interactive shell ~2s lag
+**Branch**: `fix/tcp-transport-split-read-write-halves`
+
+### Summary
+
+Root-caused TCP adb shell ~2s/key lag to reader holding a shared Arc<Mutex<socket>> across its 1s read timeout, serializing the writer. Fixed via tokio::io::split into independent read/write half locks (aligning TCP to USB's separate-endpoint design); CurrentConnection now impls AsyncRead/AsyncWrite delegation (no unsafe). TLS upgrade unsplit/re-split preserves STLS timing. set_nodelay kept. Added loopback regression test + spec invariant.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1e28628` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
