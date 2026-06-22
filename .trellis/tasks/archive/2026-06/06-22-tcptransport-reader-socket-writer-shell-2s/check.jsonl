@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "验收时核对读超时契约、payload 越界、magic-only、STLS upgrade 时序未回归"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量门：fmt/clippy pedantic/test 全绿，无 unsafe、无 item 级 allow，含内联测试"}
