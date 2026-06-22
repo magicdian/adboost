@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy --all-targets --features server clean, hermetic test present, MSRV-safe"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify set_nodelay failure is tolerated (logged, connection continues) not propagated as a fatal error"}
