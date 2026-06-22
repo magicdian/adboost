@@ -990,3 +990,42 @@ Root-caused TCP adb shell ~2s/key lag to reader holding a shared Arc<Mutex<socke
 ### Next Steps
 
 - None - task complete
+
+
+## Session 24: Transport cancel-safety bug class: shared FrameReadBuffer + frame-atomic write timeout + hardening
+
+**Date**: 2026-06-22
+**Task**: Transport cancel-safety bug class: shared FrameReadBuffer + frame-atomic write timeout + hardening
+**Branch**: `main`
+
+### Summary
+
+Investigated a TCP read cancel-safety report; a 6-lens adversarial review found it was one of a recurring class ('the async/TCP path lacks a USB robustness guarantee'). Class A (1aac71c): shared sans-io FrameReadBuffer enforcing 'a timeout is never observed mid-frame' — fixes TCP read partial-byte desync (the reported ifconfig disconnect), TCP write truncation poisoning, and USB multi-transfer-field partial loss. Hardening: recv_file short/empty-frame panic guard (23c2078), proxy framebuffer (5bd58ae) and LIST/RECV (f45e91d) unbounded wire-length allocs, is_alive() reflects writer (584dd75). Then fixed a regression the Class A writer teardown introduced — saturating reverse_iperf3 tore down on normal backpressure — with frame-atomic write timeout / Scheme B (ea88205): start-gate WriteTimeout is recoverable, only mid-frame truncation is fatal. Plus selftest reboot_recovery now runs last (bfcd337). All verified by user; quality gate green (fmt, clippy pedantic default+usb, full workspace tests).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1aac71c` | (see git log) |
+| `23c2078` | (see git log) |
+| `5bd58ae` | (see git log) |
+| `f45e91d` | (see git log) |
+| `584dd75` | (see git log) |
+| `ea88205` | (see git log) |
+| `bfcd337` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
