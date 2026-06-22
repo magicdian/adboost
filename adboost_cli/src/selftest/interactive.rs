@@ -63,14 +63,19 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
         return;
     };
 
+    // Ordering invariant: `reboot_recovery` MUST run last. It reboots the device,
+    // which is slow and leaves the device not-yet-ready for a while afterwards, so
+    // any case running after it would race device recovery and flake. Add new
+    // interactive/tcpip cases ABOVE the reboot block, never below it.
     let replug = case_usb_replug(&subject).await;
     record(reporter, "interactive", "usb_replug", replug);
 
-    let reboot = case_reboot_recovery(&subject).await;
-    record(reporter, "interactive", "reboot_recovery", reboot);
-
     let tcpip = case_tcpip_through_server(&subject).await;
     record(reporter, "tcpip", "shell_through_tcp_device", tcpip);
+
+    // ALWAYS LAST — see the ordering invariant above.
+    let reboot = case_reboot_recovery(&subject).await;
+    record(reporter, "interactive", "reboot_recovery", reboot);
 }
 
 /// End-to-end tcpip closed loop (`PR4b`): switch a USB device to TCP/IP mode,
