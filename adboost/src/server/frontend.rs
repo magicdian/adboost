@@ -135,6 +135,8 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     continue;
                 }
             };
+            // SEG A: low-latency interactive echo for this client socket.
+            enable_client_nodelay(&stream, peer);
             let me = Arc::clone(&shared);
             tokio::spawn(async move {
                 if let Err(e) = me.handle_client(stream).await {
@@ -1084,6 +1086,25 @@ fn reply_or_overflow(reply: Option<Vec<u8>>) -> Vec<u8> {
     reply.unwrap_or_else(|| protocol::fail("reply too large"))
 }
 
+/// Enable `TCP_NODELAY` on a freshly-accepted **client-facing** socket (SEG A:
+/// `adb`/`scrcpy` client → adboost frontend).
+///
+/// Interactive shell echo is a small-packet round-trip (one keystroke → one
+/// echoed byte); with Nagle on, every keystroke's echo is held an extra RTT
+/// waiting to coalesce, so the shell visibly lags. The device-facing hop (SEG B)
+/// already sets this; the client hop must too, since it carries both the
+/// small-packet host-protocol handshake and the bridged interactive stream.
+///
+/// Unlike the SEG B `connect()` path, a failure here must NOT drop the
+/// connection: this is an already-accepted, live client socket mid-serve, and
+/// Nagle-on is a latency regression, not a correctness failure. Log and proceed
+/// (mirrors the reverse host-dial pattern in `reverse_engine.rs`).
+fn enable_client_nodelay(stream: &TcpStream, peer: SocketAddr) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("client {peer}: set_nodelay failed: {e}");
+    }
+}
+
 /// Host-side `forward` accept loop: for every inbound TCP connection on
 /// `listener`, open `tcp:<remote_port>` on the device `serial` via `backend`
 /// and bridge the two byte streams. Runs until the task is aborted (rule removed
@@ -1106,6 +1127,8 @@ async fn run_forward_listener<B: DeviceBackend>(
                 continue;
             }
         };
+        // SEG A: low-latency interactive echo for this forwarded-port client.
+        enable_client_nodelay(&client, peer);
         let backend = Arc::clone(&backend);
         let serial = serial.clone();
         tokio::spawn(async move {
@@ -1229,6 +1252,29 @@ mod tests {
         let _ = client.read_to_end(&mut buf).await;
         server.await.expect("server task");
         buf
+    }
+
+    /// SEG A regression: a client socket accepted by the frontend must have
+    /// `TCP_NODELAY` enabled, so interactive shell echo is not held an RTT by
+    /// Nagle. Drives a real loopback accept (the established harness) and asserts
+    /// the *server-side* accepted socket reports `nodelay() == true`.
+    #[tokio::test]
+    async fn accepted_client_socket_has_nodelay_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            enable_client_nodelay(&stream, peer);
+            stream.nodelay().expect("nodelay getter")
+        });
+
+        let _client = TcpStream::connect(addr).await.expect("connect");
+        let nodelay = server.await.expect("server task");
+        assert!(
+            nodelay,
+            "accepted client socket must have TCP_NODELAY enabled (SEG A)"
+        );
     }
 
     #[tokio::test]
