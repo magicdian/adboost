@@ -110,10 +110,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                     }
                 }
             }
-            if ReadBytesExt::read_u32::<byteorder::LittleEndian>(&mut Cursor::new(
-                &payload[(payload.len() - 8)..(payload.len() - 4)],
-            ))? == MessageSubcommand::Done as u32
-            {
+            if payload_ends_with_done(&payload)? {
                 break;
             }
         }
@@ -212,6 +209,85 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         // Interesting part starts right after
 
         AdbStatResponse::decode(&response.into_payload()[4..])
+    }
+}
+
+/// Whether a sync-pull data payload ends with the `DONE` trailer.
+///
+/// The trailer's subcommand word occupies bytes `[len-8 .. len-4]`. A sync frame
+/// may legitimately carry a `data_length` of 0 (and a hostile/buggy device can
+/// send any length below 8), so the trailer must be located with checked
+/// arithmetic: indexing `payload[len-8..]` directly would underflow `usize` and
+/// panic the task on a short or empty device frame. A too-short payload is a
+/// structured protocol error, not a panic.
+fn payload_ends_with_done(payload: &[u8]) -> Result<bool> {
+    let trailer = payload
+        .len()
+        .checked_sub(8)
+        .and_then(|start| payload.get(start..start + 4))
+        .ok_or(RustADBError::ConversionError)?;
+    Ok(
+        ReadBytesExt::read_u32::<byteorder::LittleEndian>(&mut Cursor::new(trailer))?
+            == MessageSubcommand::Done as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payload_ends_with_done;
+    use crate::{RustADBError, message_devices::message_commands::MessageSubcommand};
+
+    /// A valid DONE trailer (subcommand word in the last 8 bytes) is detected.
+    #[test]
+    fn detects_done_trailer() {
+        // 4 leading bytes, then the DONE subcommand word, then 4 trailing bytes:
+        // the word sits at [len-8 .. len-4].
+        let mut payload = vec![0_u8; 4];
+        payload.extend_from_slice(&(MessageSubcommand::Done as u32).to_le_bytes());
+        payload.extend_from_slice(&[0_u8; 4]);
+        assert!(
+            payload_ends_with_done(&payload).expect("well-formed payload parses"),
+            "the DONE subcommand word at [len-8..len-4] must be detected"
+        );
+    }
+
+    /// A trailer that is not DONE returns false (keep reading), not an error.
+    #[test]
+    fn non_done_trailer_is_false() {
+        let mut payload = vec![0_u8; 4];
+        payload.extend_from_slice(&(MessageSubcommand::Data as u32).to_le_bytes());
+        payload.extend_from_slice(&[0_u8; 4]);
+        assert!(
+            !payload_ends_with_done(&payload).expect("well-formed payload parses"),
+            "a non-DONE trailer must report false, not error"
+        );
+    }
+
+    /// Regression lock: an empty (0-byte) device frame is a VALID frame and must
+    /// not panic via `len - 8` underflow — it returns a structured error instead.
+    #[test]
+    fn empty_payload_does_not_panic() {
+        assert!(
+            matches!(
+                payload_ends_with_done(&[]),
+                Err(RustADBError::ConversionError)
+            ),
+            "an empty payload must yield ConversionError, never a usize-underflow panic"
+        );
+    }
+
+    /// Any payload shorter than the 8-byte trailer is likewise rejected cleanly.
+    #[test]
+    fn short_payload_does_not_panic() {
+        for len in 1..8 {
+            assert!(
+                matches!(
+                    payload_ends_with_done(&vec![0_u8; len]),
+                    Err(RustADBError::ConversionError)
+                ),
+                "a {len}-byte payload (shorter than the trailer) must error, not panic"
+            );
+        }
     }
 }
 
