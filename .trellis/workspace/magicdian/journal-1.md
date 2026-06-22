@@ -858,3 +858,36 @@ Completed the long-deferred library crate rename adb_client -> adboost across th
 ### Next Steps
 
 - None - task complete
+
+
+## Session 20: Fix TCP_NODELAY on TcpTransport connect (bug 1 of TCP shell report)
+
+**Date**: 2026-06-22
+**Task**: Fix TCP_NODELAY on TcpTransport connect (bug 1 of TCP shell report)
+**Branch**: `main`
+
+### Summary
+
+External bug report (TCP/IP host:connect shell). Verified both reported bugs in source. Bug 1 (fixed): TcpTransport::connect never set TCP_NODELAY, so interactive adb shell over host:connect lagged a keystroke-RTT each (Nagle). Added set_nodelay(true) after socket build (also covers TLS upgrade, same socket) + hermetic loopback unit test. Bug 2 (per-device shell_v2 over-advertising via global capabilities()) confirmed real but DEFERRED to a separate task+brainstorm; report's premise that device_features() already exposes the device's banner features is WRONG — that field is what adboost advertises TO the device; the device banner is parsed only for delayed_ack and the full set is discarded, so a real fix needs new banner-feature plumbing. Testbed: hypervisor Yocto-Linux stripped adbd reached via Android tcp:6665 forward — one backend genuinely fronts two devices with different caps.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e90ab60` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
