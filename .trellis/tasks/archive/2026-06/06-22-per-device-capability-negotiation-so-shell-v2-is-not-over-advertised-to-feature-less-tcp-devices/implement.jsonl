@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "the per-device host:features replies + shell,v2/sync gates live in frontend.rs; this is the host-protocol contract (transport selection, error wording matrix) those paths must keep parity with"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "CNXN banner parsing: from_banner must respect the no-trim / NUL caveats this contract documents (same family as banner_advertises_delayed_ack); feature CSV semantics"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "new gate fallback returns AOSP-style FAIL reasons; device_capabilities returns Option not Result — confirm RustADBError vs Option conventions"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "MSRV 1.88.0, pedantic clippy, testing style for the new parser + intersection + frontend unit tests"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "where the new pieces belong (models vs server vs usb module layout, backend trait seam conventions)"}
