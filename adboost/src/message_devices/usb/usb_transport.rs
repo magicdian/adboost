@@ -11,17 +11,20 @@ use crate::{
     Result, RustADBError,
     adb_transport::ADBTransport,
     message_devices::{
-        adb_message_transport::ADBMessageTransport,
-        adb_transport_message::{
-            ADBTransportMessage, ADBTransportMessageHeader, MAX_PAYLOAD, payload_len_within_bound,
-        },
-        message_commands::MessageCommand,
+        adb_message_transport::ADBMessageTransport, adb_transport_message::ADBTransportMessage,
+        framed_read::FrameReadBuffer, message_commands::MessageCommand,
     },
 };
 
 const ADB_CLASS: u8 = 0xFF;
 const ADB_SUBCLASS: u8 = 0x42;
 const ADB_PROTOCOL: u8 = 0x01;
+
+/// Target byte length of a single bulk IN transfer while draining the read
+/// stream (rounded up to a max-packet multiple before use). Large enough that a
+/// 1 MiB payload drains in a handful of transfers rather than thousands; a short
+/// packet still ends a transfer early, and any over-read is carried by the buffer.
+const READ_TRANSFER_LEN: usize = 64 * 1024;
 
 /// Address + max-packet-size pair for a discovered bulk endpoint.
 #[derive(Clone, Copy, Debug)]
@@ -56,14 +59,15 @@ struct Connection {
     interface: Option<Interface>,
     read_endpoint: Option<nusb::Endpoint<Bulk, In>>,
     read_info: Option<EndpointInfo>,
-    /// Bytes received by a bulk IN completion that overshot the logically
-    /// requested length (the next frame's header — or the start of a payload —
-    /// that the device/host controller coalesced into the same transfer as the
-    /// current frame). They are carried here and consumed by the *next*
-    /// [`read_exact`] before another transfer is submitted, so the framed stream
-    /// stays aligned. See [`read_exact`] for why this happens on the reverse
-    /// (device→host bulk) path.
-    read_residual: Vec<u8>,
+    /// Persistent, cancel-safe frame accumulation buffer. A bulk IN completion can
+    /// return more than the current frame needs (the device/host controller
+    /// coalesces a frame's tail and the next frame's header into one transfer), and
+    /// a frame field can span multiple transfers. Holding all received bytes here
+    /// across calls means a mid-frame timeout (a `Cancelled` transfer mapped to
+    /// [`RustADBError::ReadTimeout`]) loses nothing: the next call resumes from the
+    /// buffered bytes, so the framed stream stays aligned. See
+    /// [`FrameReadBuffer`](crate::message_devices::framed_read::FrameReadBuffer).
+    read_buffer: FrameReadBuffer,
 }
 
 #[derive(Debug, Default)]
@@ -316,8 +320,8 @@ impl ADBTransport for USBTransport {
         connection.interface = Some(interface);
         // Drop any bytes carried over from a previous connection's framed stream:
         // a fresh CNXN handshake must never consume a stale CLSE/WRTE left in the
-        // residual buffer (that desyncs the handshake — "expected CNXN, got CLSE").
-        connection.read_residual.clear();
+        // read buffer (that desyncs the handshake — "expected CNXN, got CLSE").
+        connection.read_buffer.clear();
 
         Ok(())
     }
@@ -345,7 +349,7 @@ impl ADBTransport for USBTransport {
         let mut connection = self.connection.lock().await;
         connection.read_endpoint = None;
         connection.interface = None;
-        connection.read_residual.clear();
+        connection.read_buffer.clear();
         tracing::debug!("succesfully released interface");
 
         Ok(())
@@ -384,12 +388,12 @@ impl ADBMessageTransport for USBTransport {
                 "no read endpoint setup",
             )))?
             .max_packet_size;
-        // Split the borrow: the IN transfer needs `&mut read_endpoint`, while the
-        // overflow carry-over needs `&mut read_residual`. Reborrowing the struct
-        // fields individually keeps both alive across the await inside `read_exact`.
+        // Split the borrow: the IN transfer needs `&mut read_endpoint`, while frame
+        // assembly needs `&mut read_buffer`. Reborrowing the struct fields
+        // individually keeps both alive across the await inside `read_into_buffer`.
         let Connection {
             read_endpoint,
-            read_residual,
+            read_buffer,
             ..
         } = &mut *connection;
         let endpoint = read_endpoint
@@ -399,126 +403,65 @@ impl ADBMessageTransport for USBTransport {
                 "no read endpoint setup",
             )))?;
 
-        let mut data = [0u8; 24];
-        read_exact(endpoint, read_residual, &mut data, max_packet_size, timeout).await?;
-
-        let header = ADBTransportMessageHeader::try_from(data)?;
-        tracing::trace!("received header {header:?}");
-
-        // Bound the wire data_length BEFORE allocating (AOSP check_header clause:
-        // reject data_length > MAX_PAYLOAD before reading the payload). A hostile or
-        // corrupt 24-byte header could otherwise drive a ~4 GiB allocation.
-        if !payload_len_within_bound(header.data_length()) {
-            return Err(RustADBError::ADBRequestFailed(format!(
-                "frame data_length {} exceeds MAX_PAYLOAD {MAX_PAYLOAD}",
-                header.data_length()
-            )));
+        // All framing (header decode, data_length bound check, payload assembly,
+        // magic integrity) lives in the shared cancel-safe FrameReadBuffer. The
+        // timeout is applied to each individual bulk-IN transfer, never mid-frame:
+        // a `Cancelled` (timed-out) transfer surfaces ReadTimeout with every
+        // already-received byte still buffered, so the stream stays aligned.
+        loop {
+            if let Some(message) = read_buffer.try_parse()? {
+                tracing::trace!("received frame {:?}", message.header());
+                return Ok(message);
+            }
+            read_into_buffer(endpoint, read_buffer, max_packet_size, timeout).await?;
         }
-
-        let payload = if header.data_length() != 0 {
-            let mut msg_data = vec![0_u8; header.data_length() as usize];
-            read_exact(
-                endpoint,
-                read_residual,
-                &mut msg_data,
-                max_packet_size,
-                timeout,
-            )
-            .await?;
-            msg_data
-        } else {
-            vec![]
-        };
-
-        let message = ADBTransportMessage::from_header_and_payload(header, payload);
-
-        // Check message integrity (magic-only; runs for every frame, AOSP-faithful)
-        if !message.check_message_integrity() {
-            return Err(RustADBError::InvalidIntegrity(
-                ADBTransportMessageHeader::compute_magic(message.header().command()),
-                message.header().magic(),
-            ));
-        }
-
-        Ok(message)
     }
 }
 
-/// Read exactly `out.len()` bytes from a bulk IN endpoint into `out`, carrying
-/// any over-read bytes across calls via `residual`.
+/// Issue ONE bulk IN transfer and append everything it returns to `buffer`.
 ///
 /// `nusb` requires the requested length of an IN transfer to be a nonzero
-/// multiple of `max_packet_size`, and a short packet ends the transfer early.
-/// We therefore request `max_packet_size`-aligned buffers and accumulate until
-/// `out` is filled.
+/// multiple of `max_packet_size`, and a short packet ends the transfer early. We
+/// request a `max_packet_size`-aligned buffer and hand whatever arrives to the
+/// shared [`FrameReadBuffer`], which owns frame assembly and over-read carry-over.
 ///
-/// # Why over-read happens (and must be carried, not discarded)
+/// # Why all received bytes go to the buffer (not a per-field copy)
 ///
-/// A bulk IN completion can return up to `request_len` (the aligned length)
-/// bytes, which may be MORE than the `out.len()` we logically need for the
-/// current frame field. Under sustained device→host throughput (the `reverse`
-/// data plane) the device/host controller coalesces a frame's payload tail and
-/// the *next* frame's 24-byte header (or the start of the next payload) into one
-/// transfer. Earlier code treated this overshoot as a fatal "frame desync"
-/// error, which tore the whole multiplexed connection down on the first bulk
-/// reverse frame (every session's channel closed → 0 bytes transferred).
-///
-/// The correct behavior — matching a normal buffered stream reader — is to copy
-/// out exactly what the current field needs and stash the remainder in
-/// `residual`, consuming it first on the next call. This keeps the framed stream
-/// aligned without a fatal error. (The forward/opener path never tripped this
-/// because device→host reads there are small/aligned control frames.)
-async fn read_exact(
+/// A bulk IN completion can return MORE than the current frame needs: under
+/// sustained device→host throughput (the `reverse` data plane) the device/host
+/// controller coalesces a frame's payload tail and the *next* frame's 24-byte
+/// header (or the start of the next payload) into one transfer. It can also
+/// return LESS (a short packet), so a single frame field may span several
+/// transfers. The previous code read directly into a per-call `out` buffer and
+/// only stashed the *overshoot*; bytes already copied into `out` were lost if a
+/// later transfer in the same field timed out, desyncing the stream. Pushing
+/// every received byte into the persistent `FrameReadBuffer` makes a timed-out
+/// transfer lossless: the buffer keeps what arrived and the next call resumes.
+async fn read_into_buffer(
     endpoint: &mut nusb::Endpoint<Bulk, In>,
-    residual: &mut Vec<u8>,
-    out: &mut [u8],
+    buffer: &mut FrameReadBuffer,
     max_packet_size: usize,
     timeout: Duration,
 ) -> Result<()> {
-    let mut offset = 0;
+    // Request a sizeable, max-packet-aligned buffer so a large payload is drained
+    // in few transfers (a short packet still ends the transfer early; nusb then
+    // returns fewer bytes). A short packet or coalesced over-read is handled by the
+    // buffer either way, so the exact request size only trades transfer count.
+    let request_len = aligned_request_len(READ_TRANSFER_LEN, max_packet_size);
+    let completion = transfer_with_timeout(endpoint, Buffer::new(request_len), timeout).await;
+    map_transfer_status(completion.status)?;
 
-    // Drain any bytes left over from a previous over-read first.
-    if !residual.is_empty() {
-        let take = residual.len().min(out.len());
-        out[..take].copy_from_slice(&residual[..take]);
-        residual.drain(..take);
-        offset += take;
+    let received = &completion.buffer[..completion.actual_len];
+    if received.is_empty() {
+        // A zero-length completion with no error would otherwise spin forever.
+        return Err(RustADBError::IOError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "USB bulk read returned no data",
+        )));
     }
 
-    while offset < out.len() {
-        let remaining = out.len() - offset;
-        // Align the requested length up to a nonzero multiple of the max packet size.
-        let request_len = aligned_request_len(remaining, max_packet_size);
-        let completion = transfer_with_timeout(endpoint, Buffer::new(request_len), timeout).await;
-        map_transfer_status(completion.status)?;
-
-        let received = &completion.buffer[..completion.actual_len];
-        if received.is_empty() {
-            // A zero-length completion with no error would otherwise spin forever.
-            return Err(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "USB bulk read returned no data",
-            )));
-        }
-
-        // Copy what this frame field needs; stash any overshoot for the next call.
-        let copy_len = fill_and_carry(received, &mut out[offset..], residual);
-        offset += copy_len;
-    }
+    buffer.push(received);
     Ok(())
-}
-
-/// Copy as much of `received` as fits into `dst`, returning the number of bytes
-/// written. Any bytes beyond `dst.len()` are appended to `residual` (the
-/// over-read carry-over for the next [`read_exact`] field). Pure / I/O-free so
-/// the over-read carry logic is unit-testable.
-fn fill_and_carry(received: &[u8], dst: &mut [u8], residual: &mut Vec<u8>) -> usize {
-    let copy_len = received.len().min(dst.len());
-    dst[..copy_len].copy_from_slice(&received[..copy_len]);
-    if received.len() > copy_len {
-        residual.extend_from_slice(&received[copy_len..]);
-    }
-    copy_len
 }
 
 /// Round `remaining` up to a nonzero multiple of `max_packet_size`.
@@ -532,7 +475,7 @@ fn aligned_request_len(remaining: usize, max_packet_size: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{aligned_request_len, fill_and_carry, map_transfer_status};
+    use super::{aligned_request_len, map_transfer_status};
     use crate::RustADBError;
     use nusb::transfer::TransferError;
 
@@ -601,56 +544,6 @@ mod tests {
             aligned_request_len(65, 64),
             128,
             "65 bytes -> two 64 packets"
-        );
-    }
-
-    #[test]
-    fn fill_and_carry_exact_fit_leaves_no_residual() {
-        // A completion that exactly fills the requested field: copy all, no carry.
-        let mut dst = [0u8; 4];
-        let mut residual = Vec::new();
-        let n = fill_and_carry(&[1, 2, 3, 4], &mut dst, &mut residual);
-        assert_eq!(n, 4, "all 4 bytes copied");
-        assert_eq!(dst, [1, 2, 3, 4]);
-        assert!(residual.is_empty(), "exact fit → no residual");
-    }
-
-    #[test]
-    fn fill_and_carry_overshoot_stashes_remainder() {
-        // The reverse-data-plane case: the device coalesced the next frame's
-        // header into this transfer. Copy only what `dst` needs; carry the rest.
-        let mut dst = [0u8; 2];
-        let mut residual = Vec::new();
-        let n = fill_and_carry(&[10, 20, 30, 40, 50], &mut dst, &mut residual);
-        assert_eq!(n, 2, "only 2 bytes fit dst");
-        assert_eq!(dst, [10, 20]);
-        assert_eq!(residual, vec![30, 40, 50], "overshoot carried to residual");
-    }
-
-    #[test]
-    fn fill_and_carry_short_packet_partial_fill() {
-        // A short packet (fewer bytes than the field needs): copy what arrived,
-        // no carry; the caller loops for the rest.
-        let mut dst = [0u8; 8];
-        let mut residual = Vec::new();
-        let n = fill_and_carry(&[1, 2, 3], &mut dst, &mut residual);
-        assert_eq!(n, 3, "only 3 bytes arrived");
-        assert_eq!(&dst[..3], &[1, 2, 3]);
-        assert!(residual.is_empty(), "short packet → nothing to carry");
-    }
-
-    #[test]
-    fn fill_and_carry_appends_to_existing_residual() {
-        // Residual accumulates across calls without clobbering prior carry-over.
-        let mut dst = [0u8; 1];
-        let mut residual = vec![99];
-        let n = fill_and_carry(&[7, 8, 9], &mut dst, &mut residual);
-        assert_eq!(n, 1);
-        assert_eq!(dst, [7]);
-        assert_eq!(
-            residual,
-            vec![99, 8, 9],
-            "new overshoot appended after existing"
         );
     }
 }

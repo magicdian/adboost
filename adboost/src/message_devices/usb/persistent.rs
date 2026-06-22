@@ -1236,20 +1236,32 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     #[tracing::instrument(name = "writer", skip(transport, writer_rx))]
     async fn writer_loop(mut transport: T, mut writer_rx: mpsc::Receiver<OutboundFrame>) {
         while let Some(frame) = writer_rx.recv().await {
-            match frame {
-                OutboundFrame::FireForget(msg) => {
-                    if let Err(e) = transport.write_message(msg).await {
-                        tracing::warn!("PersistentUsb writer: fire-and-forget write failed: {e}");
-                    }
-                }
+            // A write error means the transport could not put a whole frame on the
+            // wire. `write_message_with_timeout` leaves a partial frame unrecoverable
+            // for the framed peer and poisons its write half, so the byte stream to
+            // the device is now desynced: pumping the NEXT frame would append it to
+            // the truncation and corrupt every session on this connection. The write
+            // direction is therefore fatal — stop the loop instead of warn-and-
+            // continue. The reader side observes the closed transport and tears the
+            // rest of the connection down.
+            let write_result = match frame {
+                OutboundFrame::FireForget(msg) => transport.write_message(msg).await,
                 OutboundFrame::WithAck(msg, ack) => {
-                    let result = transport
-                        .write_message(msg)
-                        .await
-                        .map_err(|e| io::Error::other(e.to_string()));
-                    // The receiver may have been cancelled (dropped); ignore.
-                    let _ = ack.send(result);
+                    let result = transport.write_message(msg).await;
+                    // Surface the per-frame result to the WRTE caller before we
+                    // decide to break; the receiver may have been dropped — ignore.
+                    let ack_result = match &result {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(io::Error::other(e.to_string())),
+                    };
+                    let _ = ack.send(ack_result);
+                    result
                 }
+            };
+
+            if let Err(e) = write_result {
+                tracing::warn!("PersistentUsb writer: write failed, tearing down writer: {e}");
+                break;
             }
         }
         tracing::debug!("PersistentUsb writer task exiting");

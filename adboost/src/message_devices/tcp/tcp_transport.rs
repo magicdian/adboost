@@ -15,11 +15,8 @@ use crate::{
     Result, RustADBError,
     adb_transport::ADBTransport,
     message_devices::{
-        adb_message_transport::ADBMessageTransport,
-        adb_transport_message::{
-            ADBTransportMessage, ADBTransportMessageHeader, MAX_PAYLOAD, payload_len_within_bound,
-        },
-        message_commands::MessageCommand,
+        adb_message_transport::ADBMessageTransport, adb_transport_message::ADBTransportMessage,
+        framed_read::FrameReadBuffer, message_commands::MessageCommand,
     },
 };
 use std::{
@@ -96,26 +93,82 @@ impl AsyncWrite for CurrentConnection {
     }
 }
 
-/// Read exactly `buf.len()` bytes from the read half, failing with the
-/// transport-neutral [`RustADBError::ReadTimeout`] if `timeout` elapses first.
+/// Size of one socket read issued while assembling a frame. The read fills as
+/// much of this scratch buffer as the kernel has available; whatever arrives is
+/// appended to the persistent [`FrameReadBuffer`], so the exact value only trades
+/// syscall count against transient memory and never affects correctness.
+const READ_CHUNK_LEN: usize = 64 * 1024;
+
+/// A frame reader: the socket read half plus its persistent, cancel-safe
+/// accumulation buffer.
 ///
-/// Returning `ReadTimeout` (not `IOError(ErrorKind::TimedOut)`) honors the
-/// [`ADBMessageTransport::read_message_with_timeout`] contract so the
-/// transport-generic persistent reader treats a TCP idle timeout as a
-/// keep-looping condition, not a fatal transport error.
-///
-/// [`ADBMessageTransport::read_message_with_timeout`]: crate::message_devices::adb_message_transport::ADBMessageTransport::read_message_with_timeout
-async fn read_exact_timeout(
-    reader: &mut ReadHalf<CurrentConnection>,
-    buf: &mut [u8],
-    timeout: Duration,
-) -> Result<()> {
-    match tokio::time::timeout(timeout, reader.read_exact(buf)).await {
-        Ok(res) => {
-            res?;
-            Ok(())
+/// The buffer is the whole point. The previous implementation wrapped
+/// [`tokio::io::AsyncReadExt::read_exact`] in [`tokio::time::timeout`], but
+/// `read_exact` is **not cancel-safe**: on a timeout the future is dropped and the
+/// bytes it had already moved into the call-local buffer are lost, so the next
+/// read began mid-frame and permanently desynced the multiplexed stream (an
+/// illegal command word → fatal [`RustADBError::ConversionError`] → connection
+/// torn down). By holding [`FrameReadBuffer`] across calls and only ever timing
+/// out a *single* chunk read that appends into it, a cancelled read loses nothing
+/// — every received byte is already buffered — mirroring the USB transport's
+/// `read_residual` + atomic-transfer-cancellation guarantee.
+#[derive(Debug)]
+struct FrameReader {
+    reader: ReadHalf<CurrentConnection>,
+    buffer: FrameReadBuffer,
+    /// Reusable heap scratch for one socket read. Kept on the struct (not the
+    /// stack) so it does not inflate the size of the read future — a 64 KiB stack
+    /// array held across the `.await` would bloat every caller's future.
+    scratch: Box<[u8]>,
+}
+
+impl FrameReader {
+    fn new(reader: ReadHalf<CurrentConnection>) -> Self {
+        Self {
+            reader,
+            buffer: FrameReadBuffer::new(),
+            scratch: vec![0_u8; READ_CHUNK_LEN].into_boxed_slice(),
         }
-        Err(_elapsed) => Err(RustADBError::ReadTimeout),
+    }
+
+    /// Read one complete framed message, applying `timeout` to each individual
+    /// socket read (per-read idle timeout).
+    ///
+    /// Returns the transport-neutral [`RustADBError::ReadTimeout`] only when a
+    /// read deadline elapses with **no** complete frame buffered — i.e. at a frame
+    /// boundary, never mid-frame. Returning `ReadTimeout` (not
+    /// `IOError(ErrorKind::TimedOut)`) honors the
+    /// [`ADBMessageTransport::read_message_with_timeout`] contract so the
+    /// transport-generic persistent reader treats a TCP idle timeout as a
+    /// keep-looping condition, not a fatal transport error.
+    ///
+    /// [`ADBMessageTransport::read_message_with_timeout`]: crate::message_devices::adb_message_transport::ADBMessageTransport::read_message_with_timeout
+    async fn read_message(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+        loop {
+            // Emit a frame the moment a whole one is buffered (including a frame
+            // already complete from a previous call's over-read). Bytes are
+            // consumed from the buffer only on a full frame, so this is the only
+            // place the stream advances.
+            if let Some(message) = self.buffer.try_parse()? {
+                return Ok(message);
+            }
+
+            // No complete frame yet: read one more chunk. The timeout wraps just
+            // this single read, so a cancellation can only ever land *between*
+            // reads — with everything received so far already in `self.buffer`.
+            let n = match tokio::time::timeout(timeout, self.reader.read(&mut self.scratch)).await {
+                Ok(res) => res?,
+                Err(_elapsed) => return Err(RustADBError::ReadTimeout),
+            };
+            if n == 0 {
+                // Clean EOF: the peer closed the connection between frames.
+                return Err(RustADBError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "TCP connection closed by peer",
+                )));
+            }
+            self.buffer.push(&self.scratch[..n]);
+        }
     }
 }
 
@@ -143,8 +196,10 @@ async fn write_all_timeout(
 /// Type aliases for the two ends of the split connection. Each is wrapped in
 /// `Option<_>` *inside* its own async mutex so the halves can be taken out,
 /// `unsplit` back into a whole `CurrentConnection` for the TLS handshake, and the
-/// re-split halves put back — all without cloning the socket.
-type ReadGuard = Arc<Mutex<Option<ReadHalf<CurrentConnection>>>>;
+/// re-split halves put back — all without cloning the socket. The read side
+/// carries its [`FrameReadBuffer`] (inside [`FrameReader`]) so partial-frame bytes
+/// survive across reads.
+type ReadGuard = Arc<Mutex<Option<FrameReader>>>;
 type WriteGuard = Arc<Mutex<Option<WriteHalf<CurrentConnection>>>>;
 
 /// Transport running over TCP/IP.
@@ -185,7 +240,7 @@ impl TcpTransport {
     /// and `upgrade_connection` (re-split after the TLS handshake).
     fn set_connection(&mut self, connection: CurrentConnection) {
         let (read, write) = tokio::io::split(connection);
-        self.read_half = Some(Arc::new(Mutex::new(Some(read))));
+        self.read_half = Some(Arc::new(Mutex::new(Some(FrameReader::new(read)))));
         self.write_half = Some(Arc::new(Mutex::new(Some(write))));
     }
 
@@ -249,42 +304,11 @@ impl ADBMessageTransport for TcpTransport {
         let mut guard = read_lock.lock().await;
         let reader = half_mut(&mut guard)?;
 
-        let mut data = [0; 24];
-        read_exact_timeout(reader, &mut data, read_timeout).await?;
-
-        let header = ADBTransportMessageHeader::try_from(data)?;
-
-        // Bound the wire data_length BEFORE allocating (AOSP check_header clause:
-        // reject data_length > MAX_PAYLOAD before reading the payload). A hostile or
-        // corrupt 24-byte header could otherwise drive a ~4 GiB allocation.
-        if !payload_len_within_bound(header.data_length()) {
-            return Err(RustADBError::ADBRequestFailed(format!(
-                "frame data_length {} exceeds MAX_PAYLOAD {MAX_PAYLOAD}",
-                header.data_length()
-            )));
-        }
-
-        let payload = if header.data_length() != 0 {
-            let mut msg_data = vec![0_u8; header.data_length() as usize];
-            read_exact_timeout(reader, &mut msg_data, read_timeout).await?;
-            msg_data
-        } else {
-            vec![]
-        };
-        // reader is not used anymore, let's drop the guard
-        drop(guard);
-
-        let message = ADBTransportMessage::from_header_and_payload(header, payload);
-
-        // Check message integrity (magic-only; runs for every frame, AOSP-faithful)
-        if !message.check_message_integrity() {
-            return Err(RustADBError::InvalidIntegrity(
-                ADBTransportMessageHeader::compute_magic(message.header().command()),
-                message.header().magic(),
-            ));
-        }
-
-        Ok(message)
+        // All framing (header decode, data_length bound check, payload assembly,
+        // magic integrity) lives in the shared cancel-safe FrameReadBuffer; the
+        // per-read timeout is applied to each socket read inside `read_message`,
+        // never mid-frame.
+        reader.read_message(read_timeout).await
     }
 
     async fn write_message_with_timeout(
@@ -297,14 +321,33 @@ impl ADBMessageTransport for TcpTransport {
         let mut guard = write_lock.lock().await;
         let writer = half_mut(&mut guard)?;
 
-        write_all_timeout(writer, &message_bytes, write_timeout).await?;
-
+        // A frame is header followed by payload. `write_all` is NOT cancel-safe and
+        // reports no partial count on error, so ANY failure here (a timeout that
+        // drops the write future mid-flush, or an IO error) may have left an
+        // unknown-length prefix of the frame on the wire — a truncated frame the
+        // framed peer cannot recover from. Writing the next frame after that would
+        // append it to the truncation and permanently desync the device-bound
+        // stream. So on any error we POISON the write half (take it out of the
+        // guard): every subsequent write then fails fast with NotConnected instead
+        // of corrupting the stream, and the connection is torn down. This mirrors
+        // the read path's invariant — a partial frame must never be silently
+        // followed by the next one.
         let payload = message.into_payload();
-        if !payload.is_empty() {
-            write_all_timeout(writer, &payload, write_timeout).await?;
+        let result = async {
+            write_all_timeout(writer, &message_bytes, write_timeout).await?;
+            if !payload.is_empty() {
+                write_all_timeout(writer, &payload, write_timeout).await?;
+            }
+            Ok(())
         }
+        .await;
 
-        Ok(())
+        if result.is_err() {
+            // Poison: drop the write half so the truncated stream is never written
+            // to again.
+            *guard = None;
+        }
+        result
     }
 
     async fn upgrade_connection(&mut self) -> Result<()> {
@@ -329,13 +372,16 @@ impl ADBMessageTransport for TcpTransport {
                 ));
             };
 
-            // Reassemble the full-duplex socket from the two halves.
-            let tcp_stream = match read_half.unsplit(write_half) {
+            // Reassemble the full-duplex socket from the two halves. The frame
+            // buffer is dropped here: a fresh stream (the TLS session) starts with
+            // an empty buffer, and carrying any pre-upgrade plaintext bytes into
+            // the encrypted stream would itself desync it.
+            let tcp_stream = match read_half.reader.unsplit(write_half) {
                 CurrentConnection::Tcp(tcp_stream) => tcp_stream,
                 tls @ CurrentConnection::Tls(_) => {
                     // Put it back (re-split); cannot upgrade an already-TLS connection.
                     let (read, write) = tokio::io::split(tls);
-                    *read_guard = Some(read);
+                    *read_guard = Some(FrameReader::new(read));
                     *write_guard = Some(write);
                     return Err(RustADBError::UpgradeError(
                         "cannot upgrade a TLS connection...".into(),
@@ -361,7 +407,7 @@ impl ADBMessageTransport for TcpTransport {
             // Async TLS handshake; consumes the TcpStream, no ownership swap.
             let tls_stream = connector.connect(server_name, tcp_stream).await?;
             let (read, write) = tokio::io::split(CurrentConnection::Tls(Box::new(tls_stream)));
-            *read_guard = Some(read);
+            *read_guard = Some(FrameReader::new(read));
             *write_guard = Some(write);
         }
 
@@ -441,6 +487,22 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::TcpListener;
 
+    /// Read one frame, tolerating `ReadTimeout` exactly as the persistent reader
+    /// loop does (`ReadTimeout` => keep looping). The cancel-safety bug would
+    /// instead surface a fatal `ConversionError` once the stream desynced.
+    async fn read_one(t: &mut TcpTransport) -> Result<ADBTransportMessage> {
+        loop {
+            match t
+                .read_message_with_timeout(Duration::from_millis(100))
+                .await
+            {
+                Ok(msg) => return Ok(msg),
+                Err(RustADBError::ReadTimeout) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// `connect()` must disable Nagle on the freshly-built socket. ADB mux over
     /// TCP is small-packet + interactive, so leaving Nagle on adds a per-keystroke
     /// RTT of lag in `adb shell`. This locks the option in at connect time (which
@@ -471,7 +533,7 @@ mod tests {
             .expect("connect stores a write half");
         let read_half = read_lock.lock().await.take().expect("read half present");
         let write_half = write_lock.lock().await.take().expect("write half present");
-        match read_half.unsplit(write_half) {
+        match read_half.reader.unsplit(write_half) {
             CurrentConnection::Tcp(stream) => {
                 assert!(
                     stream.nodelay().expect("read TCP_NODELAY"),
@@ -533,6 +595,135 @@ mod tests {
 
         transport.disconnect().await.expect("disconnect");
         let _ = reader.await;
+        server.abort();
+    }
+
+    /// Regression lock for the IP-direct `ifconfig` disconnect: a frame whose
+    /// bytes straddle a read-timeout boundary MUST be read intact, and the next
+    /// frame MUST stay aligned. The old `timeout(read_exact)` dropped the bytes
+    /// already read on timeout, desyncing the stream into a fatal `ConversionError`
+    /// that tore the connection down.
+    #[tokio::test]
+    async fn frame_split_across_read_timeout_stays_aligned() {
+        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        // Two complete frames, serialized to their on-wire bytes.
+        let frame1 =
+            ADBTransportMessage::try_new(MessageCommand::Write, 1, 2, b"a large-ish payload")
+                .expect("build frame 1");
+        let frame2 =
+            ADBTransportMessage::try_new(MessageCommand::Okay, 3, 4, b"").expect("build frame 2");
+        let mut bytes1 = frame1.header().as_bytes();
+        bytes1.extend_from_slice(frame1.payload());
+        let mut bytes2 = frame2.header().as_bytes();
+        bytes2.extend_from_slice(frame2.payload());
+
+        // Server: send the first frame in two pieces with a pause LONGER than the
+        // client's read timeout in between (so the client's read times out with a
+        // partial frame buffered), then the second frame.
+        let split_at = bytes1.len() / 2;
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            sock.write_all(&bytes1[..split_at])
+                .await
+                .expect("send part 1");
+            sock.flush().await.expect("flush part 1");
+            // Outlast the client's 100ms read timeout to force a mid-frame timeout.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            sock.write_all(&bytes1[split_at..])
+                .await
+                .expect("send part 2");
+            sock.write_all(&bytes2).await.expect("send frame 2");
+            sock.flush().await.expect("flush rest");
+            // Keep the socket open so the client doesn't see EOF mid-test.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let mut transport = TcpTransport::new(addr, "unused-key-path");
+        transport.connect().await.expect("connect to loopback");
+
+        let got1 = tokio::time::timeout(Duration::from_secs(5), read_one(&mut transport))
+            .await
+            .expect("frame 1 read did not hang")
+            .expect("frame 1 must read intact across the timeout boundary");
+        assert_eq!(
+            got1.header().command(),
+            MessageCommand::Write,
+            "first frame command must survive the split"
+        );
+        assert_eq!(
+            got1.payload().as_slice(),
+            b"a large-ish payload",
+            "first frame payload must be reassembled intact across the read timeout"
+        );
+
+        let got2 = tokio::time::timeout(Duration::from_secs(5), read_one(&mut transport))
+            .await
+            .expect("frame 2 read did not hang")
+            .expect("frame 2 must stay aligned (no desync after the timeout)");
+        assert_eq!(
+            got2.header().command(),
+            MessageCommand::Okay,
+            "the stream must remain aligned: the next frame decodes cleanly, not as ConversionError"
+        );
+
+        transport.disconnect().await.expect("disconnect");
+        server.abort();
+    }
+
+    /// Regression lock for the write-side desync (#2): a write that fails part-way
+    /// through a frame MUST poison the write half so a subsequent write fails fast
+    /// rather than appending the next frame to the truncated one on the wire.
+    #[tokio::test]
+    async fn write_timeout_poisons_write_half() {
+        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        // Peer that accepts and then NEVER reads, so once both the kernel send and
+        // receive buffers fill, our write_all blocks and trips the timeout mid-frame.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            // Hold the socket open without ever reading.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(sock);
+        });
+
+        let mut transport = TcpTransport::new(addr, "unused-key-path");
+        transport.connect().await.expect("connect to loopback");
+
+        // A payload far larger than any socket buffer, with a short write timeout:
+        // write_all cannot complete, so the write times out mid-frame.
+        let big = vec![0xAB_u8; 8 * 1024 * 1024];
+        let msg = ADBTransportMessage::try_new(MessageCommand::Write, 1, 2, &big)
+            .expect("build large frame");
+        let first = transport
+            .write_message_with_timeout(msg, Duration::from_millis(150))
+            .await;
+        assert!(
+            first.is_err(),
+            "a write that cannot drain within the timeout must error (got {first:?})"
+        );
+
+        // The write half must now be poisoned: any further write fails fast with
+        // NotConnected instead of corrupting the stream by appending to the truncation.
+        let next = ADBTransportMessage::try_new(MessageCommand::Okay, 0, 0, b"")
+            .expect("build small frame");
+        let second = transport
+            .write_message_with_timeout(next, Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(
+                second,
+                Err(RustADBError::IOError(ref e)) if e.kind() == std::io::ErrorKind::NotConnected
+            ),
+            "after a mid-frame write failure the write half must be poisoned (got {second:?})"
+        );
+
         server.abort();
     }
 }

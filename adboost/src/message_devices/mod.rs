@@ -12,6 +12,7 @@ pub(crate) mod adb_message_transport;
 pub mod adb_session;
 pub(crate) mod adb_transport_message;
 mod commands;
+pub(crate) mod framed_read;
 pub(crate) mod message_commands;
 mod models;
 mod utils;

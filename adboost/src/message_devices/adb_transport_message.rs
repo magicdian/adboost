@@ -9,6 +9,11 @@ pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
 pub const AUTH_RSAPUBLICKEY: u32 = 3;
 
+/// Wire size of an ADB message header in bytes (6 little-endian `u32` fields:
+/// command, arg0, arg1, `data_length`, `data_crc32`, magic). This is the fixed
+/// prefix every framed transport reads before the variable-length payload.
+pub const HEADER_LENGTH: usize = 24;
+
 /// Maximum bytes in a single ADB payload (AOSP `MAX_PAYLOAD`, 1 MiB).
 ///
 /// This is a protocol constant, not a USB-specific value: AOSP
