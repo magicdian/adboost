@@ -1,0 +1,1 @@
+{"file": ".trellis/tasks/06-22-selftest-reboot-runs-last/prd.md", "reason": "Verify reboot recorded after usb_replug and tcpip; ordering resists future regression; gate green."}
