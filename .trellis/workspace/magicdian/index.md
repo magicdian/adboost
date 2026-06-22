@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 21
+- **Total Sessions**: 22
 - **Last Active**: 2026-06-22
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~926 | Active |
+| `journal-1.md` | ~959 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 22 | 2026-06-22 | SEG A nodelay miss — client-facing frontend sockets (TCP shell lag follow-up) | `fd5e624` | `main` |
 | 21 | 2026-06-22 | Per-device capability negotiation (bug 2 of TCP shell report) | `67cc53e` | `main` |
 | 20 | 2026-06-22 | Fix TCP_NODELAY on TcpTransport connect (bug 1 of TCP shell report) | `e90ab60` | `main` |
 | 19 | 2026-06-22 | Expose TCP connection building blocks for external backends + fix two latent TCP-path bugs | `a3b1a91`, `a80dfd0`, `4951301` | `main` |

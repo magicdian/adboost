@@ -924,3 +924,36 @@ Fixed bug 2 from the external TCP/IP host:connect shell report: global DeviceBac
 ### Next Steps
 
 - None - task complete
+
+
+## Session 22: SEG A nodelay miss — client-facing frontend sockets (TCP shell lag follow-up)
+
+**Date**: 2026-06-22
+**Task**: SEG A nodelay miss — client-facing frontend sockets (TCP shell lag follow-up)
+**Branch**: `main`
+
+### Summary
+
+Follow-up to the reported still-present nodelay lag. Confirmed the earlier fix (e90ab60) only set TCP_NODELAY on the device-facing socket (SEG B); the client-facing socket (SEG A: adb client → :5037 frontend) was never set, so interactive shell echo was Nagle-delayed an RTT per keystroke on BOTH IP-direct and forwarded-port paths (SEG A is shared by all devices). The reporter's diagnosis was correct and precise. Fixed by setting TCP_NODELAY right after each client accept() in frontend.rs — the main :5037 accept loop and the host:forward listener accept — via a shared enable_client_nodelay helper. Set at accept (not in bridge_tcp_session, which the reverse host-dial path reuses and already sets nodelay; and the main socket needs nodelay during the pre-bridge host-protocol handshake). set_nodelay failure is logged-and-tolerated (live accepted socket; latency not correctness), mirroring reverse_engine.rs. Hermetic loopback test asserts the server-side accepted socket has nodelay()==true. trellis-implement + trellis-check sub-agents; clippy/fmt/test all green (219 tests), default build unaffected (server-gated). xdb cannot fix this — socket is entirely inside the frontend.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fd5e624` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
