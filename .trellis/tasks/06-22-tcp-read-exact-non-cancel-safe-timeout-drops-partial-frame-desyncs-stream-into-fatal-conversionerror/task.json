@@ -1,0 +1,31 @@
+{
+  "id": "tcp-read-exact-non-cancel-safe-timeout-drops-partial-frame-desyncs-stream-into-fatal-conversionerror",
+  "name": "tcp-read-exact-non-cancel-safe-timeout-drops-partial-frame-desyncs-stream-into-fatal-conversionerror",
+  "title": "TCP read_exact non-cancel-safe: timeout drops partial frame, desyncs stream into fatal ConversionError",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "magicdian",
+  "assignee": "magicdian",
+  "createdAt": "2026-06-22",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-22-recv-file-short-frame-panic",
+    "06-22-writer-loop-teardown-is-alive",
+    "06-22-proxy-framebuffer-unbounded-alloc",
+    "06-22-proxy-list-recv-unbounded-alloc"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
