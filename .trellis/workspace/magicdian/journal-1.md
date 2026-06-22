@@ -891,3 +891,36 @@ External bug report (TCP/IP host:connect shell). Verified both reported bugs in 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 21: Per-device capability negotiation (bug 2 of TCP shell report)
+
+**Date**: 2026-06-22
+**Task**: Per-device capability negotiation (bug 2 of TCP shell report)
+**Branch**: `main`
+
+### Summary
+
+Fixed bug 2 from the external TCP/IP host:connect shell report: global DeviceBackend::capabilities() over-advertised shell_v2/sync_v2 to feature-less devices, so a stripped adbd (empty features= banner, reached via adb forward tcp:N tcp:6665 + adb connect) CLSE'd every shell,v2 OPEN. Made negotiation per-device, sourced from each device's CNXN banner. New: DeviceFeatureSet::from_banner parser (round-trip test caught a real host::features= placement bug), PersistentConnection::peer_features() storing the DEVICE's advertised set (distinct from device_features() = what we advertise — the conflation the report made), DeviceEntry.capabilities: Option<DeviceFeatureSet>, DeviceBackend::device_capabilities(serial,timeout) with default None, DefaultDeviceBackend cache+query (timeout on the on-demand single-device call, not list_devices). Frontend: post-transport + host-serial host:features reply server_caps ∩ device_caps (client picks v1 gracefully); defense-in-depth gate fallback FAILs shell,v2/sync cleanly. Banner mapping: shell_v2⟸shell_v2, sync_v2⟸stat_v2. BREAKING: DeviceEntry public field + new trait method (default impl). All hermetic unit tests incl. e2e mixed full/stripped device; no special hardware. Spec updated (server-host-protocol.md two-axis contract). Corrected the report's wrong premise that device_features() already held the device banner.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `67cc53e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
