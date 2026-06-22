@@ -53,26 +53,53 @@ new domain error as a named variant with a `{0}`-style format message.
 
 ### USB error variants (`nusb`, feature = "usb")
 
-The USB transport uses **`nusb`** (pure-Rust, not `rusb`/libusb). Three
-feature-gated variants (`error.rs:80-96`):
+The USB transport uses **`nusb`** (pure-Rust, not `rusb`/libusb). Two
+feature-gated variants:
 
 | Variant | Source | Meaning |
 |---|---|---|
 | `UsbError(#[from] nusb::Error)` | nusb non-transfer ops (enumerate/open/claim/descriptors) | generic USB error |
 | `UsbTransferError(#[from] nusb::transfer::TransferError)` | a bulk `transfer_blocking` failure that is NOT a timeout | transfer-level error |
-| `UsbTimeout` (unit) | produced from `TransferError::Cancelled` | **non-fatal** read/write timeout |
 
-> **Gotcha — USB timeout must be matched structurally, never by string.**
+> **Gotcha — read timeout must be matched structurally, never by string.**
 > `nusb`'s `Endpoint::transfer_blocking(buf, timeout)` returns
 > `TransferError::Cancelled` on timeout (it does NOT carry a "timed out"
-> string). The reader/drain loops in `persistent.rs` distinguish "nothing to
-> read yet → keep looping" from "genuine disconnect → break" by matching
-> `Err(RustADBError::UsbTimeout)`. The mapping `Cancelled → UsbTimeout` lives in
-> `usb_transport.rs` (`map_transfer_status`); all other `TransferError`s map to
-> `UsbTransferError` so they correctly break the loop. **Never reintroduce a
-> `err.to_string().contains("timed out")` check** — nusb's wording differs from
+> string). `map_transfer_status` (`usb_transport.rs`) maps `Cancelled →
+> RustADBError::ReadTimeout`; all other `TransferError`s map to
+> `UsbTransferError` so they correctly break the reader loop. **Never reintroduce
+> a `err.to_string().contains("timed out")` check** — nusb's wording differs from
 > libusb's and the string match silently breaks the disconnect/timeout
 > distinction.
+
+### Transport-neutral read timeout: `ReadTimeout` (NOT feature-gated)
+
+`RustADBError::ReadTimeout` is the single, **non-`#[cfg(feature = "usb")]`**
+variant every transport returns when `ADBMessageTransport::read_message_with_timeout`
+hits its deadline before a full message arrives. This is an explicit trait
+contract (documented on the trait method), not an implicit convention:
+
+- USB: `map_transfer_status` maps `TransferError::Cancelled → ReadTimeout`.
+- TCP: `tcp_transport.rs::read_exact_timeout` maps its `tokio::time::timeout`
+  elapse → `ReadTimeout` (the **read** path only; `write_all_timeout` still
+  returns `IOError(ErrorKind::TimedOut)` with "TCP write timed out" — write
+  timeout unification is deliberately out of scope).
+- Consumer: the transport-generic persistent reader's `classify_read_result`
+  (`persistent.rs`) matches ONLY `Err(RustADBError::ReadTimeout)` →
+  `ReadStep::ReadTimeout` (keep looping / `continue`); everything else is a
+  `ReadStep::ReadError` subject to the fatal/recoverable split.
+
+> **Why this exists (regression history):** the trait method originally did not
+> specify a timeout variant, so USB returned the old feature-gated `UsbTimeout`
+> while TCP returned `IOError(ErrorKind::TimedOut)`. The reader only matched
+> `UsbTimeout`, so a TCP idle read timeout fell into the fatal branch and tore
+> down the entire persistent connection (`tcpip.shell_through_tcp_device` dropped
+> ~1s after a successful CNXN handshake). Gating "timeout" on the `usb` feature
+> was also wrong — TCP can build without `usb` and still needs the variant. The
+> removed `UsbTimeout` variant is a **breaking** (major) error-enum change.
+>
+> **Rule:** when adding a new transport, return `RustADBError::ReadTimeout` on
+> read-deadline elapse. Never reintroduce a transport-specific timeout encoding
+> for reads, and never re-gate the timeout concept on a transport feature.
 
 ### CLI: `ADBCliError` (`adb_cli/src/models/adb_cli_error.rs`)
 

@@ -45,8 +45,15 @@ enum CurrentConnection {
 }
 
 impl CurrentConnection {
-    /// Read exactly `buf.len()` bytes, failing with an `io::ErrorKind::TimedOut`
-    /// error if `timeout` elapses first.
+    /// Read exactly `buf.len()` bytes, failing with the transport-neutral
+    /// [`RustADBError::ReadTimeout`] if `timeout` elapses first.
+    ///
+    /// Returning `ReadTimeout` (not `IOError(ErrorKind::TimedOut)`) honors the
+    /// [`ADBMessageTransport::read_message_with_timeout`] contract so the
+    /// transport-generic persistent reader treats a TCP idle timeout as a
+    /// keep-looping condition, not a fatal transport error.
+    ///
+    /// [`ADBMessageTransport::read_message_with_timeout`]: crate::message_devices::adb_message_transport::ADBMessageTransport::read_message_with_timeout
     async fn read_exact_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> Result<()> {
         let fut = async {
             match self {
@@ -59,10 +66,7 @@ impl CurrentConnection {
                 res?;
                 Ok(())
             }
-            Err(_elapsed) => Err(RustADBError::IOError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "TCP read timed out",
-            ))),
+            Err(_elapsed) => Err(RustADBError::ReadTimeout),
         }
     }
 

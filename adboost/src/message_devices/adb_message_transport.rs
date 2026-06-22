@@ -32,7 +32,20 @@ pub trait ADBMessageTransport: ADBTransport + Clone + Send + 'static {
         }
     }
 
-    /// Read a message using given timeout on the underlying transport
+    /// Read a message using given timeout on the underlying transport.
+    ///
+    /// # Timeout contract
+    ///
+    /// If `read_timeout` elapses before a **complete** message has been read,
+    /// implementations **MUST** return [`RustADBError::ReadTimeout`] — never a
+    /// transport-specific timeout encoding (e.g. `IOError(ErrorKind::TimedOut)`
+    /// or a `nusb` transfer error). This is the single, transport-neutral signal
+    /// that lets transport-generic consumers (notably the persistent reader loop)
+    /// distinguish a normal idle timeout (keep looping) from a genuine transport
+    /// failure (tear down the connection) with a structured match instead of
+    /// knowing each transport's private timeout shape.
+    ///
+    /// [`RustADBError::ReadTimeout`]: crate::RustADBError::ReadTimeout
     async fn read_message_with_timeout(
         &mut self,
         read_timeout: Duration,

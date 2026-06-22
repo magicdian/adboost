@@ -239,7 +239,7 @@ impl USBTransport {
 /// drain it — a cancelled transfer is still returned from `next_complete`, so
 /// the endpoint queue returns to `pending() == 0` and is never left with a
 /// dangling transfer. We then force the status to `TransferError::Cancelled`,
-/// which [`map_transfer_status`] turns into [`RustADBError::UsbTimeout`],
+/// which [`map_transfer_status`] turns into [`RustADBError::ReadTimeout`],
 /// preserving the timeout-vs-disconnect distinction the persistent reader loop
 /// relies on (even in the rare race where the transfer completed during
 /// cancellation, a timeout must never surface as a successful transfer).
@@ -269,14 +269,17 @@ where
 /// Map a `nusb` transfer status into the crate error type.
 ///
 /// `TransferError::Cancelled` is what a timed-out transfer surfaces (see
-/// [`transfer_with_timeout`]); it is translated to the dedicated
-/// [`RustADBError::UsbTimeout`] so callers (notably the persistent reader loop)
-/// can distinguish a normal timeout from a genuine disconnect via a structured
-/// match instead of string matching.
+/// [`transfer_with_timeout`]); it is translated to the transport-neutral
+/// [`RustADBError::ReadTimeout`] (per the
+/// [`ADBMessageTransport::read_message_with_timeout`] contract) so callers
+/// (notably the persistent reader loop) can distinguish a normal timeout from a
+/// genuine disconnect via a structured match instead of string matching.
+///
+/// [`ADBMessageTransport::read_message_with_timeout`]: crate::message_devices::adb_message_transport::ADBMessageTransport::read_message_with_timeout
 fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result<()> {
     match status {
         Ok(()) => Ok(()),
-        Err(TransferError::Cancelled) => Err(RustADBError::UsbTimeout),
+        Err(TransferError::Cancelled) => Err(RustADBError::ReadTimeout),
         Err(e) => Err(e.into()),
     }
 }
@@ -534,14 +537,15 @@ mod tests {
     use nusb::transfer::TransferError;
 
     #[test]
-    fn cancelled_status_maps_to_usb_timeout() {
+    fn cancelled_status_maps_to_read_timeout() {
         // The reader loop relies on this: a timed-out transfer surfaces as
-        // `TransferError::Cancelled` and MUST become `RustADBError::UsbTimeout`
-        // so a normal poll timeout is not misclassified as a disconnect.
+        // `TransferError::Cancelled` and MUST become the transport-neutral
+        // `RustADBError::ReadTimeout` so a normal poll timeout is not
+        // misclassified as a disconnect.
         let mapped = map_transfer_status(Err(TransferError::Cancelled));
         assert!(
-            matches!(mapped, Err(RustADBError::UsbTimeout)),
-            "Cancelled must map to UsbTimeout, got {mapped:?}"
+            matches!(mapped, Err(RustADBError::ReadTimeout)),
+            "Cancelled must map to ReadTimeout, got {mapped:?}"
         );
     }
 
@@ -567,7 +571,7 @@ mod tests {
             let mapped = map_transfer_status(Err(err));
             assert!(
                 matches!(mapped, Err(RustADBError::UsbTransferError(_))),
-                "{err:?} must map to UsbTransferError (not UsbTimeout), got {mapped:?}"
+                "{err:?} must map to UsbTransferError (not ReadTimeout), got {mapped:?}"
             );
         }
     }

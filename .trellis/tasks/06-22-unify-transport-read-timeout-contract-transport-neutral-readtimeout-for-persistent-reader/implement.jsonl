@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "本任务核心是 RustADBError enum 变更（新增 ReadTimeout、移除 UsbTimeout）；须遵循 thiserror 变体定义、Result 别名、错误分类与 cfg 门控约定"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "reader loop 的超时=正常/非致命语义与 CNXN/帧读取语义相关；确认超时分类不破坏消息完整性/帧对齐约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "多特性组合（usb/非usb/tcp/server）下 clippy -D warnings + test 全绿；新变体非 cfg 门控的正确性"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "这是典型跨层(transport 实现↔transport-generic 消费者)抽象泄漏 bug；trait 契约统一须从层边界数据流角度审视"}

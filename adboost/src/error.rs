@@ -84,16 +84,22 @@ pub enum RustADBError {
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
     #[error("USB transfer error: {0}")]
     UsbTransferError(#[from] nusb::transfer::TransferError),
-    /// A USB transfer timed out (no data within the requested timeout).
+    /// A read operation timed out before a full message arrived.
     ///
-    /// Produced from `nusb`'s `TransferError::Cancelled`, which is what a
-    /// `transfer_blocking` call returns when it hits its timeout. This is a
-    /// non-fatal condition used by polling loops to distinguish "nothing to
-    /// read yet" from a genuine disconnect.
-    #[cfg(feature = "usb")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]
-    #[error("USB transfer timed out")]
-    UsbTimeout,
+    /// This is the transport-neutral, **non-feature-gated** timeout variant of
+    /// the [`crate::message_devices::adb_message_transport::ADBMessageTransport`]
+    /// contract: any transport's `read_message_with_timeout` MUST return this
+    /// variant when its per-read deadline elapses before a complete message is
+    /// available. It is deliberately not gated on the `usb` feature — the TCP
+    /// transport (which can build without `usb`) needs it too, and the
+    /// transport-generic persistent reader matches on it to distinguish a normal
+    /// idle timeout (keep looping) from a genuine disconnect (tear down).
+    ///
+    /// USB produces it from `nusb`'s `TransferError::Cancelled` (what a
+    /// timed-out transfer surfaces); TCP produces it when its read future hits
+    /// the `tokio::time::timeout` deadline.
+    #[error("read timed out before a full message arrived")]
+    ReadTimeout,
     /// Selected device is busy.
     #[cfg(feature = "usb")]
     #[cfg_attr(docsrs, doc(cfg(feature = "usb")))]

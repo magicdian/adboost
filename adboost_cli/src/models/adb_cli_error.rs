@@ -91,7 +91,7 @@ impl From<adboost::RustADBError> for ADBCliError {
             | RustADBError::USBDeviceNotFound(_, _)
             | RustADBError::WrongFileExtension(_)
             | RustADBError::AddrParseError(_)
-            | RustADBError::UsbTimeout
+            | RustADBError::ReadTimeout
             | RustADBError::DeviceBusy => Self::Standard(value),
         }
     }

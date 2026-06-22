@@ -974,10 +974,11 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
             let msg = match outcome {
                 ReadStep::Message(msg) => msg,
                 // `ReadTimeout`: normal read timeout — the transport hit its
-                // per-read deadline. `nusb` surfaces this as
-                // `TransferError::Cancelled`, which the transport maps to
-                // `RustADBError::UsbTimeout`. `Control`: a control message was
-                // applied (registry already mutated). Both just keep looping.
+                // per-read deadline and returned the transport-neutral
+                // `RustADBError::ReadTimeout` (USB maps `nusb`'s
+                // `TransferError::Cancelled` to it; TCP maps its read-future
+                // timeout to it). `Control`: a control message was applied
+                // (registry already mutated). Both just keep looping.
                 ReadStep::ReadTimeout => continue,
                 ReadStep::Closed => {
                     tracing::debug!("PersistentUsb reader: control channel closed, exiting");
@@ -1139,12 +1140,30 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         // 2. Read one full frame to completion (atomic, never cancelled by a
         //    control message mid-frame). The 1s timeout returns control to the
         //    loop so newly-queued control mutations are applied between frames.
-        match transport
-            .read_message_with_timeout(Duration::from_secs(1))
-            .await
-        {
+        Self::classify_read_result(
+            transport
+                .read_message_with_timeout(Duration::from_secs(1))
+                .await,
+        )
+    }
+
+    /// Classify the outcome of a single `read_message_with_timeout` into a
+    /// [`ReadStep`].
+    ///
+    /// This is the transport-neutral consumer of the
+    /// [`ADBMessageTransport::read_message_with_timeout`] timeout contract: a
+    /// read deadline elapsing surfaces as [`RustADBError::ReadTimeout`] from
+    /// every transport (USB and TCP alike), and we treat ONLY that variant as a
+    /// keep-looping idle timeout. The match deliberately does not name any
+    /// transport-specific timeout encoding (no `UsbTimeout`, no
+    /// `IOError(TimedOut)`) and is not gated on the `usb` feature, so the reader
+    /// behaves identically on the TCP/server path. Everything else is forwarded
+    /// to [`ReadStep::ReadError`] for the fatal/recoverable split in the reader
+    /// loop.
+    fn classify_read_result(result: Result<ADBTransportMessage>) -> ReadStep {
+        match result {
             Ok(msg) => ReadStep::Message(msg),
-            Err(RustADBError::UsbTimeout) => ReadStep::ReadTimeout,
+            Err(RustADBError::ReadTimeout) => ReadStep::ReadTimeout,
             Err(e) => ReadStep::ReadError(e),
         }
     }
@@ -2543,6 +2562,55 @@ mod tests {
             custom.private_key_path.as_deref(),
             Some(std::path::Path::new("/tmp/adbkey")),
             "with_private_key_path must set the key path"
+        );
+    }
+
+    // Reader timeout contract: a transport's read deadline elapsing surfaces as
+    // the transport-neutral `RustADBError::ReadTimeout`, which `classify_read_result`
+    // MUST map to `ReadStep::ReadTimeout` (the reader loop then `continue`s — it
+    // does NOT tear down the multiplexed connection). This locks the regression
+    // where TCP's idle read timeout was classified as a fatal `ReadError` and
+    // dropped the whole persistent connection. Tested over BOTH concrete
+    // transports so the same neutral contract is exercised for USB and TCP.
+    #[test]
+    fn read_timeout_classifies_as_read_timeout_not_fatal() {
+        // USB specialization.
+        let usb_step = PersistentConnection::<USBTransport>::classify_read_result(Err(
+            RustADBError::ReadTimeout,
+        ));
+        assert!(
+            matches!(usb_step, ReadStep::ReadTimeout),
+            "ReadTimeout must classify as ReadStep::ReadTimeout (keep looping), not a fatal ReadError"
+        );
+
+        // TCP specialization — the path that previously misclassified the timeout.
+        let tcp_step = PersistentConnection::<TcpTransport>::classify_read_result(Err(
+            RustADBError::ReadTimeout,
+        ));
+        assert!(
+            matches!(tcp_step, ReadStep::ReadTimeout),
+            "TCP ReadTimeout must also classify as ReadStep::ReadTimeout, not a fatal ReadError"
+        );
+
+        // A genuine transport error must NOT be treated as a timeout.
+        let fatal = PersistentConnection::<TcpTransport>::classify_read_result(Err(
+            RustADBError::IOError(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "dead")),
+        ));
+        assert!(
+            matches!(fatal, ReadStep::ReadError(_)),
+            "a non-timeout transport error must classify as ReadStep::ReadError (fatal path)"
+        );
+
+        // A successful read is forwarded as a Message.
+        let ok = PersistentConnection::<TcpTransport>::classify_read_result(Ok(msg(
+            MessageCommand::Okay,
+            1,
+            2,
+            &[],
+        )));
+        assert!(
+            matches!(ok, ReadStep::Message(_)),
+            "a successful read must classify as ReadStep::Message"
         );
     }
 
