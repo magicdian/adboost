@@ -58,7 +58,7 @@ impl ADBProxyDevice {
                     let size = connection.read_u32_le().await?;
                     let time = connection.read_u32_le().await?;
                     let name_len = connection.read_u32_le().await?;
-                    let mut name_buf = vec![0_u8; name_len as usize];
+                    let mut name_buf = vec![0_u8; super::checked_wire_len(name_len)?];
                     connection.read_exact(&mut name_buf).await?;
                     let name = String::from_utf8(name_buf)?;
 

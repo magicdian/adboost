@@ -59,7 +59,7 @@ impl ADBProxyDevice {
                 }
                 b"DONE" => break,
                 b"FAIL" => {
-                    let length = connection.read_u32_le().await? as usize;
+                    let length = super::checked_wire_len(connection.read_u32_le().await?)?;
                     let mut error_msg = vec![0; length];
                     connection.read_exact(&mut error_msg).await?;
 
