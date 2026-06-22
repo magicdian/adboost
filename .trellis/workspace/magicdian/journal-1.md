@@ -823,3 +823,38 @@ Completed the long-deferred library crate rename adb_client -> adboost across th
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: Expose TCP connection building blocks for external backends + fix two latent TCP-path bugs
+
+**Date**: 2026-06-22
+**Task**: Expose TCP connection building blocks for external backends + fix two latent TCP-path bugs
+**Branch**: `main`
+
+### Summary
+
+调用方 xdb 需在自定义 device backend 中持有持久化 TCP 连接，但 TcpTransport 不可命名。暴露 TcpTransport + 公开别名 PersistentTcpConnection + TcpConnectOptions（标准 Default + 链式定制）并从 crate root re-export（a3b1a91, semver minor）。打通后真机 selftest 逐层暴露两个 pre-existing bug：(1) host-serial:<serial>:<sub> 用 split_once(':') 切分，对 ip:port serial 失败——改为锚定已知 sub-service 切分（a80dfd0）；(2) transport-generic reader 只认 USB 的 UsbTimeout，TCP 的 IOError(TimedOut) 被误判致命拆连接——在 ADBMessageTransport trait 层统一为非门控的 ReadTimeout，移除 UsbTimeout（4951301, breaking）。三处均全特性组合门禁绿 + 真机 selftest tcpip.shell_through_tcp_device 验证通过。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a3b1a91` | (see git log) |
+| `a80dfd0` | (see git log) |
+| `4951301` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

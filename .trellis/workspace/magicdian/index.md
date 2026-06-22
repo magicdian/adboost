@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
-- **Last Active**: 2026-06-15
+- **Total Sessions**: 19
+- **Last Active**: 2026-06-22
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~825 | Active |
+| `journal-1.md` | ~860 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-06-22 | Expose TCP connection building blocks for external backends + fix two latent TCP-path bugs | `a3b1a91`, `a80dfd0`, `4951301` | `main` |
 | 18 | 2026-06-15 | Rename library crate adb_client -> adboost (main line) | `0a55c91` | `main` |
 | 17 | 2026-06-15 | tcpip mainline parity (PR1-5 + PR4a/b) | `c6447d7` | `feat/tcpip-mainline-parity` |
 | 16 | 2026-06-15 | Fix reboot-recovery selftest + through-server shell exit code | `c7a09d1` | `main` |
