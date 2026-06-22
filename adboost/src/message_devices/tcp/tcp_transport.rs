@@ -147,6 +147,13 @@ fn connection_mut(conn: &mut Option<CurrentConnection>) -> Result<&mut CurrentCo
 impl ADBTransport for TcpTransport {
     async fn connect(&mut self) -> Result<()> {
         let stream = TcpStream::connect(self.address).await?;
+        // ADB multiplexing over TCP is small-packet + interactive: an `adb shell`
+        // echoes one tiny segment per keystroke. With Nagle enabled (the default),
+        // each segment is held until the prior one's ACK returns, stacking an
+        // RTT of latency onto every keystroke — visible lag in interactive shells.
+        // Disable it. The option lives on the kernel socket, so it also covers the
+        // later TLS upgrade (`upgrade_connection` consumes this same `TcpStream`).
+        stream.set_nodelay(true)?;
         self.current_connection = Some(Arc::new(Mutex::new(Some(CurrentConnection::Tcp(stream)))));
         Ok(())
     }
@@ -357,5 +364,50 @@ impl ServerCertVerifier for NoCertificateVerification {
             SignatureScheme::ED25519,
             SignatureScheme::ED448,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::net::TcpListener;
+
+    /// `connect()` must disable Nagle on the freshly-built socket. ADB mux over
+    /// TCP is small-packet + interactive, so leaving Nagle on adds a per-keystroke
+    /// RTT of lag in `adb shell`. This locks the option in at connect time (which
+    /// also covers the later TLS upgrade, since it consumes this same socket).
+    #[tokio::test]
+    async fn connect_sets_tcp_nodelay() {
+        // Hermetic: a loopback listener that just accepts one connection. No real
+        // ADB device or handshake involved — `connect()` only opens the socket.
+        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        // `connect()` never reads `private_key_path` (only the TLS upgrade does),
+        // so any path is fine here.
+        let mut transport = TcpTransport::new(addr, "unused-key-path");
+        transport.connect().await.expect("connect to loopback");
+
+        let conn = transport
+            .current_connection
+            .as_ref()
+            .expect("connect stores a live connection");
+        let guard = conn.lock().await;
+        match guard.as_ref().expect("connection present") {
+            CurrentConnection::Tcp(stream) => {
+                assert!(
+                    stream.nodelay().expect("read TCP_NODELAY"),
+                    "connect() must set TCP_NODELAY to avoid interactive shell lag"
+                );
+            }
+            CurrentConnection::Tls(_) => panic!("a fresh connect() must be plain Tcp, not Tls"),
+        }
+
+        drop(guard);
+        let _ = accept.await;
     }
 }
