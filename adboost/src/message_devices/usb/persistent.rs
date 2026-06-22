@@ -1705,13 +1705,25 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         Ok(())
     }
 
-    /// Check if the connection is still alive (reader task running).
+    /// Check if the connection is still alive (both reader and writer tasks
+    /// running).
+    ///
+    /// A connection is only usable when BOTH directions work. The reader tears
+    /// down on a fatal read error, and the writer now tears down on a fatal write
+    /// error (a partial frame poisons the transport — see `writer_loop`). A
+    /// half-open connection — say the write half is dead while the read half only
+    /// idles on its read timeout — must NOT report alive, or `default_backend`
+    /// would hand it back out for reuse and every outbound frame (including the
+    /// `FireForget` OKAYs that grant inbound flow-control credit) would be silently
+    /// dropped, stalling the peer with no teardown. Treat a finished task in
+    /// EITHER direction as not-alive.
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        match &self.reader_handle {
+        let task_running = |handle: &Option<JoinHandle<()>>| match handle {
             Some(h) => !h.is_finished(),
             None => false,
-        }
+        };
+        task_running(&self.reader_handle) && task_running(&self.writer_handle)
     }
 
     /// Flush a single connection-level CLSE while the writer task is still alive,
