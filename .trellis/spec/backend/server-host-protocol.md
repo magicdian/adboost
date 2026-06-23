@@ -257,3 +257,103 @@ which locks against the original `unknown host service: connect:` regression.
 > three device-verified wire regressions documented in
 > `adb-wire-protocol-contract.md` (delayed_ack/data_check coupling, CNXN no-NUL
 > banner, CLSE routing).
+
+## Disconnect cleanup: a device's `forward` / `reverse` rules are released when its transport vanishes
+
+**The bug this fixes**: a `forward` rule is registered in the **server-global**
+`ForwardRegistry` (`forward.rs`), which is keyed by local port and bound to no
+device lifetime. Unplugging the USB device (or `host:disconnect`ing a TCP one)
+left the host-side listener bound and the rule visible in `forward --list`
+forever — standard `adb` releases it. `reverse` had the mirror leak: the engine's
+data pump stopped when the connection died, but its entry lingered in the
+backend's `reverse` map until `shutdown()`.
+
+**The seam** (backend is the device-lifecycle source of truth; frontend owns the
+forward registry — so cleanup is a cross-layer event flow, NOT a local patch):
+
+| Piece | Location | Role |
+|---|---|---|
+| `LifecycleEvent::Disconnected(serial)` | `backend.rs` | the internal event; **distinct from** `subscribe_changes` (that serves `track-devices` clients and fires only when one is attached) |
+| `DeviceBackend::subscribe_lifecycle()` | `backend.rs` (default: closed stream) | the stream the frontend drains; `DefaultDeviceBackend` overrides it |
+| USB hotplug-diff watcher | `default_backend.rs::spawn_usb_disconnect_watch` | keeps a `HashSet` of present serials; on each nusb hotplug event, emits `Disconnected` for every serial that left. Separate from the `subscribe_changes` watcher because cleanup needs the **diff**, not a snapshot |
+| TCP `disconnect` emit | `default_backend.rs::disconnect` | `emit_disconnected` for each removed serial (single + empty-target-all paths) |
+| `handle_disconnects` | `frontend.rs` | spawned by `serve()` (unless `Retain`); applies the policy per event |
+| `ForwardHandle::{release,release_all}` | `forward_handle.rs` | the caller-facing active-cleanup API; `serve()` consumes `self`, so obtain it via `frontend.handle()` **before** serving |
+
+**`OnDisconnect` policy** (`on_disconnect.rs`, mirrors `ReversePolicy`'s
+enum-plus-closure shape) — set via `AdbServerFrontendBuilder::on_disconnect`:
+
+| Variant | Behavior | Notes |
+|---|---|---|
+| `ReleaseAll` (**default**) | release the serial's forward listeners **and** reverse rules | aligns with standard `adb`; the default so existing callers get correct behavior |
+| `Retain` | keep everything; caller releases via `ForwardHandle` | `serve()` does not even spawn `handle_disconnects` for this variant |
+| `Notify(Arc<dyn Fn(&str)>)` | invoke callback with the serial; release **nothing** | pure notification; callback decides via `ForwardHandle` |
+
+**Unified semantics**: one policy governs **both** forward and reverse for a
+serial — a disconnected device loses everything it was forwarding.
+`ForwardHandle::release` clears the serial's forward rules (`remove_by_serial`)
+**and** its reverse rules.
+
+> **Gotcha — the disconnect path must NOT reopen the dead connection.** Reverse
+> cleanup on disconnect uses `DeviceBackend::release_reverse`, which (in
+> `DefaultDeviceBackend`) just drops the `reverse` map entry. Do **not** route it
+> through `reverse_remove_all` → `reverse_engine` → `get_or_open`: that re-opens
+> the just-unplugged device to reach its engine, which fails and re-leaks. The
+> data pump is already stopping (its connection's reader died), so only the
+> in-memory rule entry needs dropping.
+
+> **Gotcha — `release_all` can't see reverse-only serials.** It fans reverse
+> cleanup over the serials present in the *forward* registry. A serial with
+> reverse rules but no forward rule is invisible to it; release such a serial
+> explicitly via `release(serial)` (the per-serial disconnect path does this
+> correctly because the event carries the serial directly).
+
+### Tests Required (assertion points)
+
+Inline `#[cfg(test)] mod tests`, run with `--features server`:
+
+- `on_disconnect.rs`: `default_is_release_all`, `debug_does_not_leak_closure`,
+  `notify_callback_receives_serial`
+- `forward.rs`: `registry_remove_by_serial_only_drops_that_serial`
+- `forward_handle.rs`: `release_drops_only_that_serial_forward_and_its_reverse`,
+  `release_all_clears_forwards_and_fans_reverse_over_serials`
+- `frontend.rs`: `release_all_policy_drops_forward_and_reverse_on_disconnect`,
+  `notify_policy_invokes_callback_and_releases_nothing`,
+  `retain_policy_releases_nothing` — the handler is **source-agnostic** (USB
+  hotplug and TCP `host:disconnect` both arrive as
+  `LifecycleEvent::Disconnected(serial)`), so these cover both transports.
+
+### Common Mistake: opening a USB device right after a case that re-enumerated it (selftest)
+
+**Symptom**: An interactive selftest case fails to open the device with
+`USB transfer error: unknown (error 0xe00002ed)` — e.g.
+`case_reboot_recovery` reporting `cannot open device to reboot: …0xe00002ed`,
+even though the device is physically present.
+
+**Cause**: The interactive phase (`adboost_cli/src/selftest/interactive.rs`)
+runs cases in sequence against one shared device. Several of them leave the
+device **mid-USB-re-enumeration**: `case_usb_forward_release_on_unplug` (operator
+replugs), `case_tcpip_through_server` (`restore_usb_mode` issues `usb:`, which
+restarts adbd and drops+re-adds the USB device), and any reboot. `nusb` re-opens
+the device under a fresh IOKit registry id, but adbd is not yet ready to accept a
+CNXN handshake. A *bare* `PersistentUsbConnection::new_from_serial` issued within
+~2 s of that transition hits the not-ready endpoint and fails. The reported
+failure surfaced at the `tcpip → reboot_recovery` seam, not within a single case.
+
+**Fix**: Two layers (both applied):
+1. **Open-with-retry at the consumer** (the durable fix): open via
+   `open_device_with_retry(serial, budget)` — retry `new_from_serial` on
+   `POLL_INTERVAL` within a ~20 s budget — rather than a bare call. This does not
+   depend on the previous case's behavior.
+2. **Hand the device back stable** (reduces downstream waiting): a case that
+   re-enumerates the device should, best-effort, `wait_for_presence` + then
+   confirm openability (`open_device_with_retry` / `verify_shell_after_recovery`)
+   before returning, so the next case starts from a ready device. This step MUST
+   NOT change the case's own `Outcome` (the core conclusion was already computed)
+   — it only `tracing::warn!`s on failure.
+
+**Prevention**: Never issue a bare device open immediately after an operation
+that restarts adbd or re-enumerates USB (unplug/replug, `tcpip:`/`usb:` mode
+switch, `reboot:`). Use `open_device_with_retry`. Keep the "reboot_recovery runs
+last" ordering invariant — but do not rely on ordering alone, since any
+re-enumerating case can precede another.

@@ -138,6 +138,42 @@ impl ForwardRegistry {
         }
     }
 
+    /// Remove every rule registered for `serial`, aborting their listeners.
+    /// Returns the number of rules removed (`0` if the serial had none).
+    ///
+    /// This is the forward half of the disconnect-cleanup path: when a device's
+    /// transport goes away, the frontend drops exactly the listeners bound for
+    /// that serial, leaving other devices' forwards untouched (a server-global
+    /// registry keys rules by local port, so removal must filter by serial).
+    pub(super) async fn remove_by_serial(&self, serial: &str) -> usize {
+        let mut rules = self.rules.lock().await;
+        // Two-step: collect the matching local ports, then remove+abort each.
+        // (Can't abort while holding a `&` into the map mid-`retain`.)
+        let ports: Vec<u16> = rules
+            .iter()
+            .filter(|(_, rule)| rule.serial == serial)
+            .map(|(port, _)| *port)
+            .collect();
+        for port in &ports {
+            if let Some(rule) = rules.remove(port) {
+                rule.task.abort();
+            }
+        }
+        ports.len()
+    }
+
+    /// The distinct device serials that currently have at least one forward
+    /// rule. Used by [`ForwardHandle::release_all`](super::ForwardHandle) to fan
+    /// reverse cleanup out per serial (reverse rules are keyed by serial in the
+    /// backend, not by local port).
+    pub(super) async fn serials(&self) -> Vec<String> {
+        let rules = self.rules.lock().await;
+        let mut serials: Vec<String> = rules.values().map(|r| r.serial.clone()).collect();
+        serials.sort_unstable();
+        serials.dedup();
+        serials
+    }
+
     /// Render the `host:list-forward` body: one `\n`-terminated line per rule,
     /// `<serial> tcp:<local> tcp:<remote>\n`, sorted by local port for a stable
     /// listing.
@@ -235,6 +271,36 @@ mod tests {
         let body = reg.list().await;
         // Sorted by local port: 8000 then 9000.
         assert_eq!(body, "A tcp:8000 tcp:2\nB tcp:9000 tcp:1\n");
+    }
+
+    #[tokio::test]
+    async fn registry_remove_by_serial_only_drops_that_serial() {
+        let reg = ForwardRegistry::default();
+        // Two rules for serialA, one for serialB.
+        reg.insert(8000, 1, "serialA".to_string(), tokio::spawn(async {}))
+            .await;
+        reg.insert(8001, 2, "serialA".to_string(), tokio::spawn(async {}))
+            .await;
+        reg.insert(9000, 3, "serialB".to_string(), tokio::spawn(async {}))
+            .await;
+
+        let removed = reg.remove_by_serial("serialA").await;
+        assert_eq!(removed, 2, "both serialA rules must be removed");
+        assert!(!reg.contains(8000).await, "serialA rule gone");
+        assert!(!reg.contains(8001).await, "serialA rule gone");
+        assert!(reg.contains(9000).await, "serialB rule must survive");
+
+        // Removing a serial with no rules is a no-op returning 0.
+        assert_eq!(
+            reg.remove_by_serial("serialA").await,
+            0,
+            "second removal finds nothing"
+        );
+        assert_eq!(
+            reg.remove_by_serial("unknown").await,
+            0,
+            "unknown serial removes nothing"
+        );
     }
 
     #[tokio::test]

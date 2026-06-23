@@ -70,6 +70,14 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
     let replug = case_usb_replug(&subject).await;
     record(reporter, "interactive", "usb_replug", replug);
 
+    let forward_release = case_usb_forward_release_on_unplug(&subject).await;
+    record(
+        reporter,
+        "interactive",
+        "forward_release_on_unplug",
+        forward_release,
+    );
+
     let tcpip = case_tcpip_through_server(&subject).await;
     record(reporter, "tcpip", "shell_through_tcp_device", tcpip);
 
@@ -136,6 +144,19 @@ async fn case_tcpip_through_server(serial: &str) -> Outcome {
     // Restore the device to USB mode regardless of the outcome above. Reconnect
     // over the now-listening TCP transport and issue `usb:`.
     restore_usb_mode(&tcp_serial).await;
+
+    // Best-effort readiness gate: `restore_usb_mode` issues `usb:` fire-and-forget,
+    // which restarts adbd and triggers a USB re-enumeration. Without waiting, the
+    // next case (`case_reboot_recovery`) opens the device within ~2s while adbd is
+    // still coming back, and the CNXN handshake fails. After switching back to USB
+    // the device re-enumerates under its ORIGINAL USB serial (not `tcp_serial`), so
+    // wait on `serial`. This MUST NOT change `outcome` — the tcpip conclusion was
+    // already computed by `run_tcpip_through_server`; failures here only warn.
+    if let Err(e) = wait_for_presence(serial, RECONNECT_TIMEOUT).await {
+        tracing::warn!("[tcpip] device {serial} did not re-enumerate over USB after restore: {e}");
+    } else if let Err(e) = open_device_with_retry(serial, Duration::from_secs(20)).await {
+        tracing::warn!("[tcpip] device {serial} returned but is not yet ready after restore: {e}");
+    }
     outcome
 }
 
@@ -215,6 +236,162 @@ async fn case_usb_replug(serial: &str) -> Outcome {
     verify_shell_after_recovery(serial).await
 }
 
+/// USB-unplug forward release: with adboost serving as an ADB server (default
+/// `OnDisconnect::ReleaseAll`), register a `forward` for a USB device through the
+/// **official** `adb -P` client, then physically unplug the device and assert the
+/// rule disappears from `forward --list` automatically — exactly what standard
+/// `adb` does and what the caller reported as missing.
+///
+/// This is the one end-to-end path the contract (mock-event) tests cannot reach:
+/// the real `nusb` hotplug → diff → `LifecycleEvent::Disconnected` → `handle_disconnects`
+/// → `ForwardHandle::release` chain. Hardware-only + operator-gated.
+async fn case_usb_forward_release_on_unplug(serial: &str) -> Outcome {
+    /// Remote port the forward targets on the device (arbitrary; never dialed).
+    const REMOTE_PORT: u16 = 5555;
+    /// How long to wait, after unplug, for the rule to vanish from `forward --list`.
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    if is_tcpip_serial(serial) {
+        return Outcome::Skipped("subject is a tcpip device, not a USB-unplug subject".into());
+    }
+    if !parity::adb_available().await {
+        return Outcome::Skipped("adb not on PATH".into());
+    }
+
+    let server = match InProcessServer::start().await {
+        Ok(s) => s,
+        Err(e) => return Outcome::Skipped(format!("cannot start in-process server: {e}")),
+    };
+    let port = server.addr().port().to_string();
+    let remote = format!("tcp:{REMOTE_PORT}");
+
+    // Register a forward (tcp:0 ⇒ OS picks the local port) for this device.
+    let register = adb_forward(&port, serial, "tcp:0", &remote).await;
+    if let Err(e) = register {
+        server.shutdown().await;
+        return Outcome::Failed(format!("could not register forward: {e}"));
+    }
+
+    // Precondition: the rule must be present in `forward --list` before unplug.
+    match adb_forward_list(&port).await {
+        Ok(list) if list.lines().any(|l| l.contains(serial)) => {}
+        Ok(list) => {
+            server.shutdown().await;
+            return Outcome::Failed(format!(
+                "forward registered but {serial} absent from `forward --list`: {}",
+                list.trim()
+            ));
+        }
+        Err(e) => {
+            server.shutdown().await;
+            return Outcome::Failed(format!("could not read `forward --list`: {e}"));
+        }
+    }
+
+    println!();
+    println!("[forward_release] Please UNPLUG the device {serial} now.");
+    if let Err(e) = wait_for_absence(serial, RECONNECT_TIMEOUT).await {
+        server.shutdown().await;
+        return Outcome::Failed(e);
+    }
+
+    // Core assertion: after unplug, the rule must auto-release within the timeout.
+    let outcome = match wait_for_forward_release(&port, serial, RELEASE_TIMEOUT).await {
+        Ok(()) => Outcome::Passed,
+        Err(last) => Outcome::Failed(format!(
+            "BUG REPRODUCED: forward rule for {serial} still present {}s after unplug \
+             (expected auto-release); last `forward --list`: {}",
+            RELEASE_TIMEOUT.as_secs(),
+            last.trim()
+        )),
+    };
+
+    // Best-effort: ask the operator to re-plug so the rig returns to its prior
+    // state. A failure here does not change the conclusion above.
+    println!("[forward_release] Core check done. Please RE-PLUG the device {serial} to restore.");
+    if let Err(e) = wait_for_presence(serial, RECONNECT_TIMEOUT).await {
+        tracing::warn!("[forward_release] device {serial} did not return after replug: {e}");
+    } else if let Outcome::Failed(reason) = verify_shell_after_recovery(serial).await {
+        // Best-effort readiness gate: the device is enumerated but adbd may not
+        // yet accept a CNXN handshake right after re-enumeration. Drive it to a
+        // stable state (open connection + shell echo) so the next case
+        // (`case_reboot_recovery`) does not open a not-yet-ready device. A
+        // failure here MUST NOT change `outcome` (the core conclusion was
+        // already computed at unplug time) — only warn.
+        tracing::warn!(
+            "[forward_release] device {serial} returned but did not stabilize after replug: {reason}"
+        );
+    }
+
+    server.shutdown().await;
+    outcome
+}
+
+/// Poll `adb -P <port> forward --list` until no line mentions `serial`, or time
+/// out. On timeout returns the last observed listing (for the failure message).
+async fn wait_for_forward_release(
+    port: &str,
+    serial: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = match adb_forward_list(port).await {
+            Ok(list) => {
+                if !list.lines().any(|l| l.contains(serial)) {
+                    return Ok(());
+                }
+                list
+            }
+            Err(e) => format!("(forward --list error: {e})"),
+        };
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// `adb -P <port> -s <serial> forward <local> <remote>`; Err on a non-zero exit.
+async fn adb_forward(port: &str, serial: &str, local: &str, remote: &str) -> Result<(), String> {
+    let output = tokio::process::Command::new("adb")
+        .args(["-P", port, "-s", serial, "forward", local, remote])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("could not invoke adb forward: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "adb forward exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ))
+    }
+}
+
+/// `adb -P <port> forward --list`; returns stdout (the rule listing).
+async fn adb_forward_list(port: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("adb")
+        .args(["-P", port, "forward", "--list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("could not invoke adb forward --list: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "adb forward --list exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ))
+    }
+}
+
 /// Reboot recovery: reboot the device and confirm it returns within the timeout
 /// and can shell again. Excludes tcpip devices (their post-reboot reconnect is a
 /// separate scenario).
@@ -235,7 +412,12 @@ async fn case_reboot_recovery(serial: &str) -> Outcome {
     // persistent connection. NOT `shell_exec("reboot")`: the reboot tears the
     // stream down immediately, which a shell read surfaces as a "session
     // channel closed" error; the `reboot:` service is request-only (OKAY ⇒ done).
-    match PersistentUsbConnection::new_from_serial(serial, None).await {
+    //
+    // Open the connection with a retry budget: a prior case (`case_tcpip_through_server`)
+    // may have just switched the device back to USB, so adbd can still be mid-restart
+    // when we get here. Only the OPEN is retried — once open, a `reboot()` failure is
+    // a genuine failure and is surfaced directly (no reboot-itself retry).
+    match open_device_with_retry(serial, Duration::from_secs(20)).await {
         Ok(conn) => {
             if let Err(e) = conn.reboot(RebootType::System).await {
                 return Outcome::Failed(format!("reboot command failed: {e}"));
@@ -258,24 +440,40 @@ async fn case_reboot_recovery(serial: &str) -> Outcome {
     verify_shell_after_recovery(serial).await
 }
 
+/// Open a persistent USB connection to `serial`, retrying within `budget` while
+/// the device is still mid-(re)enumeration. Returns the open connection or the
+/// last open error after the budget elapses.
+///
+/// Right after a USB re-enumeration (e.g. following `tcpip:`/`usb:` mode switches
+/// or a reboot) adbd may not yet accept a CNXN handshake, so the bare
+/// `new_from_serial` call fails transiently. Polling on [`POLL_INTERVAL`] within a
+/// short budget converges past that window.
+async fn open_device_with_retry(
+    serial: &str,
+    budget: Duration,
+) -> Result<PersistentUsbConnection, String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match PersistentUsbConnection::new_from_serial(serial, None).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) if Instant::now() >= deadline => return Err(e.to_string()),
+            Err(_) => sleep(POLL_INTERVAL).await,
+        }
+    }
+}
+
 /// After a device returns, open a persistent connection and run the shell-echo
 /// case to prove the connection is usable again.
 async fn verify_shell_after_recovery(serial: &str) -> Outcome {
     // The device may need a moment after re-enumeration before adbd is ready;
-    // retry opening a few times within a short budget.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        match PersistentUsbConnection::new_from_serial(serial, None).await {
-            Ok(conn) => {
-                let outcome = cases::persistent_shell_echo(&conn).await;
-                conn.close().await;
-                return outcome;
-            }
-            Err(e) if Instant::now() >= deadline => {
-                return Outcome::Failed(format!("device returned but shell not ready: {e}"));
-            }
-            Err(_) => sleep(POLL_INTERVAL).await,
+    // retry opening within a short budget.
+    match open_device_with_retry(serial, Duration::from_secs(20)).await {
+        Ok(conn) => {
+            let outcome = cases::persistent_shell_echo(&conn).await;
+            conn.close().await;
+            outcome
         }
+        Err(e) => Outcome::Failed(format!("device returned but shell not ready: {e}")),
     }
 }
 

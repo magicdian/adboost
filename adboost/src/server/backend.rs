@@ -75,6 +75,21 @@ impl DeviceEntry {
     }
 }
 
+/// A device-lifecycle event from [`DeviceBackend::subscribe_lifecycle`].
+///
+/// Distinct from the `host:track-devices` snapshot stream
+/// ([`DeviceBackend::subscribe_changes`]): that one serves connected clients a
+/// full device set on every change; this one is the **internal** signal the
+/// frontend uses to release a vanished device's `forward` / `reverse` rules,
+/// and it fires whether or not any client is tracking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    /// The named serial's transport went away — USB unplug, TCP `host:disconnect`,
+    /// or its persistent connection's reader task dying. Any `forward` listeners
+    /// or `reverse` rules bound to it are now stale.
+    Disconnected(String),
+}
+
 /// A device's connection state, in its host-protocol wire spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceState {
@@ -146,6 +161,44 @@ pub trait DeviceBackend: Send + Sync + 'static {
     /// snapshot whenever the device set changes; the receiver closes when the
     /// backend stops watching.
     async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>>;
+
+    /// The **internal** device-lifecycle event stream the frontend subscribes to
+    /// in order to release a disconnected serial's `forward` / `reverse` rules
+    /// (see [`LifecycleEvent`]). Unlike [`Self::subscribe_changes`], this fires
+    /// regardless of whether any `host:track-devices` client is attached — rule
+    /// cleanup is a server concern, not a client one.
+    ///
+    /// The default returns an immediately-closed stream: a backend that does not
+    /// track disconnects opts out, and the frontend simply never auto-releases
+    /// (rules then behave as they did before this seam existed). adboost's
+    /// [`DefaultDeviceBackend`] overrides it to emit
+    /// [`LifecycleEvent::Disconnected`] on USB unplug and TCP `host:disconnect`.
+    ///
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
+    async fn subscribe_lifecycle(&self) -> mpsc::Receiver<LifecycleEvent> {
+        async move {
+            // Closed stream: capacity-1 channel whose sender is dropped at once.
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+    }
+
+    /// Release a serial's `reverse` rules **without** re-establishing its
+    /// connection — the disconnect-path counterpart to [`Self::reverse_remove_all`].
+    ///
+    /// [`Self::reverse_remove_all`] routes through the per-serial reverse engine,
+    /// which (in the bundled backend) re-opens a dead connection to reach it —
+    /// exactly wrong when the device just unplugged. This method instead drops
+    /// the backend's local reverse bookkeeping for `serial` best-effort: the data
+    /// pump is already stopping (its connection's reader died), so only the
+    /// in-memory rule entry needs clearing. The default delegates to
+    /// [`Self::reverse_remove_all`] for backends without a separate dead-path;
+    /// [`DefaultDeviceBackend`] overrides it to just drop the map entry.
+    ///
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
+    async fn release_reverse(&self, serial: &str) -> Result<()> {
+        async move { self.reverse_remove_all(serial).await }
+    }
 
     /// Open a local service (`shell:` / `tcp:`) on a device, returning a
     /// bidirectionally-bridgeable session. Implementations reuse adboost's

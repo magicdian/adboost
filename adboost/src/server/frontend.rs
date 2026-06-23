@@ -13,10 +13,13 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
-use super::backend::{DeviceBackend, DeviceEntry};
+use super::backend::{DeviceBackend, DeviceEntry, LifecycleEvent};
 use super::capabilities::{KillPolicy, ServerCapabilities};
 use super::forward::{ForwardRegistry, parse_forward, parse_killforward};
+use super::forward_handle::ForwardHandle;
+use super::on_disconnect::OnDisconnect;
 use super::protocol;
 use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 
@@ -25,6 +28,7 @@ pub struct AdbServerFrontendBuilder<B: DeviceBackend> {
     backend: Arc<B>,
     addr: SocketAddr,
     caps: ServerCapabilities,
+    on_disconnect: OnDisconnect,
 }
 
 impl<B: DeviceBackend> AdbServerFrontendBuilder<B> {
@@ -42,6 +46,15 @@ impl<B: DeviceBackend> AdbServerFrontendBuilder<B> {
         self
     }
 
+    /// Set the [`OnDisconnect`] policy: what happens to a device's `forward` /
+    /// `reverse` rules when its transport disconnects. Defaults to
+    /// [`OnDisconnect::ReleaseAll`] (release them, matching standard `adb`).
+    #[must_use]
+    pub fn on_disconnect(mut self, policy: OnDisconnect) -> Self {
+        self.on_disconnect = policy;
+        self
+    }
+
     /// Finish building the frontend.
     #[must_use]
     pub fn build(self) -> AdbServerFrontend<B> {
@@ -50,6 +63,7 @@ impl<B: DeviceBackend> AdbServerFrontendBuilder<B> {
             addr: self.addr,
             caps: self.caps,
             forwards: Arc::new(ForwardRegistry::default()),
+            on_disconnect: self.on_disconnect,
         }
     }
 }
@@ -64,6 +78,10 @@ pub struct AdbServerFrontend<B: DeviceBackend> {
     /// listeners). Shared because forward rules outlive the client socket that
     /// created them.
     forwards: Arc<ForwardRegistry>,
+    /// What to do with a serial's forward/reverse rules when its transport
+    /// disconnects. Consumed by the disconnect-handling task (PR3); stored here
+    /// so the builder's choice survives into [`Self::serve`].
+    on_disconnect: OnDisconnect,
 }
 
 /// How long a serial-aware capability query may spend establishing a device
@@ -91,7 +109,21 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             backend,
             addr: SocketAddr::from(([127, 0, 0, 1], 5037)),
             caps: ServerCapabilities::default(),
+            on_disconnect: OnDisconnect::default(),
         }
+    }
+
+    /// A [`ForwardHandle`] over this frontend's forward registry and backend —
+    /// the caller-facing API for releasing a device's `forward` / `reverse`
+    /// rules on demand.
+    ///
+    /// [`Self::serve`] consumes `self`, so obtain the handle (and clone it as
+    /// needed) *before* serving if you want to release rules while the server
+    /// runs — e.g. under [`OnDisconnect::Retain`], or from an
+    /// [`OnDisconnect::Notify`] callback.
+    #[must_use]
+    pub fn handle(&self) -> ForwardHandle<B> {
+        ForwardHandle::new(Arc::clone(&self.forwards), Arc::clone(&self.backend))
     }
 
     /// Bound address (useful when built with port 0 to discover the OS-assigned
@@ -126,6 +158,19 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             "adb server frontend listening on {actual} (features: {})",
             self.caps.features_csv()
         );
+
+        // Unless the policy is Retain (caller manages release itself), subscribe
+        // to the backend's lifecycle stream and spawn the disconnect handler:
+        // when a device's transport vanishes, release (or notify about) its
+        // forward/reverse rules. Spawned before the accept loop so a disconnect
+        // is handled even with no clients connected.
+        if !matches!(self.on_disconnect, OnDisconnect::Retain) {
+            let events = self.backend.subscribe_lifecycle().await;
+            let handle = self.handle();
+            let policy = self.on_disconnect.clone();
+            tokio::spawn(handle_disconnects(events, handle, policy));
+        }
+
         let shared = Arc::new(self);
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -1143,12 +1188,43 @@ async fn run_forward_listener<B: DeviceBackend>(
     }
 }
 
+/// The disconnect-handling loop: drain the backend's [`LifecycleEvent`] stream
+/// and apply the [`OnDisconnect`] policy to each vanished serial.
+///
+/// Spawned by [`AdbServerFrontend::serve`] only when the policy is not
+/// [`OnDisconnect::Retain`] (that variant releases nothing, so the loop is not
+/// even started). Ends when the backend closes the stream (server teardown).
+async fn handle_disconnects<B: DeviceBackend>(
+    mut events: mpsc::Receiver<LifecycleEvent>,
+    handle: ForwardHandle<B>,
+    policy: OnDisconnect,
+) {
+    while let Some(LifecycleEvent::Disconnected(serial)) = events.recv().await {
+        match &policy {
+            OnDisconnect::ReleaseAll => {
+                let n = handle.release(&serial).await;
+                tracing::info!(
+                    serial = %serial,
+                    "device disconnected; released {n} forward rule(s) + reverse rules"
+                );
+            }
+            OnDisconnect::Notify(cb) => {
+                tracing::debug!(serial = %serial, "device disconnected; notifying caller");
+                cb(&serial);
+            }
+            // Retain never starts this loop (see `serve`), but match exhaustively
+            // so a future construction path can't silently release.
+            OnDisconnect::Retain => {}
+        }
+    }
+    tracing::debug!("disconnect handler: lifecycle stream closed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Result;
     use crate::server::backend::DeviceState;
-    use tokio::sync::mpsc;
 
     /// A hardware-free backend with a fixed device list. `open_local_service` is
     /// never called by these tests (they exercise the host-protocol arms that do
@@ -1252,6 +1328,154 @@ mod tests {
         let _ = client.read_to_end(&mut buf).await;
         server.await.expect("server task");
         buf
+    }
+
+    /// A backend that records reverse-release calls, for disconnect-handler
+    /// tests. Its `subscribe_lifecycle` is driven manually via a returned sender.
+    #[derive(Default)]
+    struct DisconnectBackend {
+        released_reverse: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl DeviceBackend for DisconnectBackend {
+        async fn list_devices(&self) -> Vec<DeviceEntry> {
+            Vec::new()
+        }
+        async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+        async fn open_local_service(
+            &self,
+            _serial: &str,
+            _cmd: &ADBLocalCommand,
+        ) -> Result<crate::usb::MultiplexedSession> {
+            unimplemented!("not exercised")
+        }
+        async fn release_reverse(&self, serial: &str) -> Result<()> {
+            self.released_reverse
+                .lock()
+                .expect("test lock")
+                .push(serial.to_owned());
+            Ok(())
+        }
+    }
+
+    /// Build a frontend over a `DisconnectBackend` carrying a forward rule for
+    /// `serial`, plus the handle and reverse-release log. Returns everything the
+    /// disconnect tests need.
+    async fn disconnect_fixture(
+        serial: &str,
+        policy: OnDisconnect,
+    ) -> (
+        AdbServerFrontend<DisconnectBackend>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let backend = Arc::new(DisconnectBackend::default());
+        let log = Arc::clone(&backend.released_reverse);
+        let frontend = AdbServerFrontend::builder(backend)
+            .on_disconnect(policy)
+            .build();
+        // Seed a forward rule for `serial` (no-op listener task stand-in).
+        frontend
+            .forwards
+            .insert(7000, 7001, serial.to_string(), tokio::spawn(async {}))
+            .await;
+        (frontend, log)
+    }
+
+    /// Contract: a `Disconnected` event under `ReleaseAll` drops the serial's
+    /// forward rule AND releases its reverse rules. This is the host-side fix for
+    /// "USB unplugged but `forward --list` still shows the rule". The handler is
+    /// source-agnostic — USB hotplug and TCP `host:disconnect` both arrive as the
+    /// same `LifecycleEvent::Disconnected(serial)`, so one test covers both paths.
+    #[tokio::test]
+    async fn release_all_policy_drops_forward_and_reverse_on_disconnect() {
+        let (frontend, reverse_log) =
+            disconnect_fixture("YTGUSCNFMFAIK7ZP", OnDisconnect::ReleaseAll).await;
+        let handle = frontend.handle();
+        assert!(
+            frontend.forwards.contains(7000).await,
+            "precondition: forward rule present"
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        let driver = tokio::spawn(handle_disconnects(rx, handle, OnDisconnect::ReleaseAll));
+        tx.send(LifecycleEvent::Disconnected("YTGUSCNFMFAIK7ZP".to_string()))
+            .await
+            .expect("send event");
+        drop(tx); // close stream so the handler loop ends
+        driver.await.expect("handler task");
+
+        assert!(
+            !frontend.forwards.contains(7000).await,
+            "forward rule must be released on disconnect"
+        );
+        assert_eq!(
+            reverse_log.lock().expect("test lock").as_slice(),
+            ["YTGUSCNFMFAIK7ZP"],
+            "reverse rules must be released for the disconnected serial"
+        );
+    }
+
+    /// Contract: under `Notify`, the handler releases NOTHING itself — it only
+    /// invokes the callback with the serial. The rule stays until the caller acts.
+    #[tokio::test]
+    async fn notify_policy_invokes_callback_and_releases_nothing() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cl = Arc::clone(&seen);
+        let policy = OnDisconnect::Notify(Arc::new(move |s: &str| {
+            seen_cl.lock().expect("test lock").push(s.to_owned());
+        }));
+        let (frontend, reverse_log) = disconnect_fixture("DEV1", policy.clone()).await;
+        let handle = frontend.handle();
+
+        let (tx, rx) = mpsc::channel(4);
+        let driver = tokio::spawn(handle_disconnects(rx, handle, policy));
+        tx.send(LifecycleEvent::Disconnected("DEV1".to_string()))
+            .await
+            .expect("send event");
+        drop(tx);
+        driver.await.expect("handler task");
+
+        assert_eq!(
+            seen.lock().expect("test lock").as_slice(),
+            ["DEV1"],
+            "Notify must invoke the callback with the disconnected serial"
+        );
+        assert!(
+            frontend.forwards.contains(7000).await,
+            "Notify must NOT release the forward rule itself"
+        );
+        assert!(
+            reverse_log.lock().expect("test lock").is_empty(),
+            "Notify must NOT release reverse rules itself"
+        );
+    }
+
+    /// Contract: `Retain` releases nothing. (`serve` does not even start the
+    /// handler for Retain; this asserts the loop body is inert if reached.)
+    #[tokio::test]
+    async fn retain_policy_releases_nothing() {
+        let (frontend, reverse_log) = disconnect_fixture("DEV2", OnDisconnect::Retain).await;
+        let handle = frontend.handle();
+
+        let (tx, rx) = mpsc::channel(4);
+        let driver = tokio::spawn(handle_disconnects(rx, handle, OnDisconnect::Retain));
+        tx.send(LifecycleEvent::Disconnected("DEV2".to_string()))
+            .await
+            .expect("send event");
+        drop(tx);
+        driver.await.expect("handler task");
+
+        assert!(
+            frontend.forwards.contains(7000).await,
+            "Retain must keep the forward rule"
+        );
+        assert!(
+            reverse_log.lock().expect("test lock").is_empty(),
+            "Retain must not release reverse rules"
+        );
     }
 
     /// SEG A regression: a client socket accepted by the frontend must have

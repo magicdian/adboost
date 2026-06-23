@@ -15,15 +15,16 @@
 //! [`UsbDeviceBackend`] remains as a deprecated type alias for source
 //! compatibility.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
-use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry};
+use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry, LifecycleEvent};
 use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 use crate::usb::{
     MultiplexedSession, PersistentTcpConnection, PersistentUsbConnection, ReverseEngine,
@@ -35,6 +36,13 @@ use crate::{Result, RustADBError};
 /// latest snapshot matters, and the consumer (one `host:track-devices` client)
 /// drains promptly.
 const CHANGES_CHANNEL_SIZE: usize = 8;
+
+/// Channel depth for the internal device-lifecycle stream
+/// ([`DeviceBackend::subscribe_lifecycle`]). Disconnect events are infrequent
+/// (a human unplugging a cable, an `adb disconnect`), so a small buffer amply
+/// absorbs a burst (e.g. a hub losing power drops several serials at once)
+/// before the frontend drains it.
+const LIFECYCLE_CHANNEL_SIZE: usize = 32;
 
 /// The default adbd-over-TCP port (`adb connect <host>` with no `:port`).
 const DEFAULT_ADB_TCP_PORT: u16 = 5555;
@@ -67,6 +75,17 @@ pub struct DefaultDeviceBackend {
     /// Wrapped in an `Arc` so the `host:track-devices` hotplug watcher task can
     /// hold a clone and fold TCP devices into each snapshot it pushes.
     tcp_devices: Arc<Mutex<HashMap<String, Arc<PersistentTcpConnection>>>>,
+    /// Internal device-lifecycle event hub (see
+    /// [`DeviceBackend::subscribe_lifecycle`]). A `broadcast` channel so the
+    /// single long-lived USB hotplug watcher and the synchronous TCP
+    /// `disconnect` path can both publish [`LifecycleEvent`]s, and every
+    /// `subscribe_lifecycle` caller gets its own receiver. Lazily initialized on
+    /// first subscription so a backend that never serves pays nothing; the
+    /// hotplug-diff watcher task is spawned exactly once alongside it.
+    lifecycle: OnceLock<broadcast::Sender<LifecycleEvent>>,
+    /// Guards one-time spawn of the USB hotplug-diff watcher that feeds
+    /// `lifecycle`. Set the first time [`Self::lifecycle_tx`] initializes the hub.
+    lifecycle_watch_started: AtomicBool,
 }
 
 /// Deprecated former name of [`DefaultDeviceBackend`]. The default backend now
@@ -232,11 +251,118 @@ impl DefaultDeviceBackend {
         conns.insert(serial.to_owned(), Arc::clone(&conn));
         Ok(conn)
     }
+
+    /// The lifecycle broadcast sender, initializing the hub (and spawning the
+    /// one-shot USB hotplug-diff watcher that feeds it) on first use.
+    ///
+    /// Idempotent: the `OnceLock` makes hub creation race-free, and the
+    /// `AtomicBool` ensures the watcher task is spawned exactly once even if two
+    /// `subscribe_lifecycle` calls land together.
+    fn lifecycle_tx(&self) -> broadcast::Sender<LifecycleEvent> {
+        let tx = self
+            .lifecycle
+            .get_or_init(|| broadcast::channel(LIFECYCLE_CHANNEL_SIZE).0)
+            .clone();
+        if !self.lifecycle_watch_started.swap(true, Ordering::SeqCst) {
+            Self::spawn_usb_disconnect_watch(tx.clone());
+        }
+        tx
+    }
+
+    /// Emit a [`LifecycleEvent::Disconnected`] for `serial` if the lifecycle hub
+    /// has been initialized. A no-op before the first `subscribe_lifecycle`
+    /// (nobody is listening yet) and when all receivers have lagged/closed —
+    /// disconnect cleanup is best-effort, never fatal.
+    fn emit_disconnected(&self, serial: &str) {
+        if let Some(tx) = self.lifecycle.get() {
+            // `send` errs only when there are no live receivers; that's fine.
+            let _ = tx.send(LifecycleEvent::Disconnected(serial.to_owned()));
+        }
+    }
+
+    /// Spawn the single USB hotplug-diff watcher. It maintains the set of
+    /// present ADB USB serials and, on each hotplug event, re-enumerates and
+    /// emits [`LifecycleEvent::Disconnected`] for every serial that left.
+    ///
+    /// Separate from `subscribe_changes`'s watcher: that one pushes full
+    /// snapshots to one `track-devices` client and carries no
+    /// disappeared-since-last-time memory. Lifecycle cleanup needs the *diff*
+    /// (which serial vanished), so it keeps its own previous-set state.
+    fn spawn_usb_disconnect_watch(tx: broadcast::Sender<LifecycleEvent>) {
+        let watch = match nusb::watch_devices() {
+            Ok(w) => w,
+            Err(e) => {
+                // No hotplug on this platform/setup: USB disconnects won't be
+                // auto-detected. TCP disconnects still emit (synchronous path),
+                // and stale USB connections are still reaped lazily on next use.
+                tracing::warn!(
+                    "DefaultDeviceBackend: hotplug unavailable ({e}); USB disconnect auto-release disabled"
+                );
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let mut present: HashSet<String> = Self::enumerate_usb_serials();
+            let mut watch = watch;
+            while watch.next().await.is_some() {
+                let now = Self::enumerate_usb_serials();
+                // Serials in the previous set but not the current one disconnected.
+                for gone in present.difference(&now) {
+                    tracing::info!(serial = %gone, "USB device disconnected; emitting lifecycle event");
+                    if tx.send(LifecycleEvent::Disconnected(gone.clone())).is_err() {
+                        // All receivers dropped → frontend gone; stop watching.
+                        return;
+                    }
+                }
+                present = now;
+            }
+            tracing::debug!("DefaultDeviceBackend: lifecycle hotplug watch ended");
+        });
+    }
+
+    /// The set of currently-present ADB USB device serials (serial-less devices
+    /// are skipped, matching [`Self::enumerate_usb`]).
+    fn enumerate_usb_serials() -> HashSet<String> {
+        match find_all_connected_adb_devices() {
+            Ok(devices) => devices.into_iter().filter_map(|d| d.serial).collect(),
+            Err(e) => {
+                tracing::warn!("DefaultDeviceBackend: serial enumeration failed: {e}");
+                HashSet::new()
+            }
+        }
+    }
 }
 
 impl DeviceBackend for DefaultDeviceBackend {
     async fn list_devices(&self) -> Vec<DeviceEntry> {
         self.enumerate_all().await
+    }
+
+    async fn subscribe_lifecycle(&self) -> mpsc::Receiver<LifecycleEvent> {
+        // Initialize the hub + spawn the one-shot USB hotplug-diff watcher, then
+        // bridge this subscriber's broadcast receiver onto an mpsc the frontend
+        // consumes (the trait surface is mpsc to match `subscribe_changes`). The
+        // bridge task ends when either the broadcast closes or the frontend drops
+        // its mpsc receiver. Lagged events (slow consumer) are logged and skipped
+        // rather than aborting the stream.
+        let mut bcast = self.lifecycle_tx().subscribe();
+        let (tx, rx) = mpsc::channel(LIFECYCLE_CHANNEL_SIZE);
+        tokio::spawn(async move {
+            loop {
+                match bcast.recv().await {
+                    Ok(ev) => {
+                        if tx.send(ev).await.is_err() {
+                            break; // frontend dropped its receiver
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("subscribe_lifecycle: lagged, dropped {n} event(s)");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        rx
     }
 
     async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>> {
@@ -393,6 +519,22 @@ impl DeviceBackend for DefaultDeviceBackend {
         self.reverse_engine(serial).await?.remove_all().await
     }
 
+    async fn release_reverse(&self, serial: &str) -> Result<()> {
+        // Disconnect path: do NOT route through `reverse_engine`, which would
+        // re-open the (just-unplugged) connection to reach the engine. The
+        // device is gone, so its inbound-open pump is already stopping; we only
+        // need to drop the in-memory rule entry. Removing the engine from the
+        // map drops the last non-pump `Arc`, so its rules stop showing in
+        // `list_reverse` and the entry no longer leaks until `shutdown()`.
+        if self.reverse.lock().await.remove(serial).is_some() {
+            tracing::debug!(
+                serial,
+                "release_reverse: dropped reverse engine on disconnect"
+            );
+        }
+        Ok(())
+    }
+
     async fn list_reverse(&self, serial: &str) -> Result<String> {
         // The host's own rule registry is the source of truth for what this
         // server set up; render it directly (the device's list-forward would also
@@ -438,15 +580,23 @@ impl DeviceBackend for DefaultDeviceBackend {
     async fn disconnect(&self, addr: &str) -> Result<String> {
         // Empty target → disconnect every TCP device (AOSP `adb disconnect`).
         if addr.is_empty() {
-            let mut map = self.tcp_devices.lock().await;
-            let n = map.len();
-            map.clear();
+            let gone: Vec<String> = {
+                let mut map = self.tcp_devices.lock().await;
+                map.drain().map(|(serial, _)| serial).collect()
+            };
+            let n = gone.len();
+            // Each removed serial's forward/reverse rules are now stale: emit a
+            // lifecycle event so the frontend releases them per its policy.
+            for serial in &gone {
+                self.emit_disconnected(serial);
+            }
             return Ok(format!("disconnected everything ({n} device(s))"));
         }
 
         let (_socket, serial) = Self::resolve_tcp_target(addr)?;
         if self.tcp_devices.lock().await.remove(&serial).is_some() {
             tracing::info!("host:disconnect removed TCP/IP device {serial}");
+            self.emit_disconnected(&serial);
             Ok(format!("disconnected {serial}"))
         } else {
             Err(RustADBError::ADBRequestFailed(format!(

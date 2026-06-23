@@ -22,6 +22,22 @@
 //! ([`BackendCapabilities`][crate::server::BackendCapabilities]) — the honest
 //! banner: the server never offers a richer wire framing it cannot satisfy.
 //!
+//! # Disconnect cleanup
+//!
+//! When a device's transport vanishes (USB unplug, TCP `host:disconnect`, or its
+//! persistent connection's reader dying), its `forward` / `reverse` rules are
+//! **released by default** — matching standard `adb`, which does not leave a
+//! host-side listener bound to a device that is gone. The behavior is configured
+//! via [`AdbServerFrontendBuilder::on_disconnect`][crate::server::AdbServerFrontendBuilder::on_disconnect]
+//! with an [`OnDisconnect`][crate::server::OnDisconnect] policy
+//! ([`ReleaseAll`][crate::server::OnDisconnect::ReleaseAll] default,
+//! [`Retain`][crate::server::OnDisconnect::Retain], or
+//! [`Notify`][crate::server::OnDisconnect::Notify]). Callers managing release
+//! themselves use [`ForwardHandle`][crate::server::ForwardHandle] (obtained from
+//! [`AdbServerFrontend::handle`][crate::server::AdbServerFrontend::handle] before
+//! serving). See the backend seam
+//! [`DeviceBackend::subscribe_lifecycle`][crate::server::DeviceBackend::subscribe_lifecycle].
+//!
 //! # Layers
 //!
 //! - [`crate::server::protocol`] — pure, I/O-free smartsocket host-protocol wire encode/decode.
@@ -37,11 +53,17 @@ mod backend;
 mod capabilities;
 mod default_backend;
 mod forward;
+mod forward_handle;
 mod frontend;
+mod on_disconnect;
 
-pub use backend::{BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, ReversePolicy};
+pub use backend::{
+    BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, LifecycleEvent, ReversePolicy,
+};
 pub use capabilities::{KillPolicy, ServerCapabilities};
 pub use default_backend::DefaultDeviceBackend;
 #[allow(deprecated)]
 pub use default_backend::UsbDeviceBackend;
+pub use forward_handle::ForwardHandle;
 pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
+pub use on_disconnect::OnDisconnect;
