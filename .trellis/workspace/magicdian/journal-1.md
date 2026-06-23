@@ -1029,3 +1029,36 @@ Investigated a TCP read cancel-safety report; a 6-lens adversarial review found 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 25: 断开自动释放 forward/reverse 规则（OnDisconnect 策略 + ForwardHandle）
+
+**Date**: 2026-06-23
+**Task**: 断开自动释放 forward/reverse 规则（OnDisconnect 策略 + ForwardHandle）
+**Branch**: `main`
+
+### Summary
+
+为 adboost server 增加 transport 断开时自动释放 forward/reverse 规则的能力，默认对齐标准 adb（断开即释放），可 opt-out。新增 OnDisconnect 策略（ReleaseAll/Retain/Notify，仿 ReversePolicy）、DeviceBackend::subscribe_lifecycle 事件流（独立于 track-devices，由 nusb hotplug diff + TCP disconnect 驱动）、release_reverse（不重开死连接）、ForwardHandle 主动清理 API（release/release_all，统一管 forward+reverse）、ForwardRegistry::remove_by_serial。frontend 订阅事件按策略释放。真机端到端验证通过（新增 selftest case_usb_forward_release_on_unplug：官方 adb 注册 forward→拔 USB→断言 list 自动清空），并修复既有 selftest 跨-case USB 重新枚举时序脆弱性（open_device_with_retry）。契约写入 server-host-protocol.md。质量门全绿：252 lib + 21 cli 测试通过。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `82006cc` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
