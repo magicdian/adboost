@@ -1062,3 +1062,36 @@ Investigated a TCP read cancel-safety report; a 6-lens adversarial review found 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 26: host-usb/host-local + transport-usb/local for adb -d/-e
+
+**Date**: 2026-06-23
+**Task**: host-usb/host-local + transport-usb/local for adb -d/-e
+**Branch**: `feat/host-usb-local-transport-kind`
+
+### Summary
+
+Implemented transport-kind selection so adb -d/-e work against the adboost server frontend, aligned with native adb. Added TransportKind{Usb,Local} + DeviceEntry.kind:Option<_> (#[non_exhaustive], with_kind builder), DefaultDeviceBackend tags USB/Local. One shared resolve_single_by_kind funnels all selection paths with byte-exact AOSP per-kind error wording (verified against adb 35.0.2). Stripped host-usb:/host-local: prefixes (reusing dispatch_host_serial), added transport-usb/local arms, kind-filtered wait-for. Updated server-host-protocol.md in lockstep; 18 new tests; fmt+clippy(pedantic)+270 tests green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bbc2b3e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
