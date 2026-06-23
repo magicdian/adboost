@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "验收时核对断开释放未破坏 host 协议各 transport 路径的 AOSP 语义一致性，forward/reverse 生命周期契约成立。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "检查 lint/typecheck/test 是否 green、测试风格是否符合、未引入超过 MSRV 1.88.0 的 API。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对新增 API 的错误类型与传播是否遵守 RustADBError 约定。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "核对 backend→frontend 事件流的跨层一致性，USB/TCP 两路径行为是否对齐。"}

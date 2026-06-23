@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "本任务核心改动在 server frontend（forward 注册表、transport 选择、生命周期）；该契约约定 host 协议各路径必须一致的 AOSP 语义，新增断开释放接缝必须遵守。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "确定新文件（OnDisconnect 策略、ForwardHandle）应放置的模块位置与 workspace 约定（edition 2024 / MSRV 1.88.0 / 仅 adboost+adboost_cli 参与构建）。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "新增 trait 方法 / 主动清理 API 涉及 Result 与 RustADBError；需遵守核心库的 thiserror 单枚举 + #[from] 约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy/rustfmt 默认配置、测试风格、MSRV 约束；新策略类型与契约测试需符合。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "本任务核心是 backend(断开检测) → frontend(forward 注册表) 的跨层事件流，需按跨层数据流指南设计接缝。"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "OnDisconnect 应复用 ReversePolicy 的枚举+回调范式；ForwardHandle 应复用现有 Arc 共享模式，避免重复造轮子。"}
