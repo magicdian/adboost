@@ -1095,3 +1095,36 @@ Implemented transport-kind selection so adb -d/-e work against the adboost serve
 ### Next Steps
 
 - None - task complete
+
+
+## Session 27: Fix adb -d/-e: select_tport kind tokens (tport:usb/local)
+
+**Date**: 2026-06-23
+**Task**: Fix adb -d/-e: select_tport kind tokens (tport:usb/local)
+**Branch**: `main`
+
+### Summary
+
+Follow-up to the host-usb/transport-kind task: adb -d/-e still failed 'device not found' because modern adb's phase-2 switch is host:tport:usb/local (not transport-usb), and select_tport parsed usb/local as a serial. Extracted pure pick_single_by_kind helper (resolve_single_by_kind now wraps it), added usb/local kind-token branch to select_tport reusing the already-fetched device slice, kept serial:<s> resolving by serial. Verified end-to-end with real adb client against in-process server (adb -d shell/getprop/get-state all work). 7 new tests, spec updated lockstep, fmt/clippy/tests green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `43217d2` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

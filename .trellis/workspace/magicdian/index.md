@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 26
+- **Total Sessions**: 27
 - **Last Active**: 2026-06-23
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1097 | Active |
+| `journal-1.md` | ~1130 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 27 | 2026-06-23 | Fix adb -d/-e: select_tport kind tokens (tport:usb/local) | `43217d2` | `main` |
 | 26 | 2026-06-23 | host-usb/host-local + transport-usb/local for adb -d/-e | `bbc2b3e` | `feat/host-usb-local-transport-kind` |
 | 25 | 2026-06-23 | 断开自动释放 forward/reverse 规则（OnDisconnect 策略 + ForwardHandle） | `82006cc` | `main` |
 | 24 | 2026-06-22 | Transport cancel-safety bug class: shared FrameReadBuffer + frame-atomic write timeout + hardening | `1aac71c`, `23c2078`, `5bd58ae`, `f45e91d`, `584dd75`, `ea88205`, `bfcd337` | `main` |
