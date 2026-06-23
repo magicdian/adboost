@@ -25,16 +25,28 @@ kind and applies the zero/one/many uniqueness with kind-correct wording.
 | `host:transport-local` | `select_transport_kind(Some(Local))` | bare `OKAY` |
 | `host:transport:<serial>` | `select_transport_by_serial` | bare `OKAY` |
 | `host:transport-id:<N>` | `select_transport_by_id` | bare `OKAY` |
-| `host:tport:<sel>` (`any`/`-any`/empty, `serial:<s>`/`<s>`, `id:<N>`/`-id:<N>`) | `select_tport` | `OKAY` + 8-byte LE id |
+| `host:tport:<sel>` (`any`/`-any`/empty, `usb`/`local`, `serial:<s>`/`<s>`, `id:<N>`/`-id:<N>`) | `select_tport` | `OKAY` + 8-byte LE id |
 | `host:*forward*` (no serial) | `serve_host_forward` → `resolve_single_serial` → `resolve_single_by_kind(None)` | forward-family framing |
 | `host-usb:<sub>` / `host-local:<sub>` | `dispatch_host_kind` → `resolve_single_by_kind(Some(kind))` then `dispatch_host_serial` | per-sub-service (mirrors `host-serial:`) |
 
 ### Transport KIND filter — `adb -d` / `adb -e` (`TransportKind`)
 
 Native `adb` encodes a transport-type filter into the request: `-d` (USB) →
-`host-usb:` prefix then `transport-usb`; `-e` (emulator/TCP-local) → `host-local:`
-then `transport-local`. This is the wire-side mirror of AOSP's `TransportType`
-(`kTransportUsb`/`kTransportLocal`/`kTransportAny`).
+`host-usb:` prefix then a transport switch; `-e` (emulator/TCP-local) →
+`host-local:` then a transport switch. This is the wire-side mirror of AOSP's
+`TransportType` (`kTransportUsb`/`kTransportLocal`/`kTransportAny`).
+
+> **Modern `adb` phase 2 uses `tport:`, not `transport-usb`.** Confirmed via
+> `ADB_TRACE=all adb -d shell true` against adb 35.0.2: phase 1 is
+> `host-usb:features`, then phase 2 is **`host:tport:usb`** (it wants the 8-byte
+> transport-id back), NOT the legacy `host:transport-usb`. `-e` mirrors with
+> `host:tport:local`. So `select_tport` recognizes the bare `usb`/`local` kind
+> tokens and routes them through the **same** shared kind resolver
+> (`pick_single_by_kind`) as `transport-usb`/`transport-local` — same single-device
+> resolution, same kind-specific wording. The `transport-usb`/`transport-local`
+> `match svc` arms are kept for older / direct callers. Only the *bare* tokens are
+> kinds; the explicit `serial:<s>` form still resolves a device literally named
+> `usb`/`local`.
 
 - `DeviceEntry.kind: Option<TransportKind>` carries each device's kind.
   **`None` = "this backend does not tag kind" → matches ANY requested kind** (the
@@ -45,6 +57,13 @@ then `transport-local`. This is the wire-side mirror of AOSP's `TransportType`
 - `kind_matches(want, entry_kind)`: `None` on *either* side matches; two concrete
   kinds must be equal. This is the single predicate behind `resolve_single_by_kind`
   and `serve_wait_for` (`wait-for-usb-device` / `wait-for-local-device`).
+- `pick_single_by_kind(devices, want)` is the **pure** filter + zero/one/many core
+  over an already-fetched device slice (uses `kind_matches` /
+  `no_devices_msg` / `ambiguous_msg`). `resolve_single_by_kind` is a thin async
+  wrapper (fetch → delegate → clone serial); `select_tport`'s `usb`/`local` branch
+  calls it directly on its own already-fetched slice (no second `list_devices()`).
+  This keeps the "every kind-aware selection funnels through one core" invariant
+  literally true with no duplicated wording.
 - `host-usb:`/`host-local:` are structurally `host-serial:` with the device pinned
   by kind instead of serial: resolve the one matching device, then run the same
   sub-service set via `dispatch_host_serial`.
@@ -206,6 +225,16 @@ Transport-KIND (`adb -d`/`-e`) assertion points (all in `frontend.rs` tests):
   `transport_usb_untagged_multi_device_is_ambiguous_with_usb_wording` → `kind: None` backward-compat
 - Pure helpers: `parse_transport_kind_maps_tokens`, `kind_matches_treats_none_as_wildcard_on_both_sides`,
   `error_wording_matches_aosp_per_kind` (locks the exact AOSP strings)
+
+Modern phase-2 `host:tport:usb`/`host:tport:local` assertion points (the path the
+real client actually uses; same shared resolver / wording as `transport-usb`):
+
+- `tport_usb_selects_single_usb_device_okay_plus_id` / `tport_local_selects_single_local_device_okay_plus_id` → `OKAY` + 8-byte id
+- `tport_usb_in_mixed_topology_picks_usb_local_picks_tcp` → `-d` picks USB, `-e` picks TCP
+- `tport_usb_with_two_usb_devices_fails_more_than_one_usb_device` → `more than one USB device`
+- `tport_usb_with_only_a_tcp_device_fails_no_devices_found` → `no devices found`
+- `tport_local_with_only_a_usb_device_fails_no_emulators_found` → `no emulators found`
+- `tport_usb_untagged_single_device_replies_okay_plus_id` → `kind: None` backward-compat
 
 ### Runtime selftest (device-backed, `adboost_cli selftest`)
 

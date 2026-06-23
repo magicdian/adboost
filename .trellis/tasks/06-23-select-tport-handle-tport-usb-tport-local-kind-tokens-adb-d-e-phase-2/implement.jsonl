@@ -1,0 +1,1 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Transport-selection contract: the 'every selection path funnels through one resolver / agrees on AOSP wording' invariant, the tport selector semantics, and the kind Error Matrix this fix must extend in lockstep."}

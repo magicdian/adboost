@@ -600,12 +600,7 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         want: Option<TransportKind>,
     ) -> Result<String, &'static str> {
         let devices = self.backend.list_devices().await;
-        let mut matching = devices.iter().filter(|d| kind_matches(want, d.kind));
-        match (matching.next(), matching.next()) {
-            (None, _) => Err(no_devices_msg(want)),
-            (Some(one), None) => Ok(one.serial.clone()),
-            (Some(_), Some(_)) => Err(ambiguous_msg(want)),
-        }
+        pick_single_by_kind(&devices, want).map(|d| d.serial.clone())
     }
 
     /// Resolve the single connected device's serial (transport-any semantics),
@@ -826,6 +821,15 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                         .ok_or("no device for transport id"),
                     Err(_) => Err("invalid transport id"),
                 }
+            } else if let Some(kind) = parse_transport_kind(rest) {
+                // Bare `usb`/`local` kind tokens — modern `adb -d`/`-e` phase 2
+                // (`host:tport:usb` / `host:tport:local`, confirmed via
+                // ADB_TRACE on adb 35.0.2). Route through the same shared kind
+                // resolver as `transport-usb`/`transport-local`, reusing the
+                // already-fetched `devices` (no second `list_devices()`). Only
+                // the *bare* tokens are kinds; the explicit `serial:` form below
+                // still resolves a device literally named `usb`/`local`.
+                pick_single_by_kind(&devices, Some(kind)).map(|d| d.serial.clone())
             } else {
                 // `tport:serial:<serial>` or `tport:<serial>`
                 let serial = rest.strip_prefix("serial:").unwrap_or(rest);
@@ -1132,6 +1136,26 @@ fn parse_transport_kind(token: &str) -> Option<TransportKind> {
         "usb" => Some(TransportKind::Usb),
         "local" => Some(TransportKind::Local),
         _ => None,
+    }
+}
+
+/// The filter + zero/one/many core of transport selection over an
+/// already-fetched device slice: keep the devices matching `want`
+/// ([`kind_matches`]) and require exactly one. This is the single shared core
+/// behind every kind-aware selection path (`resolve_single_by_kind` wraps it
+/// with a `list_devices()` fetch; `select_tport` calls it directly on its own
+/// already-fetched slice to avoid a second fetch), so they all agree on the
+/// kind-specific AOSP zero/more-than-one wording
+/// ([`no_devices_msg`]/[`ambiguous_msg`]).
+fn pick_single_by_kind(
+    devices: &[DeviceEntry],
+    want: Option<TransportKind>,
+) -> Result<&DeviceEntry, &'static str> {
+    let mut matching = devices.iter().filter(|d| kind_matches(want, d.kind));
+    match (matching.next(), matching.next()) {
+        (None, _) => Err(no_devices_msg(want)),
+        (Some(one), None) => Ok(one),
+        (Some(_), Some(_)) => Err(ambiguous_msg(want)),
     }
 }
 
@@ -1476,6 +1500,38 @@ mod tests {
 
         let mut resp = [0u8; 4];
         client.read_exact(&mut resp).await.expect("read OKAY");
+        drop(client); // EOF → server's next read_request returns None → clean exit
+        server.await.expect("server task");
+        resp
+    }
+
+    /// Drive one `host:tport:*` request. Like [`round_trip_select`] a successful
+    /// selection keeps the socket open, but `tport` replies `OKAY` + an 8-byte LE
+    /// transport id, so we read exactly 12 bytes then drop the client to EOF the
+    /// server. Returns the 12 reply bytes.
+    async fn round_trip_tport(
+        frontend: Arc<AdbServerFrontend<MockBackend>>,
+        request: &str,
+    ) -> [u8; 12] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = frontend.handle_client(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(format!("{:04x}{request}", request.len()).as_bytes())
+            .await
+            .expect("write req");
+        client.flush().await.expect("flush");
+
+        let mut resp = [0u8; 12];
+        client
+            .read_exact(&mut resp)
+            .await
+            .expect("read 12-byte tport reply");
         drop(client); // EOF → server's next read_request returns None → clean exit
         server.await.expect("server task");
         resp
@@ -1951,6 +2007,87 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("more than one USB device"), "got: {body}");
+    }
+
+    // ---- `adb -d`/`-e` phase 2: `host:tport:usb` / `host:tport:local` ----------
+    //
+    // Modern `adb` (35.0.2, confirmed via ADB_TRACE) selects the transport with
+    // `host:tport:usb` / `host:tport:local` — NOT the legacy `transport-usb`. The
+    // bare `usb`/`local` tokens are kind tokens and route through the same shared
+    // kind resolver, so wording matches `transport-usb`/`transport-local` exactly.
+
+    #[tokio::test]
+    async fn tport_usb_selects_single_usb_device_okay_plus_id() {
+        // `-d` phase 2 against one USB device → OKAY + 8-byte transport id.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1")]));
+        let resp = round_trip_tport(f, "host:tport:usb").await;
+        assert_eq!(&resp[..4], b"OKAY");
+        assert_eq!(&resp[4..], &1u64.to_le_bytes(), "single device -> id 1");
+    }
+
+    #[tokio::test]
+    async fn tport_local_selects_single_local_device_okay_plus_id() {
+        // `-e` phase 2 against one local/TCP device → OKAY + 8-byte transport id.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip_tport(f, "host:tport:local").await;
+        assert_eq!(&resp[..4], b"OKAY");
+        assert_eq!(&resp[4..], &1u64.to_le_bytes(), "single device -> id 1");
+    }
+
+    #[tokio::test]
+    async fn tport_usb_in_mixed_topology_picks_usb_local_picks_tcp() {
+        // One USB + one TCP device: `tport:usb` locks the USB device, `tport:local`
+        // the TCP one. Serials sort as "10.0.0.5:5555" (id 1) < "usb1" (id 2).
+        let devices = vec![usb_dev("usb1"), local_dev("10.0.0.5:5555")];
+        let f = Arc::new(frontend_with(devices.clone()));
+        let resp = round_trip_tport(f, "host:tport:usb").await;
+        assert_eq!(&resp[..4], b"OKAY", "tport:usb selects the USB device");
+        assert_eq!(&resp[4..], &2u64.to_le_bytes(), "usb1 -> id 2");
+
+        let f = Arc::new(frontend_with(devices));
+        let resp = round_trip_tport(f, "host:tport:local").await;
+        assert_eq!(&resp[..4], b"OKAY", "tport:local selects the TCP device");
+        assert_eq!(&resp[4..], &1u64.to_le_bytes(), "10.0.0.5:5555 -> id 1");
+    }
+
+    #[tokio::test]
+    async fn tport_usb_with_two_usb_devices_fails_more_than_one_usb_device() {
+        // Ambiguity within the USB kind → AOSP USB-specific wording.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1"), usb_dev("usb2")]));
+        let resp = round_trip(f, "host:tport:usb").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("more than one USB device"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_usb_with_only_a_tcp_device_fails_no_devices_found() {
+        // `-d` when the only device is TCP → USB-specific zero wording.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip(f, "host:tport:usb").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_local_with_only_a_usb_device_fails_no_emulators_found() {
+        // `-e` when the only device is USB → local-specific zero wording.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1")]));
+        let resp = round_trip(f, "host:tport:local").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no emulators found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn tport_usb_untagged_single_device_replies_okay_plus_id() {
+        // Untagged backend (kind: None) must not regress: `tport:usb` degrades to
+        // transport-any uniqueness — the single untagged device is selected.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip_tport(f, "host:tport:usb").await;
+        assert_eq!(&resp[..4], b"OKAY");
+        assert_eq!(&resp[4..], &1u64.to_le_bytes(), "single device -> id 1");
     }
 
     #[tokio::test]

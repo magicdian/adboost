@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Verify the tport:usb/tport:local path is documented as the modern -d/-e phase-2 route, routes through the shared resolver, and the selector list + Error Matrix stay consistent."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality bar: fmt, clippy::pedantic -D warnings (default + --features usb,server), inline tests, MSRV 1.88."}
