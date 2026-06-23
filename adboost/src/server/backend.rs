@@ -22,9 +22,35 @@ use crate::{Result, RustADBError};
 // existing `server::ReversePolicy` users keep compiling.
 pub use crate::usb::ReversePolicy;
 
+/// How a device's transport is reached — the wire equivalent of AOSP's
+/// `TransportType` (`kTransportUsb` / `kTransportLocal`). It is the filter behind
+/// `adb -d` (USB) and `adb -e` (emulator/TCP-local): the client encodes the
+/// requested kind into the `host-usb:` / `host-local:` request prefix and the
+/// `transport-usb` / `transport-local` selection services.
+///
+/// AOSP has no third "unknown" kind — every registered transport is concretely
+/// USB or Local. In adboost, a *backend* that has not been taught to tag its
+/// devices reports [`DeviceEntry::kind`] as `None`; the frontend treats that
+/// conservatively as "matches any kind" so an untagged backend keeps behaving as
+/// it did before this field existed (see [`DeviceEntry::kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportKind {
+    /// A physically attached USB device — the target of `adb -d`.
+    Usb,
+    /// An emulator or TCP-connected (`adb connect`ed) device — the "local"
+    /// transport, the target of `adb -e`. ("local" is AOSP's name: emulators and
+    /// network devices are both reached over a local TCP socket.)
+    Local,
+}
+
 /// One device visible to clients. `state` is usually [`DeviceState::Device`]
 /// (the wire equivalent of AOSP's `ConnectionState`).
+///
+/// `#[non_exhaustive]`: construct via [`DeviceEntry::new`] plus the `with_*`
+/// builders, never a struct literal from another crate. This lets future fields
+/// be added without breaking downstream [`DeviceBackend`] implementations.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceEntry {
     /// The device serial — the authoritative identifier, also what
     /// transport-ids are computed over (see [`super::protocol::transport_id_for`]).
@@ -49,6 +75,19 @@ pub struct DeviceEntry {
     /// `Some`. See [`DeviceBackend::device_capabilities`] for the authoritative,
     /// on-demand query that can drive a handshake within a timeout.
     pub capabilities: Option<DeviceFeatureSet>,
+    /// The device's transport kind ([`TransportKind::Usb`] / [`TransportKind::Local`]),
+    /// powering `adb -d` / `adb -e` selection.
+    ///
+    /// `None` means **this backend does not tag transport kind** — the frontend
+    /// treats it as matching *any* requested kind, so `host-usb:` / `host-local:`
+    /// and `transport-usb` / `transport-local` degrade to plain transport-any
+    /// uniqueness (never worse than the kind-agnostic behavior). A backend opts
+    /// into real `-d`/`-e` disambiguation by setting this via [`Self::with_kind`].
+    /// adboost's [`DefaultDeviceBackend`] tags every device (`Usb` for enumerated
+    /// USB devices, `Local` for `host:connect`ed TCP devices).
+    ///
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
+    pub kind: Option<TransportKind>,
 }
 
 impl DeviceEntry {
@@ -63,6 +102,7 @@ impl DeviceEntry {
             model: None,
             device: None,
             capabilities: None,
+            kind: None,
         }
     }
 
@@ -71,6 +111,16 @@ impl DeviceEntry {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: DeviceFeatureSet) -> Self {
         self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// Set the device's transport kind (USB vs local/TCP). Builder for backends
+    /// that know how each device is reached and want `adb -d` / `adb -e` to
+    /// disambiguate by kind. Leaving it unset (`None`) is valid and behaves as
+    /// "matches any kind" — see [`Self::kind`].
+    #[must_use]
+    pub fn with_kind(mut self, kind: TransportKind) -> Self {
+        self.kind = Some(kind);
         self
     }
 }
@@ -386,6 +436,10 @@ mod tests {
             e.capabilities.is_none(),
             "a freshly-listed device has unknown (None) capabilities until handshaked"
         );
+        assert!(
+            e.kind.is_none(),
+            "an untagged entry defaults to kind: None (matches any -d/-e request)"
+        );
     }
 
     #[test]
@@ -393,6 +447,22 @@ mod tests {
         let caps = DeviceFeatureSet::default();
         let e = DeviceEntry::new("ABC123").with_capabilities(caps.clone());
         assert_eq!(e.capabilities, Some(caps));
+    }
+
+    #[test]
+    fn device_entry_with_kind_sets_some() {
+        assert_eq!(
+            DeviceEntry::new("ABC123")
+                .with_kind(TransportKind::Usb)
+                .kind,
+            Some(TransportKind::Usb)
+        );
+        assert_eq!(
+            DeviceEntry::new("ABC123")
+                .with_kind(TransportKind::Local)
+                .kind,
+            Some(TransportKind::Local)
+        );
     }
 
     #[test]

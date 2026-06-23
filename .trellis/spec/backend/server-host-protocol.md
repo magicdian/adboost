@@ -13,26 +13,70 @@
 There are **multiple parallel transport-selection entry points** in
 `frontend.rs`, and they must all report the *same* AOSP error wording for the
 *same* condition. They are easy to drift apart because each is a separate
-function with its own match:
+function with its own match — so they all funnel through one core,
+`resolve_single_by_kind(want: Option<TransportKind>)` (the analogue of AOSP's
+single `acquire_one_transport`), which filters the device list by the requested
+kind and applies the zero/one/many uniqueness with kind-correct wording.
 
 | Service | Function | Reply on success |
 |---|---|---|
-| `host:transport-any` | `select_transport_any` | bare `OKAY` |
+| `host:transport-any` | `select_transport_any` → `select_transport_kind(None)` | bare `OKAY` |
+| `host:transport-usb` | `select_transport_kind(Some(Usb))` | bare `OKAY` |
+| `host:transport-local` | `select_transport_kind(Some(Local))` | bare `OKAY` |
 | `host:transport:<serial>` | `select_transport_by_serial` | bare `OKAY` |
 | `host:transport-id:<N>` | `select_transport_by_id` | bare `OKAY` |
 | `host:tport:<sel>` (`any`/`-any`/empty, `serial:<s>`/`<s>`, `id:<N>`/`-id:<N>`) | `select_tport` | `OKAY` + 8-byte LE id |
-| `host:*forward*` (no serial) | `serve_host_forward` → `resolve_single_serial` | forward-family framing |
+| `host:*forward*` (no serial) | `serve_host_forward` → `resolve_single_serial` → `resolve_single_by_kind(None)` | forward-family framing |
+| `host-usb:<sub>` / `host-local:<sub>` | `dispatch_host_kind` → `resolve_single_by_kind(Some(kind))` then `dispatch_host_serial` | per-sub-service (mirrors `host-serial:`) |
 
-### Validation & Error Matrix (the canonical wording)
+### Transport KIND filter — `adb -d` / `adb -e` (`TransportKind`)
 
-| Selector | 0 devices | >1 devices | serial/id not found | bad id |
+Native `adb` encodes a transport-type filter into the request: `-d` (USB) →
+`host-usb:` prefix then `transport-usb`; `-e` (emulator/TCP-local) → `host-local:`
+then `transport-local`. This is the wire-side mirror of AOSP's `TransportType`
+(`kTransportUsb`/`kTransportLocal`/`kTransportAny`).
+
+- `DeviceEntry.kind: Option<TransportKind>` carries each device's kind.
+  **`None` = "this backend does not tag kind" → matches ANY requested kind** (the
+  same conservative-default shape as `capabilities: Option<_>`). An untagged
+  backend therefore never regresses: `-d`/`-e` degrade to transport-any over the
+  full set (single device selected, multiple → ambiguous). `DefaultDeviceBackend`
+  tags every device (`Usb` for `enumerate_usb`, `Local` for `tcp_device_entries`).
+- `kind_matches(want, entry_kind)`: `None` on *either* side matches; two concrete
+  kinds must be equal. This is the single predicate behind `resolve_single_by_kind`
+  and `serve_wait_for` (`wait-for-usb-device` / `wait-for-local-device`).
+- `host-usb:`/`host-local:` are structurally `host-serial:` with the device pinned
+  by kind instead of serial: resolve the one matching device, then run the same
+  sub-service set via `dispatch_host_serial`.
+- **`DeviceEntry` is `#[non_exhaustive]`.** External backends construct it via
+  `DeviceEntry::new(serial).with_kind(..).with_capabilities(..)`, never a struct
+  literal — so future fields stay non-breaking downstream. (First
+  `#[non_exhaustive]` in `server/`.)
+
+### Validation & Error Matrix (the canonical wording — AOSP-exact)
+
+Wording is byte-verified against the `adb` 35.0.2 client binary. The `0 devices`
+and `>1 devices` columns are **kind-specific** (the column header is the requested
+kind):
+
+| Selector / kind | 0 devices | >1 devices | serial/id not found | bad id |
 |---|---|---|---|---|
-| `*-any` / empty / `forward` (implicit) | `FAIL("no devices")` | `FAIL("more than one device")` | — | — |
+| any (`*-any`/empty/`forward`/`transport-any`, or untagged) | `FAIL("no devices/emulators found")` | `FAIL("more than one device/emulator")` | — | — |
+| usb (`-d`: `host-usb:`/`transport-usb`) | `FAIL("no devices found")` | `FAIL("more than one USB device")` | — | — |
+| local (`-e`: `host-local:`/`transport-local`) | `FAIL("no emulators found")` | `FAIL("more than one emulator")` | — | — |
 | `:<serial>` | `FAIL("device not found")` | (n/a — serial is explicit) | `FAIL("device not found")` | — |
 | `-id:<N>` | — | — | `FAIL("no device for transport id")` | `FAIL("invalid transport id")` |
 
-`select_transport_any` and `resolve_single_serial` are the reference for the
-`any` column; `select_transport_by_id` is the reference for the id column.
+`resolve_single_by_kind` + the pure helpers `no_devices_msg(want)` /
+`ambiguous_msg(want)` are the single reference for the kind columns;
+`select_transport_by_id` is the reference for the id column.
+
+> **Gotcha — the kind columns are NOT "device" everywhere.** AOSP uses three
+> different nouns: combined `device/emulator` for transport-any, bare `USB device`
+> for `-d`, and `emulator` for `-e`. Do not "simplify" them to one string — the
+> native `adb` client prints these verbatim and the parity tests assert the exact
+> bytes. `host:devices`/`devices-l` are **never** kind-filtered (AOSP lists all
+> transports regardless of `-d`/`-e`); only *selection* is filtered.
 
 ---
 
@@ -115,9 +159,10 @@ let chosen = if rest.is_empty() || rest == "any" || rest == "-any" {
 let chosen: std::result::Result<String, &str> =
     if rest.is_empty() || rest == "any" || rest == "-any" {
         match devices.as_slice() {
-            [] => Err("no devices"),
+            // transport-any wording via the shared helpers (kind == None).
+            [] => Err(no_devices_msg(None)),       // "no devices/emulators found"
             [one] => Ok(one.serial.clone()),
-            _ => Err("more than one device"),
+            _ => Err(ambiguous_msg(None)),          // "more than one device/emulator"
         }
     } else if let Some(id_str) = rest.strip_prefix("id:").or_else(|| rest.strip_prefix("-id:")) {
         match id_str.parse::<u64>() {
@@ -138,12 +183,29 @@ Inline `#[cfg(test)] mod tests` in `frontend.rs`, driven by `round_trip` against
 a `MockBackend`. Run with `--features "server,usb"` (the test module references
 `crate::usb::MultiplexedSession`, so `server` alone will not compile the tests).
 
-- `tport_any_with_multiple_devices_fails_more_than_one` → body contains `more than one device`
-- `tport_any_with_no_devices_fails_no_devices` → `no devices`
+- `tport_any_with_multiple_devices_fails_more_than_one` → `more than one device/emulator`
+- `tport_any_with_no_devices_fails_no_devices` → `no devices/emulators found`
 - `tport_by_unknown_serial_fails_device_not_found` → `device not found`
 - `tport_by_unknown_id_fails_no_device_for_transport_id` → `no device for transport id`
 - `tport_by_invalid_id_fails_invalid_transport_id` → `invalid transport id`
+- `transport_any_with_no_devices_fails` → `no devices/emulators found`
+- `forward_no_device_fails` → `no devices/emulators found`
 - single-device happy path (`tport_any_with_single_device_replies_okay_plus_8byte_id`) unchanged
+
+Transport-KIND (`adb -d`/`-e`) assertion points (all in `frontend.rs` tests):
+
+- `transport_usb_selects_the_single_usb_device` / `transport_local_selects_the_single_local_device` → bare `OKAY`
+- `transport_usb_in_mixed_topology_picks_usb_not_tcp` → `-d` picks USB, `-e` picks TCP in a mixed set
+- `transport_usb_with_two_usb_devices_fails_more_than_one_usb_device` → `more than one USB device`
+- `transport_local_with_two_local_devices_fails_more_than_one_emulator` → `more than one emulator`
+- `transport_usb_with_only_a_tcp_device_fails_no_devices_found` → `no devices found`
+- `transport_local_with_only_a_usb_device_fails_no_emulators_found` → `no emulators found`
+- `host_usb_features_resolves_and_answers_features` → phase-1 `host-usb:features` is answered (the reported bug)
+- `host_local_get_state_resolves_local_device`, `host_usb_features_with_no_usb_device_fails_no_devices_found`
+- `transport_usb_untagged_backend_degrades_to_transport_any` +
+  `transport_usb_untagged_multi_device_is_ambiguous_with_usb_wording` → `kind: None` backward-compat
+- Pure helpers: `parse_transport_kind_maps_tokens`, `kind_matches_treats_none_as_wildcard_on_both_sides`,
+  `error_wording_matches_aosp_per_kind` (locks the exact AOSP strings)
 
 ### Runtime selftest (device-backed, `adboost_cli selftest`)
 
@@ -153,8 +215,9 @@ what issues `host:tport:any` before `shell:`). Covered by a parity case:
 
 - `adboost_cli/src/selftest/parity.rs::case_official_adb_ambiguous_shell` — runs
   `adb -P <port> shell echo …` with **no `-s`** against adboost's in-process
-  server; `Passed` iff stderr contains `more than one device`, and explicitly
-  flags `device not found` as a REGRESSION.
+  server; `Passed` iff stderr contains `more than one device` (the stable
+  substring of the AOSP `more than one device/emulator`), and explicitly flags
+  `device not found` as a REGRESSION.
 - Wired in `selftest/mod.rs::run_through_server_phase` under `if multi {}` —
   runs **once per run** (ambiguity is a whole-device-set property, not per
   serial), never emitted in single-device mode, `Skipped` when no `adb` on PATH.

@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use super::backend::{DeviceBackend, DeviceEntry, LifecycleEvent};
+use super::backend::{DeviceBackend, DeviceEntry, LifecycleEvent, TransportKind};
 use super::capabilities::{KillPolicy, ServerCapabilities};
 use super::forward::{ForwardRegistry, parse_forward, parse_killforward};
 use super::forward_handle::ForwardHandle;
@@ -272,6 +272,19 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return Ok(HostOutcome::Close);
         }
 
+        // `host-usb:<sub>` / `host-local:<sub>` — a single-device query that pins
+        // the device by transport *kind* instead of serial (native `adb -d`/`-e`
+        // phase 1). Structurally identical to `host-serial:`: resolve the one
+        // matching device, then run the same sub-service against its serial.
+        for (prefix, kind) in [
+            ("host-usb:", TransportKind::Usb),
+            ("host-local:", TransportKind::Local),
+        ] {
+            if let Some(sub) = service.strip_prefix(prefix) {
+                return self.dispatch_host_kind(stream, kind, sub).await;
+            }
+        }
+
         let Some(svc) = service.strip_prefix("host:") else {
             stream
                 .write_all(&protocol::fail(&format!("unknown service: {service}")))
@@ -313,6 +326,14 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 Ok(HostOutcome::Close)
             }
             "transport-any" => self.select_transport_any(stream).await,
+            "transport-usb" => {
+                self.select_transport_kind(stream, Some(TransportKind::Usb))
+                    .await
+            }
+            "transport-local" => {
+                self.select_transport_kind(stream, Some(TransportKind::Local))
+                    .await
+            }
             _ if svc.starts_with("transport-id:") => {
                 let id_str = &svc["transport-id:".len()..];
                 self.select_transport_by_id(stream, id_str).await
@@ -439,6 +460,26 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         Ok(HostOutcome::Close)
     }
 
+    /// `host-usb:<sub>` / `host-local:<sub>` single-device queries, pinned by
+    /// transport `kind` (native `adb -d` / `adb -e`). Resolves the one device of
+    /// that kind — replying `FAIL` with the kind-specific AOSP wording on zero /
+    /// more-than-one — then runs the sub-service through [`Self::dispatch_host_serial`]
+    /// so kind- and serial-pinned queries share identical sub-service semantics.
+    async fn dispatch_host_kind(
+        &self,
+        stream: &mut TcpStream,
+        kind: TransportKind,
+        sub: &str,
+    ) -> std::io::Result<HostOutcome> {
+        match self.resolve_single_by_kind(Some(kind)).await {
+            Ok(serial) => self.dispatch_host_serial(stream, &serial, sub).await,
+            Err(reason) => {
+                stream.write_all(&protocol::fail(reason)).await?;
+                Ok(HostOutcome::Close)
+            }
+        }
+    }
+
     /// Handle a `host:`-prefixed forward-family service that carries no explicit
     /// serial. `list-forward` / `killforward-all` are device-independent; the
     /// per-rule `forward:` / `killforward:` resolve against the single device.
@@ -490,8 +531,9 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     /// (`any-device`, `usb-device`, `local-device`, …). Our backend only observes
     /// the `device` state (a listed device is ready; we cannot see
     /// recovery/sideload/bootloader), so those states FAIL fast with a clear
-    /// reason rather than hanging forever. The transport token is accepted but not
-    /// filtered on — `DeviceEntry` carries no transport tag yet.
+    /// reason rather than hanging forever. The transport token *is* honored: it
+    /// filters the device set by [`TransportKind`] (`usb`/`local`; `any` matches
+    /// all), so `wait-for-usb-device` waits for a USB device specifically.
     ///
     /// Framing: a bare `OKAY` once the wait is satisfied. `ADBProxyServer::
     /// wait_for_device` issues the request via `send_adb_request` (reads the
@@ -508,9 +550,11 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         // A bare arg with no '-' (e.g. a hand-typed `wait-for-device`) is treated
         // as the state directly — real `adb` always sends the `<transport>-<state>`
         // form, but accepting the bare state is harmless and more forgiving.
-        let state = arg
+        let (want, state) = arg
             .rsplit_once('-')
-            .map_or(arg, |(_transport, state)| state);
+            .map_or((None, arg), |(transport, state)| {
+                (parse_transport_kind(transport), state)
+            });
 
         if state != "device" {
             return stream
@@ -520,11 +564,18 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 .await;
         }
 
-        // Poll the device set until at least one device is present, bounded so a
-        // never-arriving device does not pin the connection forever.
+        // Poll the device set until at least one device of the requested kind is
+        // present, bounded so a never-arriving device does not pin the connection
+        // forever.
         let deadline = tokio::time::Instant::now() + MAX_WAIT;
         loop {
-            if !self.backend.list_devices().await.is_empty() {
+            if self
+                .backend
+                .list_devices()
+                .await
+                .iter()
+                .any(|d| kind_matches(want, d.kind))
+            {
                 return stream.write_all(&protocol::okay()).await;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -536,15 +587,33 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         }
     }
 
+    /// Resolve the single device matching a requested transport kind, or an
+    /// AOSP-style failure reason when zero or multiple match. This is the single
+    /// `acquire_one_transport` analogue every transport-selection path funnels
+    /// through, so they all agree on the zero/one/many wording.
+    ///
+    /// `want == None` is transport-any (the default / `-s` / forward paths);
+    /// `Some(Usb)`/`Some(Local)` are `adb -d` / `adb -e`. The error wording is
+    /// kind-specific to match native `adb` ([`no_devices_msg`]/[`ambiguous_msg`]).
+    async fn resolve_single_by_kind(
+        &self,
+        want: Option<TransportKind>,
+    ) -> Result<String, &'static str> {
+        let devices = self.backend.list_devices().await;
+        let mut matching = devices.iter().filter(|d| kind_matches(want, d.kind));
+        match (matching.next(), matching.next()) {
+            (None, _) => Err(no_devices_msg(want)),
+            (Some(one), None) => Ok(one.serial.clone()),
+            (Some(_), Some(_)) => Err(ambiguous_msg(want)),
+        }
+    }
+
     /// Resolve the single connected device's serial (transport-any semantics),
     /// or an AOSP-style failure reason when there are zero or multiple devices.
     async fn resolve_single_serial(&self) -> Result<String, String> {
-        let devices = self.backend.list_devices().await;
-        match devices.as_slice() {
-            [] => Err("no devices".to_string()),
-            [one] => Ok(one.serial.clone()),
-            _ => Err("more than one device".to_string()),
-        }
+        self.resolve_single_by_kind(None)
+            .await
+            .map_err(str::to_string)
     }
 
     /// Dispatch a forward-family service (`forward:...` / `killforward:...`) for
@@ -657,22 +726,27 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     }
 
     /// `host:transport-any` — select the single connected device (error if none
-    /// or more than one).
+    /// or more than one), regardless of transport kind.
     async fn select_transport_any(&self, stream: &mut TcpStream) -> std::io::Result<HostOutcome> {
-        let devices = self.backend.list_devices().await;
-        match devices.as_slice() {
-            [] => {
-                stream.write_all(&protocol::fail("no devices")).await?;
-                Ok(HostOutcome::Close)
-            }
-            [one] => {
+        self.select_transport_kind(stream, None).await
+    }
+
+    /// `host:transport-usb` / `host:transport-local` / `host:transport-any` —
+    /// select the single device matching `want` (bare `OKAY`), or FAIL with the
+    /// kind-specific AOSP wording on zero / more-than-one. `want == None` is
+    /// `transport-any`.
+    async fn select_transport_kind(
+        &self,
+        stream: &mut TcpStream,
+        want: Option<TransportKind>,
+    ) -> std::io::Result<HostOutcome> {
+        match self.resolve_single_by_kind(want).await {
+            Ok(serial) => {
                 stream.write_all(&protocol::okay()).await?;
-                Ok(HostOutcome::TransportSelected(one.serial.clone()))
+                Ok(HostOutcome::TransportSelected(serial))
             }
-            _ => {
-                stream
-                    .write_all(&protocol::fail("more than one device"))
-                    .await?;
+            Err(reason) => {
+                stream.write_all(&protocol::fail(reason)).await?;
                 Ok(HostOutcome::Close)
             }
         }
@@ -731,17 +805,17 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         let serials: Vec<String> = devices.iter().map(|d| d.serial.clone()).collect();
 
         // Each selector resolves to the chosen serial, or its own AOSP-correct
-        // failure reason. The `any`/empty branch must distinguish "no devices"
-        // from "more than one device" (matching `select_transport_any`); the
-        // `id:` branch matches `select_transport_by_id`'s messages. Collapsing
-        // these into a single `Option` would misreport every case as
-        // "device not found" (e.g. `adb shell` with no `-s` on multiple devices).
+        // failure reason. The `any`/empty branch must distinguish zero from
+        // more-than-one (matching `select_transport_any`); the `id:` branch matches
+        // `select_transport_by_id`'s messages. Collapsing these into a single
+        // `Option` would misreport every case as "device not found" (e.g. `adb
+        // shell` with no `-s` on multiple devices).
         let chosen: std::result::Result<String, &str> =
             if rest.is_empty() || rest == "any" || rest == "-any" {
                 match devices.as_slice() {
-                    [] => Err("no devices"),
+                    [] => Err(no_devices_msg(None)),
                     [one] => Ok(one.serial.clone()),
-                    _ => Err("more than one device"),
+                    _ => Err(ambiguous_msg(None)),
                 }
             } else if let Some(id_str) = rest
                 .strip_prefix("id:")
@@ -1049,6 +1123,53 @@ fn is_host_serial_sub(sub: &str) -> bool {
         || is_forward_family(sub)
 }
 
+/// Parse an AOSP transport-type token into a requested [`TransportKind`] filter.
+/// `"usb"` → `Usb`, `"local"` → `Local`, `"any"` (or anything else) → `None`
+/// (no kind filter). Used by the `transport-usb`/`transport-local` services, the
+/// `host-usb:`/`host-local:` prefixes, and `wait-for-<transport>-device`.
+fn parse_transport_kind(token: &str) -> Option<TransportKind> {
+    match token {
+        "usb" => Some(TransportKind::Usb),
+        "local" => Some(TransportKind::Local),
+        _ => None,
+    }
+}
+
+/// Does a device of `entry_kind` satisfy a request for `want`?
+///
+/// `want == None` is `transport-any` (matches every device). A *device* whose
+/// `entry_kind == None` (a backend that does not tag transport kind) matches any
+/// request — the conservative degradation that keeps untagged backends behaving as
+/// they did before `-d`/`-e` existed (see [`DeviceEntry::kind`]). Only when both
+/// sides are concrete must they be equal.
+fn kind_matches(want: Option<TransportKind>, entry_kind: Option<TransportKind>) -> bool {
+    match (want, entry_kind) {
+        (None, _) | (_, None) => true,
+        (Some(w), Some(e)) => w == e,
+    }
+}
+
+/// AOSP `acquire_one_transport` wording for *zero* matching devices, by requested
+/// kind. `adb` prints these verbatim, so match the bytes exactly (confirmed
+/// against the `adb` 35.0.2 client binary).
+fn no_devices_msg(want: Option<TransportKind>) -> &'static str {
+    match want {
+        None => "no devices/emulators found",
+        Some(TransportKind::Usb) => "no devices found",
+        Some(TransportKind::Local) => "no emulators found",
+    }
+}
+
+/// AOSP `acquire_one_transport` wording for *more than one* matching device, by
+/// requested kind (confirmed against the `adb` 35.0.2 client binary).
+fn ambiguous_msg(want: Option<TransportKind>) -> &'static str {
+    match want {
+        None => "more than one device/emulator",
+        Some(TransportKind::Usb) => "more than one USB device",
+        Some(TransportKind::Local) => "more than one emulator",
+    }
+}
+
 /// Split `host-serial:<serial>:<sub>` into `(serial, sub)`, tolerating a serial
 /// that itself contains colons (TCP/IP `ip:port`, e.g. `172.20.1.45:5555`).
 ///
@@ -1330,6 +1451,36 @@ mod tests {
         buf
     }
 
+    /// Drive one *transport-selecting* request (e.g. `host:transport-usb`). Unlike
+    /// [`round_trip`], a successful selection does NOT close the socket — the
+    /// server keeps it open for the follow-up local-service request — so we read
+    /// exactly the 4-byte `OKAY` (these reply a bare `OKAY`, no payload), then drop
+    /// the client to EOF the server. Returns the 4 reply bytes.
+    async fn round_trip_select(
+        frontend: Arc<AdbServerFrontend<MockBackend>>,
+        request: &str,
+    ) -> [u8; 4] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = frontend.handle_client(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(format!("{:04x}{request}", request.len()).as_bytes())
+            .await
+            .expect("write req");
+        client.flush().await.expect("flush");
+
+        let mut resp = [0u8; 4];
+        client.read_exact(&mut resp).await.expect("read OKAY");
+        drop(client); // EOF → server's next read_request returns None → clean exit
+        server.await.expect("server task");
+        resp
+    }
+
     /// A backend that records reverse-release calls, for disconnect-handler
     /// tests. Its `subscribe_lifecycle` is driven manually via a returned sender.
     #[derive(Default)]
@@ -1555,7 +1706,8 @@ mod tests {
         let resp = round_trip(f, "host:transport-any").await;
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"));
-        assert!(body.contains("no devices"));
+        // AOSP transport-any (kTransportAny) wording: combined "device/emulator".
+        assert!(body.contains("no devices/emulators found"), "got: {body}");
     }
 
     #[tokio::test]
@@ -1605,7 +1757,7 @@ mod tests {
     async fn tport_any_with_multiple_devices_fails_more_than_one() {
         // Modern `adb` selects a transport via `host:tport:any` before sending
         // `shell:` / forward / reverse. With multiple devices it must fail with
-        // the AOSP-correct "more than one device", NOT "device not found".
+        // the AOSP-correct "more than one device/emulator", NOT "device not found".
         let f = Arc::new(frontend_with(vec![
             DeviceEntry::new("devA"),
             DeviceEntry::new("devB"),
@@ -1613,7 +1765,10 @@ mod tests {
         let resp = round_trip(f, "host:tport:any").await;
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
-        assert!(body.contains("more than one device"), "got: {body}");
+        assert!(
+            body.contains("more than one device/emulator"),
+            "got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1622,7 +1777,7 @@ mod tests {
         let resp = round_trip(f, "host:tport:any").await;
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
-        assert!(body.contains("no devices"), "got: {body}");
+        assert!(body.contains("no devices/emulators found"), "got: {body}");
     }
 
     #[tokio::test]
@@ -1650,6 +1805,152 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("invalid transport id"), "got: {body}");
+    }
+
+    // ---- `adb -d` / `adb -e`: transport-kind selection (USB / local) ----------
+    //
+    // Native `adb -d` sends `host-usb:features` then `transport-usb`; `adb -e`
+    // sends `host-local:features` then `transport-local`. These cover both phases,
+    // the mixed-topology disambiguation, the per-kind AOSP error wording, and the
+    // `kind: None` (untagged backend) backward-compatible degradation.
+
+    fn usb_dev(serial: &str) -> DeviceEntry {
+        DeviceEntry::new(serial).with_kind(TransportKind::Usb)
+    }
+    fn local_dev(serial: &str) -> DeviceEntry {
+        DeviceEntry::new(serial).with_kind(TransportKind::Local)
+    }
+
+    #[tokio::test]
+    async fn transport_usb_selects_the_single_usb_device() {
+        // `-d` phase 2 against one USB device → bare OKAY, transport selected.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1")]));
+        let resp = round_trip_select(f, "host:transport-usb").await;
+        assert_eq!(&resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn transport_local_selects_the_single_local_device() {
+        // `-e` phase 2 against one local/TCP device → bare OKAY.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip_select(f, "host:transport-local").await;
+        assert_eq!(&resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn transport_usb_in_mixed_topology_picks_usb_not_tcp() {
+        // The reported xdb case: one USB + one TCP device, non-conflicting serials.
+        // `-d` must lock the USB device, `-e` the TCP one — true disambiguation.
+        let devices = vec![usb_dev("usb1"), local_dev("10.0.0.5:5555")];
+        let f = Arc::new(frontend_with(devices.clone()));
+        let resp = round_trip_select(f, "host:transport-usb").await;
+        assert_eq!(&resp, b"OKAY", "transport-usb selects the USB device");
+
+        let f = Arc::new(frontend_with(devices));
+        let resp = round_trip_select(f, "host:transport-local").await;
+        assert_eq!(&resp, b"OKAY", "transport-local selects the TCP device");
+    }
+
+    #[tokio::test]
+    async fn transport_usb_with_two_usb_devices_fails_more_than_one_usb_device() {
+        // Ambiguity *within* the USB kind → AOSP USB-specific wording.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1"), usb_dev("usb2")]));
+        let resp = round_trip(f, "host:transport-usb").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("more than one USB device"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn transport_local_with_two_local_devices_fails_more_than_one_emulator() {
+        let f = Arc::new(frontend_with(vec![
+            local_dev("10.0.0.5:5555"),
+            local_dev("10.0.0.6:5555"),
+        ]));
+        let resp = round_trip(f, "host:transport-local").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("more than one emulator"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn transport_usb_with_only_a_tcp_device_fails_no_devices_found() {
+        // `-d` when the only device is TCP → USB-specific zero wording.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip(f, "host:transport-usb").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn transport_local_with_only_a_usb_device_fails_no_emulators_found() {
+        // `-e` when the only device is USB → local-specific zero wording.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1")]));
+        let resp = round_trip(f, "host:transport-local").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no emulators found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_usb_features_resolves_and_answers_features() {
+        // `-d` phase 1: `host-usb:features` must NOT be `unknown service` (the
+        // reported bug); it resolves the single USB device and answers features.
+        let f = Arc::new(frontend_with(vec![usb_dev("usb1")]));
+        let resp = round_trip(f, "host-usb:features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert!(
+            body.contains("cmd,stat_v2,fixed_push_mkdir,apex"),
+            "got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_local_get_state_resolves_local_device() {
+        // `host-local:get-state` pins the single local device by kind.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip(f, "host-local:get-state").await;
+        assert_eq!(
+            resp,
+            b"OKAY0006device",
+            "got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn host_usb_features_with_no_usb_device_fails_no_devices_found() {
+        // `host-usb:` phase-1 error wording matches the USB transport selection.
+        let f = Arc::new(frontend_with(vec![local_dev("10.0.0.5:5555")]));
+        let resp = round_trip(f, "host-usb:features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn transport_usb_untagged_backend_degrades_to_transport_any() {
+        // A backend that does not tag kind (kind: None) must not regress: `-d`
+        // behaves as transport-any — the single untagged device is selected.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip_select(f, "host:transport-usb").await;
+        assert_eq!(&resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn transport_usb_untagged_multi_device_is_ambiguous_with_usb_wording() {
+        // Untagged + multiple devices: still ambiguous (matches any), reported with
+        // the requested kind's wording (USB here).
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("a"),
+            DeviceEntry::new("b"),
+        ]));
+        let resp = round_trip(f, "host:transport-usb").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("more than one USB device"), "got: {body}");
     }
 
     #[tokio::test]
@@ -1713,6 +2014,7 @@ mod tests {
             model: None,
             device: None,
             capabilities: None,
+            kind: None,
         }]));
         let resp = round_trip(f.clone(), "host-serial:dev1:get-state").await;
         assert_eq!(resp, b"OKAY0006device");
@@ -1774,6 +2076,50 @@ mod tests {
         assert_eq!(split_host_serial("dev1"), None);
     }
 
+    #[test]
+    fn parse_transport_kind_maps_tokens() {
+        assert_eq!(parse_transport_kind("usb"), Some(TransportKind::Usb));
+        assert_eq!(parse_transport_kind("local"), Some(TransportKind::Local));
+        assert_eq!(parse_transport_kind("any"), None);
+        assert_eq!(parse_transport_kind(""), None);
+    }
+
+    #[test]
+    fn kind_matches_treats_none_as_wildcard_on_both_sides() {
+        use TransportKind::{Local, Usb};
+        // want == None (transport-any) matches every device.
+        assert!(kind_matches(None, Some(Usb)));
+        assert!(kind_matches(None, Some(Local)));
+        assert!(kind_matches(None, None));
+        // entry kind == None (untagged backend) matches every request.
+        assert!(kind_matches(Some(Usb), None));
+        assert!(kind_matches(Some(Local), None));
+        // Concrete-vs-concrete must be equal.
+        assert!(kind_matches(Some(Usb), Some(Usb)));
+        assert!(!kind_matches(Some(Usb), Some(Local)));
+        assert!(!kind_matches(Some(Local), Some(Usb)));
+    }
+
+    #[test]
+    fn error_wording_matches_aosp_per_kind() {
+        // Locked against the `adb` 35.0.2 client binary strings.
+        assert_eq!(no_devices_msg(None), "no devices/emulators found");
+        assert_eq!(no_devices_msg(Some(TransportKind::Usb)), "no devices found");
+        assert_eq!(
+            no_devices_msg(Some(TransportKind::Local)),
+            "no emulators found"
+        );
+        assert_eq!(ambiguous_msg(None), "more than one device/emulator");
+        assert_eq!(
+            ambiguous_msg(Some(TransportKind::Usb)),
+            "more than one USB device"
+        );
+        assert_eq!(
+            ambiguous_msg(Some(TransportKind::Local)),
+            "more than one emulator"
+        );
+    }
+
     #[tokio::test]
     async fn host_serial_features_with_tcp_ip_serial_routes_correctly() {
         // Regression: `host-serial:172.20.1.45:5555:features` must route to the
@@ -1786,6 +2132,7 @@ mod tests {
             model: None,
             device: None,
             capabilities: None,
+            kind: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:features").await;
         let body = String::from_utf8(resp).unwrap();
@@ -1856,6 +2203,7 @@ mod tests {
             model: None,
             device: None,
             capabilities: None,
+            kind: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:get-state").await;
         assert_eq!(resp, b"OKAY0006device");
@@ -1873,6 +2221,7 @@ mod tests {
             model: None,
             device: None,
             capabilities: None,
+            kind: None,
         }]));
         let resp = round_trip(f, "host-serial:172.20.1.45:5555:forward:tcp:0;tcp:7777").await;
         let body = String::from_utf8(resp).unwrap();
@@ -1966,10 +2315,22 @@ mod tests {
 
     #[tokio::test]
     async fn host_wait_for_usb_device_token_is_accepted() {
-        // The transport token (usb/local/any) is accepted; we don't filter on it.
+        // The transport token (usb/local/any) now filters by kind. An untagged
+        // device (kind: None) matches any token, so a `usb` wait still resolves.
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
         let resp = round_trip(f, "host:wait-for-usb-device").await;
         assert_eq!(resp, b"OKAY");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_local_device_with_only_usb_times_out_quickly() {
+        // A tagged USB-only set must NOT satisfy `wait-for-local-device`. We can't
+        // wait the full 60s in a unit test, so assert the kind predicate directly:
+        // a USB device does not match a local request.
+        assert!(!kind_matches(
+            Some(TransportKind::Local),
+            Some(TransportKind::Usb)
+        ));
     }
 
     #[tokio::test]
@@ -2011,6 +2372,7 @@ mod tests {
             model: Some("mod".to_string()),
             device: Some("dev".to_string()),
             capabilities: None,
+            kind: None,
         }];
         assert_eq!(format_devices(&devices, false), "s1\tdevice");
         assert_eq!(
@@ -2021,12 +2383,13 @@ mod tests {
 
     #[tokio::test]
     async fn forward_no_device_fails() {
-        // `host:forward:` with no device resolves transport-any → "no devices".
+        // `host:forward:` with no device resolves transport-any → AOSP
+        // "no devices/emulators found".
         let f = Arc::new(frontend_with(vec![]));
         let resp = round_trip(f, "host:forward:tcp:0;tcp:5555").await;
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
-        assert!(body.contains("no devices"), "got: {body}");
+        assert!(body.contains("no devices/emulators found"), "got: {body}");
     }
 
     #[tokio::test]

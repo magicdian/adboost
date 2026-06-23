@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Verify the Error Matrix, new host-usb/host-local + transport-usb/transport-local rows, the TransportKind/Option contract note, and the Tests-Required list were updated to AOSP wording in lockstep with the code."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "General quality bar (tests, clippy, build under correct features) to check the change against."}
+{"file": "research/native-adb-transport-kind.md", "reason": "Cross-check implemented wording/semantics against the documented AOSP source of truth, including the flagged USB-ambiguous string caveat."}

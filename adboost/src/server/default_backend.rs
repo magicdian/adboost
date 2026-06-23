@@ -24,7 +24,9 @@ use std::sync::{Arc, OnceLock};
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
-use super::backend::{BackendCapabilities, DeviceBackend, DeviceEntry, LifecycleEvent};
+use super::backend::{
+    BackendCapabilities, DeviceBackend, DeviceEntry, LifecycleEvent, TransportKind,
+};
 use crate::models::{ADBLocalCommand, DeviceFeatureSet};
 use crate::usb::{
     MultiplexedSession, PersistentTcpConnection, PersistentUsbConnection, ReverseEngine,
@@ -143,7 +145,10 @@ impl DefaultDeviceBackend {
         match find_all_connected_adb_devices() {
             Ok(devices) => devices
                 .into_iter()
-                .filter_map(|d| d.serial.map(DeviceEntry::new))
+                .filter_map(|d| {
+                    d.serial
+                        .map(|s| DeviceEntry::new(s).with_kind(TransportKind::Usb))
+                })
                 .collect(),
             Err(e) => {
                 tracing::warn!("DefaultDeviceBackend: device enumeration failed: {e}");
@@ -633,7 +638,9 @@ async fn tcp_device_entries(
         .await
         .iter()
         .map(|(serial, conn)| {
-            DeviceEntry::new(serial.clone()).with_capabilities(conn.peer_features().clone())
+            DeviceEntry::new(serial.clone())
+                .with_kind(TransportKind::Local)
+                .with_capabilities(conn.peer_features().clone())
         })
         .collect()
 }

@@ -71,7 +71,9 @@ pub async fn case_official_adb_shell(addr: SocketAddrV4, serial: &str) -> Outcom
 /// This reproduces the exact reported regression end-to-end: a modern `adb`
 /// selects a transport via `host:tport:any` *before* sending `shell:`, and the
 /// server frontend used to collapse the multi-device case into the misleading
-/// `device not found`. The AOSP-correct reply is `more than one device`.
+/// `device not found`. The AOSP-correct reply is `more than one device/emulator`
+/// (we assert the stable `more than one device` substring, tolerant of the
+/// `/emulator` suffix).
 ///
 /// Only meaningful in the multi-device scenario; the harness runs it once per
 /// run (not per serial) and only when `multi` is true.

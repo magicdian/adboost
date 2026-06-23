@@ -59,6 +59,7 @@ mod on_disconnect;
 
 pub use backend::{
     BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, LifecycleEvent, ReversePolicy,
+    TransportKind,
 };
 pub use capabilities::{KillPolicy, ServerCapabilities};
 pub use default_backend::DefaultDeviceBackend;
