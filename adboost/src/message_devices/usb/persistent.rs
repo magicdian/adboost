@@ -98,6 +98,53 @@ const CNXN_MAX_ATTEMPTS: u32 = 8;
 /// pass, so a device that keeps emitting frames cannot wedge the drain forever.
 const STALE_DRAIN_MAX_FRAMES: usize = 64;
 
+/// `IOKit` `kIOReturnNotResponding` (`0xe00002ed`): the endpoint is enumerated but
+/// adbd/the pipe is not answering yet. nusb 0.2.3 has no named variant for it, so
+/// it surfaces as `TransferError::Unknown(0xe000_02ed)`. This is the textbook
+/// transient signal right after USB re-enumeration (adbd restart / replug).
+///
+/// NOTE: `kIOReturnNoDevice` (`0xe00002c0`, the *other* re-enumeration transient)
+/// is mapped by nusb to `TransferError::Disconnected`, so it has no code constant
+/// here — see [`is_transient_connect_error`].
+const IOKIT_NOT_RESPONDING: u32 = 0xe000_02ed;
+
+/// Settle delay between transient connect retries — the same ~100 ms idiom the
+/// stale-CLSE arm of [`PersistentConnection::do_connect`] already uses to let the
+/// pipe quiesce before the next handshake attempt.
+const CONNECT_RETRY_SETTLE: Duration = Duration::from_millis(100);
+
+/// Whether a connect-time transfer error is a transient "endpoint enumerated but
+/// not ready yet" signal seen right after USB re-enumeration (adbd restart from
+/// `root:`/`unroot:`/`tcpip:`/`usb:`/reboot, or a physical replug), vs a permanent
+/// failure.
+///
+/// Transient family (both observed in real logs right after re-enumeration):
+/// - `kIOReturnNotResponding` (`0xe00002ed`) → `TransferError::Unknown(0xe000_02ed)`
+///   (no named nusb variant; lands in the `Unknown` arm).
+/// - `kIOReturnNoDevice` (`0xe00002c0`) → `TransferError::Disconnected` (nusb maps
+///   `NoDevice` to `Disconnected`).
+///
+/// A *bounded* retry on these rides out the re-enumeration window; a truly-absent
+/// device still fails fast within the bound (the code layer alone cannot tell a
+/// transient `NoDevice` from a real unplug, so the bound — never the code — is what
+/// keeps this honest). This mirrors AOSP's transport reconnect handler, which
+/// retries a (re)open within a bounded window rather than surfacing a single
+/// transient (re)open failure to the user.
+///
+/// NOT transient: `Stall` (a real endpoint/protocol fault — retrying could mask a
+/// genuine stall), `WrongResponseReceived`, `ADBRequestFailed`, and every
+/// non-USB-transfer error (so this never misfires on a TCP transport's neutral
+/// `IOError`/`ReadTimeout`, which carry no `UsbTransferError`).
+pub(crate) fn is_transient_connect_error(e: &RustADBError) -> bool {
+    matches!(
+        e,
+        RustADBError::UsbTransferError(
+            nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING)
+                | nusb::transfer::TransferError::Disconnected
+        )
+    )
+}
+
 /// Legacy ADB wire version; predates `delayed_ack` windowed flow control.
 const A_VERSION_LEGACY: u32 = 0x0100_0000;
 /// First ADB wire version that permits `delayed_ack` windowing
@@ -814,9 +861,35 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
                 1_048_576,
                 banner.as_bytes(),
             )?;
-            transport.write_message(cnxn_msg).await?;
+            // CNXN write/read can race a not-ready endpoint right after USB
+            // re-enumeration (adbd restart / replug): the device is enumerated
+            // but adbd is not yet answering, surfacing as a transient transfer
+            // error (kIOReturnNotResponding / kIOReturnNoDevice). Settle briefly
+            // and retry within the same bounded loop instead of propagating, so
+            // EVERY consumer (USB-direct and the server `adb root` reconnect
+            // path) rides out the window. A non-transient error still fails fast.
+            if let Err(e) = transport.write_message(cnxn_msg).await {
+                if is_transient_connect_error(&e) {
+                    tracing::debug!(
+                        "PersistentUsb: transient transfer error on CNXN write, attempt {attempt}/{CNXN_MAX_ATTEMPTS} ({e}); settling + retrying"
+                    );
+                    tokio::time::sleep(CONNECT_RETRY_SETTLE).await;
+                    continue;
+                }
+                return Err(e);
+            }
 
-            let response = transport.read_message().await?;
+            let response = match transport.read_message().await {
+                Ok(response) => response,
+                Err(e) if is_transient_connect_error(&e) => {
+                    tracing::debug!(
+                        "PersistentUsb: transient transfer error on CNXN read, attempt {attempt}/{CNXN_MAX_ATTEMPTS} ({e}); settling + retrying"
+                    );
+                    tokio::time::sleep(CONNECT_RETRY_SETTLE).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             match response.header().command() {
                 MessageCommand::Cnxn => {
@@ -870,7 +943,7 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
                         "PersistentUsb: got stale CLSE on attempt {attempt}/{CNXN_MAX_ATTEMPTS}, draining + retrying"
                     );
                     Self::drain_stale(transport).await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(CONNECT_RETRY_SETTLE).await;
                 }
                 _ => {
                     return Err(RustADBError::WrongResponseReceived(
@@ -881,7 +954,7 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
             }
         }
         Err(RustADBError::ADBRequestFailed(format!(
-            "CNXN failed after {CNXN_MAX_ATTEMPTS} attempts (stale CLSE)"
+            "CNXN failed after {CNXN_MAX_ATTEMPTS} attempts (stale CLSE or transient transfer error)"
         )))
     }
 
@@ -2561,6 +2634,162 @@ mod tests {
 
     fn msg(command: MessageCommand, arg0: u32, arg1: u32, payload: &[u8]) -> ADBTransportMessage {
         ADBTransportMessage::try_new(command, arg0, arg1, payload).expect("build message")
+    }
+
+    // ---- Scripted mock transport (the `do_connect` retry contract seam) -------
+    //
+    // `PersistentConnection<T>` is generic over `ADBMessageTransport`, so a
+    // scripted in-memory transport lets us exercise the CNXN retry without
+    // hardware (research Q6). The mock returns a programmed number of transient
+    // transfer errors on `write_message` before succeeding, then answers every
+    // read with a canned CNXN banner — so `do_connect` should ride out the
+    // transients and complete. State is behind `Arc<Mutex<_>>` so the `Clone`
+    // the trait requires shares one script.
+
+    #[derive(Clone)]
+    struct ScriptedTransport {
+        /// Number of transient write failures still to emit before writes succeed.
+        transient_writes_remaining: Arc<std::sync::Mutex<u32>>,
+        /// The transient error to emit (`NotResponding` vs `Disconnected`).
+        transient: nusb::transfer::TransferError,
+    }
+
+    impl ScriptedTransport {
+        fn new(transient_writes: u32, transient: nusb::transfer::TransferError) -> Self {
+            Self {
+                transient_writes_remaining: Arc::new(std::sync::Mutex::new(transient_writes)),
+                transient,
+            }
+        }
+    }
+
+    impl crate::adb_transport::ADBTransport for ScriptedTransport {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ADBMessageTransport for ScriptedTransport {
+        async fn write_message_with_timeout(
+            &mut self,
+            _message: ADBTransportMessage,
+            _write_timeout: Duration,
+        ) -> Result<()> {
+            let mut remaining = self.transient_writes_remaining.lock().expect("lock");
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(RustADBError::UsbTransferError(self.transient));
+            }
+            Ok(())
+        }
+
+        async fn read_message_with_timeout(
+            &mut self,
+            _read_timeout: Duration,
+        ) -> Result<ADBTransportMessage> {
+            // Canned CNXN banner — a minimal, feature-less device banner so the
+            // handshake completes (delayed_ack negotiates to false, fine here).
+            Ok(msg(
+                MessageCommand::Cnxn,
+                A_VERSION_LEGACY,
+                1_048_576,
+                b"device::",
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn do_connect_retries_transient_notresponding_then_succeeds() {
+        // Fewer transient writes than CNXN_MAX_ATTEMPTS → the handshake recovers.
+        let mut transport = ScriptedTransport::new(
+            3,
+            nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING),
+        );
+        let key = ADBRsaKey::new_random().expect("key");
+        let result = PersistentConnection::<ScriptedTransport>::do_connect(
+            &mut transport,
+            &key,
+            &DeviceFeatureSet::default(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "do_connect must ride out NotResponding transients within CNXN_MAX_ATTEMPTS, got {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn do_connect_retries_transient_disconnected_then_succeeds() {
+        let mut transport = ScriptedTransport::new(2, nusb::transfer::TransferError::Disconnected);
+        let key = ADBRsaKey::new_random().expect("key");
+        let result = PersistentConnection::<ScriptedTransport>::do_connect(
+            &mut transport,
+            &key,
+            &DeviceFeatureSet::default(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "do_connect must ride out Disconnected (NoDevice) transients, got {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn do_connect_fails_fast_when_transients_exceed_attempts() {
+        // More transient writes than CNXN_MAX_ATTEMPTS → bounded loop gives up.
+        let mut transport = ScriptedTransport::new(
+            CNXN_MAX_ATTEMPTS + 1,
+            nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING),
+        );
+        let key = ADBRsaKey::new_random().expect("key");
+        let result = PersistentConnection::<ScriptedTransport>::do_connect(
+            &mut transport,
+            &key,
+            &DeviceFeatureSet::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "do_connect must fail fast (not hang) when transients exceed CNXN_MAX_ATTEMPTS"
+        );
+    }
+
+    #[test]
+    fn is_transient_connect_error_classifies_family() {
+        assert!(
+            is_transient_connect_error(&RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING)
+            )),
+            "NotResponding (0xe00002ed) must be transient"
+        );
+        assert!(
+            is_transient_connect_error(&RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Disconnected
+            )),
+            "Disconnected (NoDevice 0xe00002c0) must be transient"
+        );
+        assert!(
+            !is_transient_connect_error(&RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Stall
+            )),
+            "Stall must NOT be transient (could mask a real endpoint stall)"
+        );
+        assert!(
+            !is_transient_connect_error(&RustADBError::WrongResponseReceived(
+                "a".into(),
+                "b".into()
+            )),
+            "WrongResponseReceived must NOT be transient"
+        );
+        assert!(
+            !is_transient_connect_error(&RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Unknown(0x1234)
+            )),
+            "an unrelated Unknown code must NOT be transient"
+        );
     }
 
     // `PersistentConnection` is generic over the transport: the same concrete

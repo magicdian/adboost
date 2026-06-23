@@ -16,10 +16,12 @@
 //! compatibility.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -48,6 +50,69 @@ const LIFECYCLE_CHANNEL_SIZE: usize = 32;
 
 /// The default adbd-over-TCP port (`adb connect <host>` with no `:port`).
 const DEFAULT_ADB_TCP_PORT: u16 = 5555;
+
+/// Wall-clock budget for [`DefaultDeviceBackend::get_or_open`]'s open/first-OPEN
+/// retry. Sized to cover a USB re-enumeration window (adbd restart from
+/// `root:`/`unroot:`/`tcpip:`/`usb:`/reboot, or a replug) — the device can be
+/// briefly absent from enumeration AND, once back, not yet ready for the first
+/// transfer. A truly-absent device fails fast within this bound rather than
+/// hanging. This is the backend analogue of the selftest's `open_device_with_retry`
+/// (which it replaces for the server `adb root` reconnect path).
+const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+
+/// Poll interval between [`OPEN_RETRY_BUDGET`] open attempts. Coarser than
+/// `do_connect`'s 100 ms handshake settle because this layer polls a slower
+/// signal (the device returning to enumeration), not a single in-flight transfer.
+const OPEN_RETRY_POLL: Duration = Duration::from_millis(500);
+
+/// Retry an async fallible op within a wall-clock `budget`, sleeping `poll`
+/// between attempts, but only while the error is deemed retryable. Returns `Ok`
+/// on the first success, or the last error once the budget elapses (so a
+/// truly-absent / permanently-failing op fails fast within ~`budget` instead of
+/// hanging). A non-retryable error returns immediately.
+///
+/// Pure over its inputs (op + predicate + clock) so it is unit-testable with a
+/// closure that fails N times then succeeds (and one that always fails), with no
+/// USB binding — see the tests at the bottom of this file.
+async fn retry_within<T, F, Fut>(
+    budget: Duration,
+    poll: Duration,
+    is_retryable: impl Fn(&RustADBError) -> bool,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            // Stop on a non-retryable error or once the budget is spent: a
+            // genuinely-absent device or a real fault must fail fast, never hang.
+            Err(e) if !is_retryable(&e) || Instant::now() >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(poll).await,
+        }
+    }
+}
+
+/// Whether an open-time error is worth retrying within [`OPEN_RETRY_BUDGET`].
+///
+/// Two cases, both transient during the USB re-enumeration window:
+/// - a transient transfer error on the CNXN handshake (the shared classifier;
+///   the device is enumerated but adbd is not yet answering), and
+/// - [`RustADBError::DeviceNotFound`] — the device is *momentarily absent from
+///   enumeration* (`USBTransport::new_by_serial` returns this), which the
+///   handshake-layer retry structurally cannot see because the transport is not
+///   even built yet.
+///
+/// Deliberately NOT retried: [`RustADBError::DeviceBusy`] — another process holds
+/// the single USB claim; that will not clear by waiting, so failing fast with the
+/// existing message is correct.
+fn is_retryable_open_error(e: &RustADBError) -> bool {
+    crate::usb::persistent::is_transient_connect_error(e)
+        || matches!(e, RustADBError::DeviceNotFound(_))
+}
 
 /// Default [`DeviceBackend`]: serial-keyed [`PersistentUsbConnection`] cache +
 /// nusb hotplug change stream for USB, plus a registry of `host:connect`ed
@@ -240,21 +305,97 @@ impl DefaultDeviceBackend {
 
     /// Get the cached connection for `serial`, opening (and caching) it on first
     /// use. A dead cached connection (reader task exited) is replaced.
+    ///
+    /// Right after a USB re-enumeration (adbd restart from
+    /// `root:`/`unroot:`/`tcpip:`/`usb:`/reboot, or a physical replug) the device
+    /// can be briefly absent from enumeration, or enumerated-but-not-ready so the
+    /// handshake's first transfer races the not-ready endpoint. This is exactly
+    /// the `adb root` reconnect path: the client waits for the device to return
+    /// then immediately issues the next service, and a bare `new_from_serial` with
+    /// zero retry would fail. So the open is wrapped in a bounded
+    /// [`OPEN_RETRY_BUDGET`] retry over transient transfer errors + brief
+    /// `DeviceNotFound`, mirroring AOSP's bounded transport-reconnect handler
+    /// (and the consumer-side `open_device_with_retry` the selftest proved out).
+    ///
+    /// CRITICAL: the `conns` mutex is **released** across the multi-second retry
+    /// (it only guards the cache lookup/insert, not the open). Holding it across
+    /// the retry would serialize every other `get_or_open` caller behind one
+    /// device's re-enumeration window.
     async fn get_or_open(&self, serial: &str) -> Result<Arc<PersistentUsbConnection>> {
-        let mut conns = self.conns.lock().await;
-        if let Some(conn) = conns.get(serial) {
-            if conn.is_alive() {
-                return Ok(Arc::clone(conn));
+        // Fast path: a live cached connection. Reap a dead one while holding the
+        // lock (cheap, no I/O), then drop the lock before any open attempt.
+        {
+            let mut conns = self.conns.lock().await;
+            if let Some(conn) = conns.get(serial) {
+                if conn.is_alive() {
+                    return Ok(Arc::clone(conn));
+                }
+                // Stale: the device was unplugged or the connection died. Drop it
+                // and re-open below (outside the lock).
+                conns.remove(serial);
             }
-            // Stale: the device was unplugged or the connection died. Drop it
-            // and re-open below.
-            conns.remove(serial);
         }
-        let conn = PersistentUsbConnection::new_from_serial(serial, self.private_key_path.clone())
-            .await
-            .map(Arc::new)?;
+
+        // Open OUTSIDE the lock, bounded so a truly-absent device fails fast.
+        let key_path = self.private_key_path.clone();
+        let conn = retry_within(
+            OPEN_RETRY_BUDGET,
+            OPEN_RETRY_POLL,
+            is_retryable_open_error,
+            || PersistentUsbConnection::new_from_serial(serial, key_path.clone()),
+        )
+        .await
+        .map(Arc::new)?;
+
+        // Re-acquire the lock to publish. Another task may have opened the same
+        // serial while we were unlocked; if a live connection is already cached,
+        // prefer it (drop ours) so all callers share one connection per device.
+        let mut conns = self.conns.lock().await;
+        if let Some(existing) = conns.get(serial)
+            && existing.is_alive()
+        {
+            return Ok(Arc::clone(existing));
+        }
         conns.insert(serial.to_owned(), Arc::clone(&conn));
         Ok(conn)
+    }
+
+    /// Open a session on `serial`, tolerating a connection that dies on its very
+    /// first OPEN right after re-enumeration (the second of the two
+    /// post-re-enumeration races).
+    ///
+    /// `get_or_open` rides out the CNXN race, but the first OPEN frame is sent by
+    /// the connection's writer task and can itself hit a transient on a freshly
+    /// re-enumerated device. The writer's fatal arm then tears the connection
+    /// down (deliberately, for OUT-stream truncation safety — see `persistent.rs`),
+    /// so `open_session` fails and `is_alive()` flips false. Rather than mutate
+    /// the shared writer loop, we treat a dead-on-first-OPEN connection like a
+    /// failed connect: drop the (now-dead) cached connection and reopen+retry
+    /// within the same [`OPEN_RETRY_BUDGET`]. A failure on a still-alive connection
+    /// is a real service rejection (e.g. CLSE) and is returned immediately.
+    async fn open_session_with_reopen(
+        &self,
+        serial: &str,
+        cmd: &ADBLocalCommand,
+    ) -> Result<MultiplexedSession> {
+        let deadline = Instant::now() + OPEN_RETRY_BUDGET;
+        loop {
+            let conn = self.get_or_open(serial).await?;
+            match conn.open_session(cmd).await {
+                Ok(session) => return Ok(session),
+                // Only retry when the FAILURE killed the connection (first-OPEN
+                // race). A failure on a live connection is a genuine rejection.
+                Err(e) if conn.is_alive() || Instant::now() >= deadline => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        serial = %serial,
+                        "open_session died on first OPEN ({e}); dropping dead connection and reopening"
+                    );
+                    self.conns.lock().await.remove(serial);
+                    tokio::time::sleep(OPEN_RETRY_POLL).await;
+                }
+            }
+        }
     }
 
     /// The lifecycle broadcast sender, initializing the hub (and spawning the
@@ -447,8 +588,10 @@ impl DeviceBackend for DefaultDeviceBackend {
         if let Some(conn) = self.tcp_conn(serial).await {
             return conn.open_session(cmd).await;
         }
-        let conn = self.get_or_open(serial).await?;
-        conn.open_session(cmd).await
+        // The `adb root` reconnect path: the device just re-enumerated, so cover
+        // BOTH races — the CNXN race (inside `get_or_open`'s open retry) and the
+        // first-OPEN race (drop the dead connection + reopen).
+        self.open_session_with_reopen(serial, cmd).await
     }
 
     async fn open_sync_session(&self, serial: &str) -> Result<SyncSession> {
@@ -762,6 +905,106 @@ mod tests {
         assert!(
             caps.is_none(),
             "an unconnectable device must report unknown (None) capabilities"
+        );
+    }
+
+    // ---- retry_within policy (Module B) --------------------------------------
+
+    #[tokio::test]
+    async fn retry_within_succeeds_after_n_transient_failures() {
+        // Fails twice (retryable), then succeeds — within budget.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result: Result<u32> = retry_within(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            |_| true, // everything retryable for this test
+            || {
+                let attempts = std::sync::Arc::clone(&attempts);
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 2 {
+                        Err(RustADBError::DeviceNotFound("absent".into()))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            result.ok(),
+            Some(42),
+            "retry_within must succeed once the op stops failing within budget"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must have retried exactly until the third (successful) attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_within_gives_up_within_budget_when_always_failing() {
+        // Always fails (retryable) → must give up at the budget, not hang.
+        let start = Instant::now();
+        let result: Result<u32> = retry_within(
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            |_| true,
+            || async { Err(RustADBError::DeviceNotFound("gone".into())) },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a permanently-failing op must surface the last error after the budget"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must fail fast within ~budget, not hang (elapsed {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_within_returns_immediately_on_non_retryable_error() {
+        // A non-retryable error must NOT be retried, even with budget remaining.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result: Result<u32> = retry_within(
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            |_| false, // nothing retryable
+            || {
+                let attempts = std::sync::Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(RustADBError::DeviceBusy)
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err(), "a non-retryable error must propagate");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-retryable error must be returned on the first attempt (no retry)"
+        );
+    }
+
+    #[test]
+    fn is_retryable_open_error_covers_transient_and_device_not_found_not_busy() {
+        assert!(
+            is_retryable_open_error(&RustADBError::DeviceNotFound("absent".into())),
+            "DeviceNotFound (device momentarily not enumerated) must be retryable"
+        );
+        assert!(
+            is_retryable_open_error(&RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Disconnected
+            )),
+            "transient transfer errors must be retryable at the backend too"
+        );
+        assert!(
+            !is_retryable_open_error(&RustADBError::DeviceBusy),
+            "DeviceBusy (another process holds the claim) must NOT be retried"
         );
     }
 }
