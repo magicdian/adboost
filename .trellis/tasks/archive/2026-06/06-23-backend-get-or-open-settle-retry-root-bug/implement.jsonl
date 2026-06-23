@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/06-23-backend-get-or-open-settle-retry-root-bug/research/reenumeration-readiness.md", "reason": "实现依据：IOKit 码解码(0xe00002ed=NotResponding/0xe00002c0=NoDevice)、两竞态点 file:line、do_connect 与 get_or_open 的精确改点、测试 seam(scripted ADBMessageTransport mock)。"}
+{"file": ".trellis/tasks/06-23-backend-get-or-open-settle-retry-root-bug/prd.md", "reason": "需求 R1-R9 + 三项已确认决策(纳入 Disconnected+NotResponding；do_connect 8x/100ms、backend 10s/500ms；不纳入 Stall)。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "do_connect 的 CNXN 握手改动须遵守 CNXN version/delayed_ack/data_check 耦合契约，重试不得破坏握手语义。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "瞬态分类器与重试须遵循 RustADBError/Result 约定；UsbTransferError 变体保留是分类依据。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试风格(inline #[cfg(test)]、无外部 mock crate、feature 门控)与 clippy pedantic 基线;新 mock transport 须依赖自由。"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "get_or_open 属 server backend 路径;现有 'Common Mistake' 节记录了 consumer 重试与待修正的 IOKit 码名(R9 要更新此文件)。"}

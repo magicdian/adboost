@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-23-backend-get-or-open-settle-retry-root-bug/prd.md", "reason": "对照验收标准核对：瞬态分类正确、两层预算、锁不在重试期间持有、契约测试与单测齐备。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 do_connect 重试未破坏 CNXN 握手契约。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 clippy pedantic、测试风格、feature 门控全绿。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验瞬态分类器/重试的错误处理符合 RustADBError 约定，非瞬态仍 fail-fast。"}
+{"file": ".trellis/tasks/06-23-backend-get-or-open-settle-retry-root-bug/research/reenumeration-readiness.md", "reason": "对照研究核对 IOKit 码、竞态点、推荐方案落实无偏差。"}
