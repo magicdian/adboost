@@ -184,6 +184,124 @@ pub async fn case_stat_root<D: ADBDeviceExt>(device: &mut D) -> Outcome {
     }
 }
 
+/// Pure: does the trimmed `id -u` output indicate uid 0 (root)?
+///
+/// Behavioral root detection: a clean `"0"` (possibly with surrounding
+/// whitespace) means root; anything else — a non-zero uid, missing `id`, or
+/// unparseable output — is treated as not-root. Kept deliberately strict and
+/// simple so it never falsely reports root.
+pub(super) fn uid_is_root(id_output: &str) -> bool {
+    id_output.trim() == "0"
+}
+
+/// Read the device's current uid via `id -u` (through whatever channel `device`
+/// uses). Returns the trimmed stdout, or an error if the shell call itself fails.
+async fn current_uid<D: ADBDeviceExt>(device: &mut D) -> Result<String, String> {
+    let (out, _) = run_shell(device, "id -u").await?;
+    Ok(out.trim().to_string())
+}
+
+/// `adb root` → `adb unroot` cycle, driven THROUGH the in-process server via an
+/// [`ADBDeviceExt`] proxy device.
+///
+/// # Why through the server (not a direct USB connection)
+///
+/// USB allows exactly ONE exclusive interface claim per device. The
+/// through-server phase's backend already holds that single cached claim, so a
+/// case that opened its OWN direct `PersistentUsbConnection` would contend for
+/// the same claim and fail with `DeviceBusy` forever. Routing root/unroot through
+/// the SAME server (a) reuses the backend's single cached claim (no competing
+/// claim) and (b) actually exercises the production `adb root` reconnect path:
+/// frontend bridge → `DefaultDeviceBackend::get_or_open` / `open_session_with_reopen`
+/// retry, which is the code that rides out adbd's restart + USB re-enumeration.
+///
+/// # Behavioral production-build detection
+///
+/// `ADBProxyDevice::root()`/`unroot()` return `Result<()>` with NO reply text, so
+/// production-build detection is BEHAVIORAL, not reply-text based: after a
+/// successful `root()` we re-read `id -u`; if it is still non-zero the build does
+/// not permit root (production/`user` build) and the case is `Skipped`. Only a
+/// genuine transport/protocol error from `root()`/`unroot()` is `Failed`.
+///
+/// # Restart handling
+///
+/// `root:`/`unroot:` restart adbd and drop the server's cached connection; the
+/// NEXT shell command rides the backend's `get_or_open` / `open_session_with_reopen`
+/// retry to recover. No direct-USB waits are added — the backend retry is exactly
+/// the code under test.
+pub(super) async fn case_root_unroot_cycle<D: ADBDeviceExt>(
+    device: &mut D,
+    label: &str,
+) -> Outcome {
+    // Step 1: capture the initial uid. The device must be shell-able here (we are
+    // mid through-server phase), so a shell error is a genuine failure.
+    let initial = match current_uid(device).await {
+        Ok(u) => u,
+        Err(e) => return Outcome::Failed(format!("[{label}] could not read initial uid: {e}")),
+    };
+
+    if uid_is_root(&initial) {
+        // Already root: still exercise the cycle so the backend reconnect retry
+        // is driven. unroot → expect non-root, then root back to leave the device
+        // as we found it.
+        if let Err(e) = device.unroot().await {
+            return Outcome::Failed(format!("[{label}] unroot (from already-root) failed: {e}"));
+        }
+        let after_unroot = match current_uid(device).await {
+            Ok(u) => u,
+            Err(e) => {
+                return Outcome::Failed(format!("[{label}] could not read uid after unroot: {e}"));
+            }
+        };
+        if uid_is_root(&after_unroot) {
+            return Outcome::Failed(format!(
+                "[{label}] still root (uid {after_unroot}) after unroot"
+            ));
+        }
+        // Restore the original rooted state (best-effort: leaving it as found).
+        if let Err(e) = device.root().await {
+            return Outcome::Failed(format!("[{label}] root (restore) failed: {e}"));
+        }
+        return Outcome::Passed;
+    }
+
+    // Step 2: not root yet → `root()`. A transport/protocol error is a real
+    // failure; `Ok(())` may still mean a production build (no uid change).
+    if let Err(e) = device.root().await {
+        return Outcome::Failed(format!("[{label}] root failed: {e}"));
+    }
+    // The restart dropped the server's cached connection; this shell rides the
+    // backend's reconnect retry.
+    let after_root = match current_uid(device).await {
+        Ok(u) => u,
+        Err(e) => return Outcome::Failed(format!("[{label}] could not read uid after root: {e}")),
+    };
+    if !uid_is_root(&after_root) {
+        // Control service round-tripped but uid did not change → production/`user`
+        // build where adbd cannot run as root. Not a failure — device policy.
+        return Outcome::Skipped(format!(
+            "[{label}] adb root did not gain uid 0 (production build / adbd cannot run as root); uid={after_root}"
+        ));
+    }
+
+    // Step 3: we gained root → `unroot()` and expect uid back to non-zero.
+    if let Err(e) = device.unroot().await {
+        return Outcome::Failed(format!("[{label}] unroot not supported: {e}"));
+    }
+    let after_unroot = match current_uid(device).await {
+        Ok(u) => u,
+        Err(e) => {
+            return Outcome::Failed(format!("[{label}] could not read uid after unroot: {e}"));
+        }
+    };
+    if uid_is_root(&after_unroot) {
+        return Outcome::Failed(format!(
+            "[{label}] still root (uid {after_unroot}) after unroot"
+        ));
+    }
+    Outcome::Passed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +426,10 @@ mod tests {
             Ok(())
         }
 
+        async fn unroot(&mut self) -> Result<(), RustADBError> {
+            Ok(())
+        }
+
         async fn install(
             &mut self,
             _apk_path: &(dyn AsRef<std::path::Path> + Sync),
@@ -422,6 +544,20 @@ mod tests {
         let mut d = FakeDevice::default();
         assert_eq!(case_list_scratch_dir(&mut d).await, Outcome::Passed);
         assert_eq!(case_stat_root(&mut d).await, Outcome::Passed);
+    }
+
+    #[test]
+    fn uid_is_root_only_for_clean_zero() {
+        assert!(uid_is_root("0"), "bare 0 is root");
+        assert!(uid_is_root("0\n"), "0 with newline is root");
+        assert!(
+            uid_is_root("  0  "),
+            "0 with surrounding whitespace is root"
+        );
+        assert!(!uid_is_root("2000"), "non-zero uid is not root");
+        assert!(!uid_is_root(""), "empty output is not root");
+        assert!(!uid_is_root("00"), "00 is not a clean 0");
+        assert!(!uid_is_root("id: not found"), "missing `id` is not root");
     }
 
     #[tokio::test]

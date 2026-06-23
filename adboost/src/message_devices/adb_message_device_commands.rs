@@ -70,6 +70,10 @@ impl<T: ADBMessageTransport> ADBDeviceExt for ADBMessageDevice<T> {
         self.root().await
     }
 
+    async fn unroot(&mut self) -> Result<()> {
+        self.unroot().await
+    }
+
     async fn install(
         &mut self,
         apk_path: &(dyn AsRef<Path> + Sync),

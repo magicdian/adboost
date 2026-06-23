@@ -258,31 +258,12 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         stream: &mut TcpStream,
         service: &str,
     ) -> std::io::Result<HostOutcome> {
-        // `host-serial:<serial>:<sub>` — a single-device query carrying its own
-        // serial. Strip the prefix and dispatch the sub-service against it.
-        if let Some(rest) = service.strip_prefix("host-serial:") {
-            // The serial may itself contain colons (TCP/IP `ip:port`), so split
-            // on the known sub-service anchor rather than the first colon.
-            if let Some((serial, sub)) = split_host_serial(rest) {
-                return self.dispatch_host_serial(stream, serial, sub).await;
-            }
-            stream
-                .write_all(&protocol::fail("malformed host-serial request"))
-                .await?;
-            return Ok(HostOutcome::Close);
-        }
-
-        // `host-usb:<sub>` / `host-local:<sub>` — a single-device query that pins
-        // the device by transport *kind* instead of serial (native `adb -d`/`-e`
-        // phase 1). Structurally identical to `host-serial:`: resolve the one
-        // matching device, then run the same sub-service against its serial.
-        for (prefix, kind) in [
-            ("host-usb:", TransportKind::Usb),
-            ("host-local:", TransportKind::Local),
-        ] {
-            if let Some(sub) = service.strip_prefix(prefix) {
-                return self.dispatch_host_kind(stream, kind, sub).await;
-            }
+        // The pinned-device family prefixes (`host-serial:`/`host-usb:`/
+        // `host-local:`/`host-transport-id:`) all resolve one device and run the
+        // sub-service against it; handled together so this dispatcher stays focused
+        // on the `host:` services proper.
+        if let Some(outcome) = self.dispatch_pinned_prefix(stream, service).await? {
+            return Ok(outcome);
         }
 
         let Some(svc) = service.strip_prefix("host:") else {
@@ -360,7 +341,9 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 Ok(HostOutcome::Close)
             }
             _ if svc.starts_with("wait-for-") => {
-                self.serve_wait_for(stream, &svc["wait-for-".len()..])
+                // Top-level `host:wait-for-*` carries no serial — it waits on the
+                // device *set* filtered by transport kind (pinned_serial = None).
+                self.serve_wait_for(stream, &svc["wait-for-".len()..], None)
                     .await?;
                 Ok(HostOutcome::Close)
             }
@@ -394,6 +377,51 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             "devices-l" => Some(format_devices(&self.backend.list_devices().await, true)),
             _ => None,
         }
+    }
+
+    /// Route the pinned-device family prefixes — `host-serial:`/`host-usb:`/
+    /// `host-local:`/`host-transport-id:` — that each name a single device (by
+    /// serial, kind, or transport id) and then run a sub-service against it.
+    /// Returns `Ok(Some(outcome))` when `service` matched one of these prefixes,
+    /// `Ok(None)` when it did not (so the caller falls through to `host:`).
+    async fn dispatch_pinned_prefix(
+        &self,
+        stream: &mut TcpStream,
+        service: &str,
+    ) -> std::io::Result<Option<HostOutcome>> {
+        // `host-serial:<serial>:<sub>` carries its own serial. The serial may
+        // itself contain colons (TCP/IP `ip:port`), so split on the known
+        // sub-service anchor rather than the first colon.
+        if let Some(rest) = service.strip_prefix("host-serial:") {
+            if let Some((serial, sub)) = split_host_serial(rest) {
+                return Ok(Some(self.dispatch_host_serial(stream, serial, sub).await?));
+            }
+            stream
+                .write_all(&protocol::fail("malformed host-serial request"))
+                .await?;
+            return Ok(Some(HostOutcome::Close));
+        }
+
+        // `host-usb:<sub>` / `host-local:<sub>` pin the device by transport *kind*
+        // (native `adb -d`/`-e` phase 1): resolve the one matching device, then run
+        // the same sub-service against its serial.
+        for (prefix, kind) in [
+            ("host-usb:", TransportKind::Usb),
+            ("host-local:", TransportKind::Local),
+        ] {
+            if let Some(sub) = service.strip_prefix(prefix) {
+                return Ok(Some(self.dispatch_host_kind(stream, kind, sub).await?));
+            }
+        }
+
+        // `host-transport-id:<N>:<sub>` is the transport-id-pinned analogue,
+        // emitted by modern `adb` during the `adb root` reconnect handshake
+        // (`host-transport-id:<N>:wait-for-any-disconnect`).
+        if let Some(rest) = service.strip_prefix("host-transport-id:") {
+            return Ok(Some(self.dispatch_host_transport_id(stream, rest).await?));
+        }
+
+        Ok(None)
     }
 
     /// `host-serial:<serial>:<sub>` single-device queries.
@@ -449,6 +477,16 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     .select_transport_by_serial(stream, serial.to_string())
                     .await;
             }
+            _ if sub.starts_with("wait-for-") => {
+                // `host-serial:<serial>:wait-for-<transport>-<state>` (and the
+                // `host-transport-id:` family that resolves through here) pins the
+                // wait to a specific serial. This is the path the `adb root`
+                // reconnect handshake takes: `wait-for-any-disconnect` blocks until
+                // *this* serial vanishes from the device list. Share
+                // `serve_wait_for`, passing the pinned serial.
+                self.serve_wait_for(stream, &sub["wait-for-".len()..], Some(serial))
+                    .await?;
+            }
             other => {
                 stream
                     .write_all(&protocol::fail(&format!(
@@ -477,6 +515,41 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 stream.write_all(&protocol::fail(reason)).await?;
                 Ok(HostOutcome::Close)
             }
+        }
+    }
+
+    /// `host-transport-id:<N>:<sub>` single-device queries, pinned by transport
+    /// *id*. `rest` is the `<N>:<sub>` tail after the prefix. Resolves N → serial
+    /// (reusing [`Self::serial_for_transport_id`]) and runs the sub-service through
+    /// [`Self::dispatch_host_serial`], the same funnel [`Self::dispatch_host_kind`]
+    /// uses for kind-pinned queries. Unlike `host-serial:`, `<N>` is a bare u64
+    /// that never contains a colon, so a plain `split_once(':')` is correct.
+    /// Failure wording mirrors [`Self::select_transport_by_id`] so every id-keyed
+    /// path reports the same AOSP-aligned errors.
+    async fn dispatch_host_transport_id(
+        &self,
+        stream: &mut TcpStream,
+        rest: &str,
+    ) -> std::io::Result<HostOutcome> {
+        let Some((id_str, sub)) = rest.split_once(':') else {
+            stream
+                .write_all(&protocol::fail("malformed host-transport-id request"))
+                .await?;
+            return Ok(HostOutcome::Close);
+        };
+        let Ok(id) = id_str.parse::<u64>() else {
+            stream
+                .write_all(&protocol::fail("invalid transport id"))
+                .await?;
+            return Ok(HostOutcome::Close);
+        };
+        if let Some(serial) = self.serial_for_transport_id(id).await {
+            self.dispatch_host_serial(stream, &serial, sub).await
+        } else {
+            stream
+                .write_all(&protocol::fail("no device for transport id"))
+                .await?;
+            Ok(HostOutcome::Close)
         }
     }
 
@@ -525,41 +598,85 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     }
 
     /// `host:wait-for-<transport>-<state>` — block until a device matching the
-    /// request is present, then reply `OKAY`.
+    /// request reaches `<state>`, then reply `OKAY`.
     ///
     /// `arg` is the suffix after `wait-for-`, i.e. `<transport>-<state>`
-    /// (`any-device`, `usb-device`, `local-device`, …). Our backend only observes
-    /// the `device` state (a listed device is ready; we cannot see
-    /// recovery/sideload/bootloader), so those states FAIL fast with a clear
-    /// reason rather than hanging forever. The transport token *is* honored: it
-    /// filters the device set by [`TransportKind`] (`usb`/`local`; `any` matches
-    /// all), so `wait-for-usb-device` waits for a USB device specifically.
+    /// (`any-device`, `usb-device`, `local-device`, `any-disconnect`, …).
     ///
-    /// Framing: a bare `OKAY` once the wait is satisfied. `ADBProxyServer::
-    /// wait_for_device` issues the request via `send_adb_request` (reads the
-    /// connect OKAY) then reads a second OKAY — both are bare OKAYs, so the
-    /// connection OKAY the smartsocket layer already implies plus this OKAY match
-    /// its two reads.
-    async fn serve_wait_for(&self, stream: &mut TcpStream, arg: &str) -> std::io::Result<()> {
-        // Poll cadence + overall bound for the device-present wait.
+    /// Two states are observable by this backend:
+    /// - `device`: a device of the requested kind is *present* in the list. We
+    ///   cannot see recovery/sideload/bootloader, so those FAIL fast.
+    /// - `disconnect`: the target is *absent* from the list. This is the state the
+    ///   `adb root` / `adb unroot` reconnect handshake waits on — after adbd
+    ///   restarts, the device drops out of the list, satisfying the wait. AOSP's
+    ///   server pins this to the exact transport it just talked to and blocks
+    ///   forever; we honor the same pinning via `pinned_serial` but bound the wait
+    ///   by `MAX_WAIT` (see PRD ADR — a 60s safety net vs. a leaked polling task).
+    ///
+    /// `pinned_serial` selects the target:
+    /// - `Some(s)`: the request named a specific device (`host-serial:<s>:` or
+    ///   `host-transport-id:<N>:` resolved to `s`). `disconnect` waits for *that*
+    ///   serial to vanish.
+    /// - `None`: top-level `host:wait-for-*` with no serial — the wait is over the
+    ///   device *set* filtered by transport kind ([`kind_matches`]).
+    ///
+    /// The transport token *is* honored for the kind-filtered (`None`) paths:
+    /// `wait-for-usb-device` waits for a USB device specifically.
+    ///
+    /// Framing: a single bare `OKAY` once the wait is satisfied (no length-prefixed
+    /// payload). `ADBProxyServer::wait_for_device` issues the request via
+    /// `send_adb_request` (reads the connect OKAY) then reads a second OKAY — both
+    /// are bare OKAYs, so the connection OKAY the smartsocket layer already implies
+    /// plus this OKAY match its two reads.
+    async fn serve_wait_for(
+        &self,
+        stream: &mut TcpStream,
+        arg: &str,
+        pinned_serial: Option<&str>,
+    ) -> std::io::Result<()> {
+        // Poll cadence + overall bound for the wait.
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
         // Split `<transport>-<state>` on the LAST '-': the state is a single token
-        // (device/recovery/sideload/bootloader); the transport may be any/usb/local.
-        // A bare arg with no '-' (e.g. a hand-typed `wait-for-device`) is treated
-        // as the state directly — real `adb` always sends the `<transport>-<state>`
-        // form, but accepting the bare state is harmless and more forgiving.
+        // (device/recovery/sideload/bootloader/disconnect); the transport may be
+        // any/usb/local. A bare arg with no '-' (e.g. a hand-typed
+        // `wait-for-device`) is treated as the state directly — real `adb` always
+        // sends the `<transport>-<state>` form, but accepting the bare state is
+        // harmless and more forgiving.
         let (want, state) = arg
             .rsplit_once('-')
             .map_or((None, arg), |(transport, state)| {
                 (parse_transport_kind(transport), state)
             });
 
+        // `disconnect`: wait for the target to be ABSENT, then OKAY. AOSP unblocks
+        // when the pinned transport is torn down; our analogue is "the pinned
+        // serial (or any device of the requested kind) is no longer listed".
+        if state == "disconnect" {
+            let deadline = tokio::time::Instant::now() + MAX_WAIT;
+            loop {
+                let devices = self.backend.list_devices().await;
+                let absent = match pinned_serial {
+                    Some(s) => !devices.iter().any(|d| d.serial == s),
+                    None => !devices.iter().any(|d| kind_matches(want, d.kind)),
+                };
+                if absent {
+                    return stream.write_all(&protocol::okay()).await;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return stream
+                        .write_all(&protocol::fail("wait-for timed out"))
+                        .await;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+
         if state != "device" {
             return stream
                 .write_all(&protocol::fail(&format!(
-                    "wait-for-{state} not supported (this server only observes the 'device' state)"
+                    "wait-for-{state} not supported (this server only observes the 'device' and 'disconnect' states)"
                 )))
                 .await;
         }
@@ -1087,19 +1204,20 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
 /// Whether `service` is a device **control service** the server bridges
 /// verbatim: a single OPEN that yields a short textual reply then CLSE, exactly
 /// like bare `shell:` v1. These are the post-transport services behind
-/// `adb tcpip <port>` / `adb usb` / `adb root` / `adb reboot [mode]` /
-/// `adb remount` / `adb {enable,disable}-verity`.
+/// `adb tcpip <port>` / `adb usb` / `adb root` / `adb unroot` /
+/// `adb reboot [mode]` / `adb remount` / `adb {enable,disable}-verity`.
 ///
 /// `reboot:` is matched by prefix because the mode is appended
 /// (`reboot:bootloader`, `reboot:` for a plain reboot). The others are exact:
 /// `tcpip:` always carries a port, but the port is opaque to us (we forward the
 /// whole string), so a prefix match is enough and keeps an empty/garbage port a
 /// device-side error rather than a silent accept of an unrelated `tcpip`-prefixed
-/// service. `usb:` / `root:` / `remount:` / `*-verity:` take no argument.
+/// service. `usb:` / `root:` / `unroot:` / `remount:` / `*-verity:` take no
+/// argument.
 fn is_control_service(service: &str) -> bool {
     matches!(
         service,
-        "usb:" | "root:" | "remount:" | "enable-verity:" | "disable-verity:"
+        "usb:" | "root:" | "unroot:" | "remount:" | "enable-verity:" | "disable-verity:"
     ) || service.starts_with("tcpip:")
         || service.starts_with("reboot:")
 }
@@ -1124,6 +1242,7 @@ fn is_host_serial_sub(sub: &str) -> bool {
     matches!(sub, "get-state" | "get-serialno" | "features")
         || sub.starts_with("transport")
         || sub == "tport"
+        || sub.starts_with("wait-for-")
         || is_forward_family(sub)
 }
 
@@ -2492,12 +2611,73 @@ mod tests {
 
     #[tokio::test]
     async fn host_wait_for_unknown_state_fails() {
-        // An unrecognized state is rejected (not the observable `device` state).
+        // An unrecognized state is rejected (not an observable state).
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
         let resp = round_trip(f, "host:wait-for-any-bogus").await;
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("not supported"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_transport_id_routes_to_dispatch_host_serial() {
+        // R5: `host-transport-id:<N>:<sub>` resolves N → serial (1-based over the
+        // sorted serial set, so id 1 = "aaa") and funnels into dispatch_host_serial,
+        // exactly like host-usb:/host-local:. Verify via the get-state sub-service.
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("aaa"),
+            DeviceEntry::new("zzz"),
+        ]));
+        let resp = round_trip(f, "host-transport-id:1:get-state").await;
+        assert_eq!(resp, b"OKAY0006device");
+    }
+
+    #[tokio::test]
+    async fn host_transport_id_invalid_id_fails() {
+        // A non-numeric N is rejected with the same wording as
+        // `select_transport_by_id` ("invalid transport id").
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("aaa")]));
+        let resp = round_trip(f, "host-transport-id:x:get-state").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("invalid transport id"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_transport_id_out_of_range_fails() {
+        // An N with no matching device → "no device for transport id" (matches
+        // `select_transport_by_id`).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("aaa")]));
+        let resp = round_trip(f, "host-transport-id:9:get-state").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no device for transport id"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn host_wait_for_disconnect_with_no_devices_returns_okay_immediately() {
+        // R7 disconnect state: with no matching device present (pinned_serial =
+        // None, empty list), the target is absent immediately, so a single bare
+        // OKAY is returned without waiting the 60s bound. This is the state the
+        // `adb root` reconnect handshake blocks on.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:wait-for-any-disconnect").await;
+        assert_eq!(resp, b"OKAY");
+    }
+
+    #[test]
+    fn is_host_serial_sub_recognizes_wait_for_family() {
+        // Prerequisite: `wait-for-*` must anchor the host-serial split so a TCP/IP
+        // `ip:port` serial followed by a wait-for sub splits correctly.
+        assert!(is_host_serial_sub("wait-for-any-disconnect"));
+        assert!(is_host_serial_sub("wait-for-usb-device"));
+        let serial = "172.20.1.45:5555";
+        let rest = format!("{serial}:wait-for-any-disconnect");
+        assert_eq!(
+            split_host_serial(&rest),
+            Some((serial, "wait-for-any-disconnect")),
+            "tcp/ip serial + wait-for sub must split on the known-sub anchor"
+        );
     }
 
     #[test]
@@ -2753,6 +2933,7 @@ mod tests {
             "tcpip:5555",
             "usb:",
             "root:",
+            "unroot:",
             "reboot:",
             "reboot:bootloader",
             "remount:",
@@ -2776,6 +2957,7 @@ mod tests {
             "tcpip:0",
             "usb:",
             "root:",
+            "unroot:",
             "reboot:",
             "reboot:recovery",
             "remount:",

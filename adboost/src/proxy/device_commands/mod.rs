@@ -14,6 +14,7 @@ mod stat;
 mod tcpip;
 mod transport;
 mod uninstall;
+mod unroot;
 mod usb;
 mod verity;
 

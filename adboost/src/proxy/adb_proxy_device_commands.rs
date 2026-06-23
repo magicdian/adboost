@@ -98,6 +98,10 @@ impl ADBDeviceExt for ADBProxyDevice {
         self.root().await
     }
 
+    async fn unroot(&mut self) -> Result<()> {
+        self.unroot().await
+    }
+
     async fn push(
         &mut self,
         stream: &mut (dyn AsyncRead + Unpin + Send),

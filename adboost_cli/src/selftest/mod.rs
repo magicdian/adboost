@@ -130,6 +130,29 @@ fn estimated_cases_per_device() -> usize {
     10
 }
 
+/// Run the automated `root → unroot` cycle ONCE, on the FIRST serial, THROUGH the
+/// shared in-process `server` via a fresh [`ADBProxyDevice`].
+///
+/// Driving it through the server (rather than a direct USB connection) reuses the
+/// backend's single cached USB claim — so it never contends with the cached
+/// connection for the device's single exclusive claim (the old direct-path bug
+/// that produced `DeviceBusy`) — and exercises the production `adb root`
+/// reconnect path (frontend bridge → backend `get_or_open` /
+/// `open_session_with_reopen` retry).
+async fn run_root_unroot_through_server(
+    reporter: &mut Reporter,
+    server: &InProcessServer,
+    serials: &[String],
+) {
+    let Some(serial) = serials.first() else {
+        return;
+    };
+    // Select the specific serial through the server (the `-s` equivalent).
+    let mut device = ADBProxyDevice::new(serial.clone(), Some(server.addr()));
+    let outcome = cases::case_root_unroot_cycle(&mut device, "root_unroot_cycle").await;
+    run_one(reporter, "through_server", "root_unroot_cycle", outcome);
+}
+
 /// Run the through-server phase for every device on ONE shared in-process
 /// server. Standing the server up once (rather than per device) keeps a single,
 /// stable set of cached device claims for the whole phase.
@@ -183,6 +206,19 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
     // host:connect routing parity: a whole-server property (not per serial), and
     // non-destructive (dials an unreachable port), so run it ONCE.
     run_connect_parity_against_server(reporter, server.addr()).await;
+
+    // Automated root → unroot cycle, ONCE on the FIRST serial, driven THROUGH this
+    // SAME in-process server via a fresh `ADBProxyDevice`. Running it through the
+    // server (rather than a direct USB connection) reuses the backend's single
+    // cached USB claim (no competing claim → no `DeviceBusy`) AND exercises the
+    // real `adb root` reconnect path: frontend bridge → backend `get_or_open` /
+    // `open_session_with_reopen` retry that rides out adbd's restart +
+    // re-enumeration. It runs LAST among the through-server cases for that serial
+    // (after forward/reverse/parity) so the adbd restart it triggers does not
+    // disturb them. Bounded to the first serial: it restarts adbd twice, so
+    // running it once bounds USB churn (per-device-policy is adequately
+    // represented by the first device).
+    run_root_unroot_through_server(reporter, &server, serials).await;
     // Gracefully shut the server down: flush a connection-level CLSE to every
     // cached device connection while their writer tasks are still alive, then
     // free the port. This prevents orphaned device streams that would otherwise

@@ -24,6 +24,7 @@ pub enum ADBLocalCommand {
     TcpIp(u16),
     Usb,
     Root,
+    Unroot,
     /// Open a TCP connection to a port on the device (formats to "tcp:<port>")
     TcpConnect(u16),
     /// A verbatim local-service string, formatted as-is (no transformation).
@@ -93,6 +94,7 @@ impl Display for ADBLocalCommand {
             }
             Self::Usb => write!(f, "usb:"),
             Self::Root => write!(f, "root:"),
+            Self::Unroot => write!(f, "unroot:"),
             Self::TcpConnect(port) => write!(f, "tcp:{port}"),
             Self::Raw(service) => write!(f, "{service}"),
 
@@ -127,6 +129,12 @@ fn test_tcpip_command_encoding() {
 fn test_usb_command_encoding() {
     // `adb usb` opens the `usb:` device service (no argument).
     assert_eq!(ADBLocalCommand::Usb.to_string(), "usb:");
+}
+
+#[test]
+fn test_unroot_command_encoding() {
+    // `adb unroot` opens the `unroot:` device service (no argument), mirroring `root:`.
+    assert_eq!(ADBLocalCommand::Unroot.to_string(), "unroot:");
 }
 
 #[test]

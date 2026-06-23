@@ -105,6 +105,9 @@ pub trait ADBDeviceExt {
     /// Restart adb daemon with root permissions
     async fn root(&mut self) -> Result<()>;
 
+    /// Restart adb daemon without root permissions
+    async fn unroot(&mut self) -> Result<()>;
+
     /// Run `activity` from `package` on device. Return the command output.
     fn run_activity(
         &mut self,

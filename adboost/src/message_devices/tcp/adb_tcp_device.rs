@@ -90,6 +90,10 @@ impl ADBDeviceExt for ADBTcpDevice {
         self.inner.root().await
     }
 
+    async fn unroot(&mut self) -> Result<()> {
+        self.inner.unroot().await
+    }
+
     async fn install(
         &mut self,
         apk_path: &(dyn AsRef<Path> + Sync),

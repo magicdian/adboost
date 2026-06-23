@@ -9,6 +9,7 @@ mod shell;
 mod stat;
 mod tcpip;
 mod uninstall;
+mod unroot;
 mod utils;
 mod verity;
 

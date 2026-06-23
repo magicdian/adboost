@@ -81,6 +81,11 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
     let tcpip = case_tcpip_through_server(&subject).await;
     record(reporter, "tcpip", "shell_through_tcp_device", tcpip);
 
+    // NOTE: the root → unroot cycle is NOT part of the interactive phase — it is an
+    // automated case run THROUGH the in-process server (see
+    // `cases::case_root_unroot_cycle`, wired by `run_through_server_phase`). Do not
+    // re-add it here.
+
     // ALWAYS LAST — see the ordering invariant above.
     let reboot = case_reboot_recovery(&subject).await;
     record(reporter, "interactive", "reboot_recovery", reboot);
