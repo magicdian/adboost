@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "校验 host 协议路由契约：host-transport-id/wait-for/disconnect 新增路径是否与既有 transport 选择路径的 AOSP 错误语义、OKAY/FAIL framing 一致。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 disconnect 路径两个 bare OKAY 的 framing 与线协议契约相符。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 clippy/测试风格/CI 命令；确认新增单测遵循既有 #[tokio::test] 范式与质量基线。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 unroot 与 FAIL 分支的错误处理符合 RustADBError/Result 约定。"}
+{"file": ".trellis/tasks/06-23-adb-root-unroot-frontend/prd.md", "reason": "对照验收标准与 ADR 决策核对实现完整性(unroot 6 处镜像、disconnect 60s 兜底、host-transport-id 路由)。"}
+{"file": ".trellis/tasks/06-23-adb-root-unroot-frontend/research/aosp-wait-for-disconnect.md", "reason": "对照 AOSP 权威行为校验 wire 形态与 disconnect 语义无偏差。"}

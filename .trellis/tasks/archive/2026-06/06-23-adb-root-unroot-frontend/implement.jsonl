@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "本任务核心契约：frontend host 协议路由 + AOSP 错误语义。R5(host-transport-id 前缀)、R6(wait-for sub 路由)、R7(disconnect 状态)全部受此契约约束，新增路径必须与既有 transport 选择路径一致。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "serve_wait_for 的回包必须是 bare OKAY(无长度前缀)；disconnect 路径写第二个 OKAY 的 framing 需对齐线协议契约，避免 client 读取错位。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "unroot 完整镜像 root 需在正确目录新建 proxy/device_commands/unroot.rs 与 message_devices/commands/unroot.rs 并注册 mod；本文件说明 workspace 代码组织与模块归属。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "新增 unroot client API + frontend FAIL 分支需遵循 RustADBError/Result 约定与 FAIL 措辞风格。"}
+{"file": ".trellis/tasks/06-23-adb-root-unroot-frontend/research/aosp-wait-for-disconnect.md", "reason": "AOSP 权威实现：wire 前缀更正(host-transport-id: 而非 host:transport-id:)、两个 bare OKAY 的时序、disconnect pinned-到具体 transport 的语义、token 集合。实现 R5/R6/R7 的事实依据。"}
+{"file": ".trellis/tasks/06-23-adb-root-unroot-frontend/prd.md", "reason": "需求与两项 ADR 决策(Q1 60s 兜底 / Q2 完整镜像 root)及精确改动清单。"}
