@@ -1128,3 +1128,38 @@ Follow-up to the host-usb/transport-kind task: adb -d/-e still failed 'device no
 ### Next Steps
 
 - None - task complete
+
+
+## Session 28: adb root reconnect handshake + unroot + USB re-enumeration retry
+
+**Date**: 2026-06-23
+**Task**: adb root reconnect handshake + unroot + USB re-enumeration retry
+**Branch**: `main`
+
+### Summary
+
+Fixed 3 xdb-reported frontend/backend gaps. (1) unroot: mirrored root as a first-class capability across ADBLocalCommand/ADBDeviceExt/proxy/message/usb/tcp + is_control_service whitelist. (2) adb root reconnect handshake: routed host-transport-id:<N>:<sub> (top-level family prefix, corrected from xdb's host:transport-id:N: report), wait-for-* sub-services, and a new disconnect state in serve_wait_for pinned to the specific serial. (3) Real production bug: backend raced the not-ready USB endpoint after adbd restart/replug (IOKit 0xe00002ed NotResponding / 0xe00002c0 NoDevice) with zero retry — fixed via do_connect transient-retry (CNXN race, all consumers) + get_or_open/open_session_with_reopen bounded retry outside the conns lock (first-OPEN race + brief absence). Added a behavioral root_unroot selftest case running through the in-process server (exercises the real adb root path; production builds report Skipped) + a scripted-mock-transport contract test. Verified on real hardware. Transient WARN/ERROR log noise during re-enumeration documented as expected.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `19b86d4` | (see git log) |
+| `f84039a` | (see git log) |
+| `423efc9` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
