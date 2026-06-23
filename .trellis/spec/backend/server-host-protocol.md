@@ -28,6 +28,7 @@ kind and applies the zero/one/many uniqueness with kind-correct wording.
 | `host:tport:<sel>` (`any`/`-any`/empty, `usb`/`local`, `serial:<s>`/`<s>`, `id:<N>`/`-id:<N>`) | `select_tport` | `OKAY` + 8-byte LE id |
 | `host:*forward*` (no serial) | `serve_host_forward` → `resolve_single_serial` → `resolve_single_by_kind(None)` | forward-family framing |
 | `host-usb:<sub>` / `host-local:<sub>` | `dispatch_host_kind` → `resolve_single_by_kind(Some(kind))` then `dispatch_host_serial` | per-sub-service (mirrors `host-serial:`) |
+| `host-transport-id:<N>:<sub>` | `dispatch_host_transport_id` → `serial_for_transport_id(N)` then `dispatch_host_serial` | per-sub-service (mirrors `host-serial:`) |
 
 ### Transport KIND filter — `adb -d` / `adb -e` (`TransportKind`)
 
@@ -114,7 +115,7 @@ is correct. `split_host_serial` (`frontend.rs`) instead **anchors on a known
 sub-service**: it scans colon split points left-to-right and takes the first one
 whose right-hand side satisfies `is_host_serial_sub` (the exact member set of
 `dispatch_host_serial`'s `match sub`: `get-state` / `get-serialno` / `features`
-/ `transport*` / `tport` / forward-family). Left-to-right scan yields the
+/ `transport*` / `tport` / forward-family / `wait-for-*`). Left-to-right scan yields the
 longest serial that still leaves a valid sub-service — matching AOSP's
 serial-prefix matching for `ip:port` serials. When nothing anchors, it falls
 back to the first colon so a genuinely-unknown sub still reaches the precise
@@ -131,6 +132,61 @@ back to the first colon so a genuinely-unknown sub still reaches the precise
 > `host_serial_{features,get_state,forward}_with_tcp_ip_serial_routes_correctly`,
 > and end-to-end by the `tcpip.shell_through_tcp_device` selftest parity case
 > (modern `adb -s <ip:port>` sends `host-serial:<ip:port>:features` first).
+
+## The `adb root` / `adb tcpip` reconnect handshake (`wait-for-...-disconnect`)
+
+After a control service that restarts adbd (`root:` / `unroot:` / `tcpip:` /
+`usb:`), a modern `adb` client runs a **reconnect handshake** so it can wait out
+the daemon bounce. When the client was pinned by transport-id (the `adb -s` /
+multi-device case), it sends:
+
+```
+host-transport-id:<N>:wait-for-any-disconnect      # block until that transport is gone
+```
+
+and then — only if it was NOT originally pinned by id (`previous_id == 0`, i.e.
+a single-device no-`-s` invocation) — a follow-up `host:wait-for-<transport>-device`
+to wait for the daemon to come back. In the pinned case AOSP **skips** the
+second wait entirely, so the frontend only has to answer the disconnect wait.
+
+> **Gotcha — the wire prefix is `host-transport-id:<N>:`, NOT `host:transport-id:N:`.**
+> `host:transport-id:<N>` (with the `host:` prefix) is the *transport-switch*
+> service handled by `select_transport_by_id`. The reconnect handshake uses the
+> `host-transport-id:` **family prefix** (a sibling of `host-serial:` /
+> `host-usb:` / `host-local:`), emitted by AOSP `format_host_command`
+> (`host-transport-id:%llu:%s`). These are different code paths; routing one does
+> not route the other. `dispatch_host_transport_id` strips the family prefix,
+> `split_once(':')` into `(N, sub)` (N is a bare `u64`, never colon-bearing — so
+> unlike `host-serial:` it does NOT need `split_host_serial`), resolves N→serial
+> via `serial_for_transport_id`, then funnels into `dispatch_host_serial` so the
+> pinned-by-id and pinned-by-serial paths share identical sub-service semantics.
+
+### `disconnect` state in `serve_wait_for`
+
+`serve_wait_for(arg, pinned_serial)` parses `<transport>-<state>` and supports
+two states: `device` (wait until a matching device is **present**) and
+`disconnect` (wait until the target is **absent**). The absence target is:
+
+- `pinned_serial = Some(s)` (from `host-serial:`/`host-transport-id:` routing):
+  the specific serial `s` is no longer in `list_devices()`. This mirrors AOSP,
+  where `wait-for-disconnect` unblocks when the *exact* pinned transport
+  (`t->id == transport_id`) is torn down, not when "any device" disconnects.
+- `pinned_serial = None` (top-level `host:wait-for-*`): no device of the
+  requested kind (`kind_matches(want, kind)`) is present.
+
+Both states reply a **single bare `OKAY`** (the smartsocket connect-ack OKAY is
+emitted by the layer above; `serve_wait_for` writes only the post-wait OKAY) and
+share the 200 ms poll / **60 s `MAX_WAIT`** bound.
+
+> **Deliberate divergence from AOSP — bounded wait.** Native adb's server waits
+> *forever* for a disconnect (it polls the client fd and bails only when the
+> client closes the socket). adboost's `serve_wait_for` is poll-only (it does not
+> watch the client socket), so it bounds the disconnect wait at 60 s to avoid
+> leaking a polling task if the device never disconnects (e.g. `root` was a
+> no-op because adbd was already root). adbd restarts drop the device within
+> seconds, so the 60 s ceiling only ever bites the no-restart edge, where
+> `FAIL("wait-for timed out")` is the correct signal. Revisit if client-fd
+> awareness is ever added.
 
 ## Gotcha: modern `adb` selects a transport via `host:tport:any` BEFORE the local service
 
@@ -236,6 +292,15 @@ real client actually uses; same shared resolver / wording as `transport-usb`):
 - `tport_local_with_only_a_usb_device_fails_no_emulators_found` → `no emulators found`
 - `tport_usb_untagged_single_device_replies_okay_plus_id` → `kind: None` backward-compat
 
+`adb root` reconnect-handshake assertion points (`host-transport-id:` routing +
+`wait-for-...-disconnect`, all in `frontend.rs` tests):
+
+- `host_transport_id_routes_to_dispatch_host_serial` → `host-transport-id:1:get-state` over `["aaa","zzz"]` resolves N→serial and answers `device`
+- `host_transport_id_invalid_id_fails` → `invalid transport id`
+- `host_transport_id_out_of_range_fails` → `no device for transport id`
+- `host_wait_for_disconnect_with_no_devices_returns_okay_immediately` → empty list → immediate `OKAY` (exercises the `disconnect` absent-target path without a 60 s wait)
+- `is_host_serial_sub_recognizes_wait_for_family` → proves a TCP `ip:port` serial with a `wait-for-*` sub splits correctly (lockstep with `dispatch_host_serial`)
+
 ### Runtime selftest (device-backed, `adboost_cli selftest`)
 
 Unit tests use a `MockBackend`; the *reported* regression only manifests with a
@@ -258,19 +323,62 @@ what issues `host:tport:any` before `shell:`). Covered by a parity case:
 ## Device control services are bridged verbatim like `shell:` v1
 
 `map_local_service` (`frontend.rs`) recognizes a **control-service** family —
-`tcpip:<port>`, `usb:`, `root:`, `reboot:[mode]`, `remount:`, `enable-verity:`,
-`disable-verity:` — and forwards each as `ADBLocalCommand::Raw(service)` with
-**no capability gating**. The justification (and the reason this is safe) is that
-every one is structurally identical to bare `shell:` v1: a single OPEN, a short
-textual reply, then CLSE. `bridge_tcp_session`'s half-close copy already handles
-that request/response-then-close shape, so no separate "one-shot" path is
-needed. `is_control_service()` is the pure predicate; unit-tested for the exact
-member set (and against look-alikes like `usbfoo:` / `rebooting:` / `tcp:`).
+`tcpip:<port>`, `usb:`, `root:`, `unroot:`, `reboot:[mode]`, `remount:`,
+`enable-verity:`, `disable-verity:` — and forwards each as
+`ADBLocalCommand::Raw(service)` with **no capability gating**. The justification
+(and the reason this is safe) is that every one is structurally identical to bare
+`shell:` v1: a single OPEN, a short textual reply, then CLSE.
+`bridge_tcp_session`'s half-close copy already handles that
+request/response-then-close shape, so no separate "one-shot" path is needed.
+`is_control_service()` is the pure predicate; unit-tested for the exact member
+set (and against look-alikes like `usbfoo:` / `rebooting:` / `tcp:`).
 
-> **Gotcha**: `tcpip:`/`usb:`/`reboot:` restart adbd, which drops the USB
-> connection. The bridge observes EOF normally; the backend's `get_or_open`
-> replaces the now-stale cached connection on the next open. Do **not** treat the
-> post-`tcpip` connection drop as an error.
+> **Gotcha**: `tcpip:`/`usb:`/`reboot:`/`root:`/`unroot:` restart adbd, which
+> drops the USB connection. The bridge observes EOF normally; the backend's
+> `get_or_open` replaces the now-stale cached connection on the next open. Do
+> **not** treat the post-restart connection drop as an error. After such a
+> restart, a modern client runs the reconnect handshake (see *The `adb root` /
+> `adb tcpip` reconnect handshake* above).
+
+> **`unroot:` is bridged but also a first-class `ADBLocalCommand::Unroot`.** As a
+> client library, adboost exposes `ADBDeviceExt::unroot()` mirroring `root()`
+> across every device type (proxy / message / USB / TCP); as a server frontend it
+> bridges a client's `unroot:` verbatim via `is_control_service`. The two paths
+> are independent — the frontend never constructs the `Unroot` variant (it uses
+> `Raw`), and the library API never goes through `is_control_service`.
+
+**Runtime coverage**: `adboost_cli/src/selftest/cases.rs::case_root_unroot_cycle`
+exercises a real `root:` → `unroot:` round-trip. It is an **automated** case (no
+operator prompt) that runs **THROUGH the in-process server** via an
+`ADBProxyDevice` (NOT a direct USB connection), wired by
+`mod.rs::run_root_unroot_through_server` as the LAST through-server case, ONCE on
+the first serial.
+
+> **Why through the server, not a direct USB connection (the fixed bug).** USB
+> allows exactly ONE exclusive interface claim per device. The through-server
+> phase's backend already holds that single cached claim. The previous version of
+> this case opened its OWN direct `PersistentUsbConnection` in a separate
+> post-through-server phase, so it contended for the same claim and failed with
+> `Device is busy` forever (`DeviceBusy`, retried 20× then `Failed`). Worse, the
+> direct path never exercised the backend code (`get_or_open` /
+> `open_session_with_reopen` retry) that the `adb root` reconnect actually rides.
+> Routing it through the SAME server (a) reuses the backend's single cached claim
+> (no competing claim) and (b) exercises the real production `adb root` reconnect
+> path: frontend bridge → `DefaultDeviceBackend::get_or_open` /
+> `open_session_with_reopen` retry, which rides out adbd's restart + USB
+> re-enumeration.
+
+**Behavioral production-build detection (no reply-text parsing).**
+`ADBProxyDevice::root()`/`unroot()` return `Result<()>` with NO reply text, so
+the case detects build policy by BEHAVIOR: it reads `id -u` (via the pure,
+unit-tested `uid_is_root`), calls `root()`, then re-reads `id -u`. If the uid is
+now `0` → root gained. If `root()` returned `Ok(())` BUT the post-root uid is
+still non-zero → production/`user` build where adbd cannot run as root →
+`Outcome::Skipped` (NOT `Failed`). Only a genuine transport/protocol error from
+`root()`/`unroot()` is `Failed`. After gaining root it calls `unroot()` and
+asserts the uid returns to non-zero. All shell calls go through the proxy/server,
+so the backend's `get_or_open` / `open_session_with_reopen` retry handles the
+post-restart not-ready window — no direct-USB settle waits are added.
 
 ## `host:features` is **per-device** (capability negotiation is two-axis)
 
@@ -422,15 +530,43 @@ Inline `#[cfg(test)] mod tests`, run with `--features server`:
 `case_reboot_recovery` reporting `cannot open device to reboot: …0xe00002ed`,
 even though the device is physically present.
 
-**Cause**: The interactive phase (`adboost_cli/src/selftest/interactive.rs`)
-runs cases in sequence against one shared device. Several of them leave the
-device **mid-USB-re-enumeration**: `case_usb_forward_release_on_unplug` (operator
-replugs), `case_tcpip_through_server` (`restore_usb_mode` issues `usb:`, which
-restarts adbd and drops+re-adds the USB device), and any reboot. `nusb` re-opens
-the device under a fresh IOKit registry id, but adbd is not yet ready to accept a
+**Cause**: The selftest phases run cases in sequence against one shared device.
+Several of them leave the device **mid-USB-re-enumeration**:
+`case_usb_forward_release_on_unplug` (operator replugs),
+`case_tcpip_through_server` (`restore_usb_mode` issues `usb:`, which restarts
+adbd and drops+re-adds the USB device), the automated `case_root_unroot_cycle`
+(`root:`/`unroot:` each restart adbd; it now runs THROUGH the server as the last
+through-server case, so its restart is absorbed by the backend's reconnect retry
+rather than a direct re-open), and any reboot. `nusb` re-opens
+the device under a fresh `IOKit` registry id, but adbd is not yet ready to accept a
 CNXN handshake. A *bare* `PersistentUsbConnection::new_from_serial` issued within
 ~2 s of that transition hits the not-ready endpoint and fails. The reported
 failure surfaced at the `tcpip → reboot_recovery` seam, not within a single case.
+
+> **`IOKit` code decode (corrected).** Verified against the pinned
+> `io-kit-sys 0.5.0`: `0xe00002ed` = **`kIOReturnNotResponding`** ("device not
+> responding"), NOT `kIOReturnAborted` (which is `0xe00002eb`). The sibling
+> transient `0xe00002c0` = **`kIOReturnNoDevice`** ("no device"). nusb 0.2.3 maps
+> `NoDevice → TransferError::Disconnected` and has no named variant for
+> `NotResponding`, so it surfaces as `TransferError::Unknown(0xe000_02ed)`. Both
+> are the genuine *not-ready-yet* family right after re-enumeration; the code layer
+> alone CANNOT distinguish a transient `NoDevice` from a real unplug — only a
+> **bounded retry budget** keeps a retry honest.
+
+> **Expected log noise during re-enumeration (NOT a bug).** When the retry rides
+> out the not-ready window you WILL see, per failed attempt: nusb's own
+> `ERROR ... Failed to submit Out transfer ... e00002c0` / `failed to create IOKit
+> PlugInInterface ... 0xe00002be` (third-party, severity not ours to set), and
+> adboost's `WARN PersistentUsb reader/writer error (fatal): ...0xe00002ed` +
+> `could not enqueue connection CLSE on drop: writer task gone` (the connection
+> legitimately died on the adbd restart; the next open reconnects). These are the
+> *visible cost of the bounded retry succeeding*, confirmed benign on real hardware
+> (selftest `through_server.root_unroot_cycle` and `tcpip.shell_through_tcp_device`
+> both pass through exactly this noise). Do NOT treat these WARN/ERROR lines as a
+> regression. To quiet them in a deployment, set `RUST_LOG=nusb=warn,adboost=info`
+> (or lower the per-attempt teardown to DEBUG) — a deliberately-untaken cosmetic
+> change, since the words "fatal"/"error" are accurate *for that one connection*
+> even though the layer above recovers.
 
 **Fix**: Two layers (both applied):
 1. **Open-with-retry at the consumer** (the durable fix): open via
@@ -449,3 +585,39 @@ that restarts adbd or re-enumerates USB (unplug/replug, `tcpip:`/`usb:` mode
 switch, `reboot:`). Use `open_device_with_retry`. Keep the "reboot_recovery runs
 last" ordering invariant — but do not rely on ordering alone, since any
 re-enumerating case can precede another.
+
+### The backend now retries the same transients (the production `adb root` path)
+
+The selftest's `open_device_with_retry` is a *consumer* discipline; the
+production `adb root` reconnect path goes through the server backend, which had
+ZERO retry until now. Two complementary, bounded retries close that gap so a
+client going **through the server** (the path PR2's `wait-for-disconnect`
+handshake feeds into) no longer needs its own retry:
+
+| Layer | Where | Bound | Covers |
+|---|---|---|---|
+| Handshake (all consumers) | `PersistentConnection::do_connect` (`usb/persistent.rs`) | `CNXN_MAX_ATTEMPTS` (8) + 100 ms settle | the **CNXN race**: a transient transfer error on the CNXN write/read is settled + retried in the existing bounded loop instead of propagating |
+| Backend open (server only) | `DefaultDeviceBackend::get_or_open` + `open_session_with_reopen` (`server/default_backend.rs`) | ~10 s budget / 500 ms poll | the **first-OPEN race** (a connection that dies on its first OPEN is dropped + reopened) **and** brief `DeviceNotFound` (device momentarily absent from enumeration — which the handshake layer structurally cannot see) |
+
+- **Transient classification = `TransferError` variant + a bounded budget, NEVER
+  code-only.** `is_transient_connect_error` matches exactly
+  `TransferError::Unknown(0xe000_02ed)` (`NotResponding`) and
+  `TransferError::Disconnected` (`NoDevice`); `Stall` is deliberately excluded
+  (it can be a real endpoint fault). The bound is what makes retrying `NoDevice`
+  safe — a real unplug never recovers within the window, so it still fails fast.
+- The backend additionally retries `RustADBError::DeviceNotFound` (re-enumeration
+  gap) but NOT `DeviceBusy` (another process holds the single USB claim — waiting
+  won't clear it).
+- `get_or_open` releases the `conns` mutex across the multi-second retry (it only
+  guards the cache lookup/insert), so one device's re-enumeration window never
+  serializes other callers.
+- `open_session_with_reopen` is wired into `open_local_service` (the
+  `adb root` → `shell:` path). `open_sync_session` / `open_shell_v2` still get the
+  CNXN-race retry via `get_or_open` but not the first-OPEN reopen (their distinct
+  session types preclude the shared helper); extend them if a first-OPEN race is
+  ever observed there.
+- This aligns with AOSP's transport reconnect handler (bounded retry + backoff;
+  a single transient (re)open is not surfaced to the user) and with the
+  `prefer-root-cause-fix-at-contract-layer` / `tcp-async-path-missing-usb-guarantees`
+  principles (fix the shared handshake + the lifecycle-owning layer, not a local
+  patch).
