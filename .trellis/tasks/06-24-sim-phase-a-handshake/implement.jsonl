@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/prd.md", "reason": "父 PRD：全局设计、两 mock 形态、门控决策、诚实边界"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/protocol-state-edges.md", "reason": "握手边界主清单 CNXN-1..13 / DRAIN-1..5 / AUTH-1..6 / DACK-1..7，含触发序列、不变量、sim-可复现性"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/escaped-bug-history.md", "reason": "B1/B2/B-feat 的根因与触发消息序列，本阶段命名回归测试依据"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "ADB 线协议契约：CNXN/AUTH/banner/delayed_ack 权威约定，确保 sim 应答符合契约"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError 用法，尤其 ReadTimeout 的 idle≠故障契约与错误分类"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试与质量基线，门控 feature 不污染 default 依赖"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用既有 framing/negotiation 助手，零重实现"}

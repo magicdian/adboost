@@ -1,0 +1,8 @@
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/prd.md", "reason": "父 PRD：全局设计、ChunkedTransport 字节层职责、诚实边界"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/protocol-state-edges.md", "reason": "session 边界主清单 OPEN-1..8 / ACC-1..5 / RTE-1..12 / FC-1..14 / SES-1..15 / TD-1..5 / LIV-1..14"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/escaped-bug-history.md", "reason": "B3a/B8/B-recv 及 B4/B5/B7/B9 的根因、触发条件与 sim/字节层可复现性判定"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/parity-bug-classes.md", "reason": "class-1 字节层取消安全已被既有测试覆盖，ChunkedTransport 只补消费侧——避免重复造测试"}
+{"file": ".trellis/tasks/06-24-sim-phase-a-handshake/prd.md", "reason": "前置阶段交付的 SimulatedDevice/ChunkedTransport/Scenario 骨架契约，本阶段在其上扩展"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "OPEN/OKAY/WRTE/CLSE 与流控窗口的线协议权威约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "liveness/拆除路径的错误分类（致命 vs 可恢复）契约"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用 FlowControl/encode_okay_payload/parse_okay_delta，绝不重实现流控记账"}

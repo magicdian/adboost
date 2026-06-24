@@ -5,6 +5,15 @@ pub mod persistent;
 mod reverse_engine;
 mod reverse_policy;
 mod shell_v2_session;
+/// Deterministic in-memory ADB-device simulator for protocol/timing tests.
+///
+/// Double-gated `#[cfg(any(test, feature = "test-support"))]`: adboost's own
+/// inline tests get it for free under `cfg(test)`, and the opt-in `test-support`
+/// feature exposes it to separate test crates (CLI selftest, downstream `xdb`)
+/// that cannot see `cfg(test)` symbols. See the module docs for the honest
+/// boundary of what a frame/byte-level simulator can and cannot prove.
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim;
 mod sync_session;
 pub(crate) mod usb_transport;
 mod utils;

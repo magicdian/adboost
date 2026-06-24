@@ -846,6 +846,23 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         &self.peer_features
     }
 
+    /// Whether windowed `delayed_ack` flow control was negotiated for this
+    /// connection (vs classic stop-and-wait) — the outcome of intersecting our
+    /// advertised feature set, the device's banner, and the negotiated wire
+    /// version (see [`negotiate_delayed_ack`]).
+    ///
+    /// Exposed only to the in-crate tests and the opt-in `test-support` harness
+    /// so a [`SimulatedDevice`](crate::message_devices::usb::sim::SimulatedDevice)
+    /// test (or a downstream test crate) can assert the negotiated flow-control
+    /// mode end-to-end. It is NOT part of the stable runtime API: production
+    /// callers never need to branch on it (the connection drives the right mode
+    /// internally), so gating it keeps the public surface unchanged.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn delayed_ack_negotiated(&self) -> bool {
+        self.delayed_ack_negotiated
+    }
+
     /// Subscribe to device-originated `OPEN` messages (pull model).
     ///
     /// Returns the consumer side of a bounded queue. The reader task routes
@@ -2847,168 +2864,22 @@ mod tests {
         ADBTransportMessage::try_new(command, arg0, arg1, payload).expect("build message")
     }
 
-    // ---- Scripted mock transport (the `do_connect` retry contract seam) -------
+    // ---- `do_connect` CNXN retry contract -------------------------------------
     //
-    // `PersistentConnection<T>` is generic over `ADBMessageTransport`, so a
-    // scripted in-memory transport lets us exercise the CNXN retry without
-    // hardware (research Q6). The mock returns a programmed number of transient
-    // transfer errors on `write_message` before succeeding, then answers every
-    // read with a canned CNXN banner — so `do_connect` should ride out the
-    // transients and complete. State is behind `Arc<Mutex<_>>` so the `Clone`
-    // the trait requires shares one script.
-
-    #[derive(Clone)]
-    struct ScriptedTransport {
-        /// Number of transient write failures still to emit before writes succeed.
-        transient_writes_remaining: Arc<std::sync::Mutex<u32>>,
-        /// The transient error to emit (`NotResponding` vs `Disconnected`).
-        transient: nusb::transfer::TransferError,
-    }
-
-    impl ScriptedTransport {
-        fn new(transient_writes: u32, transient: nusb::transfer::TransferError) -> Self {
-            Self {
-                transient_writes_remaining: Arc::new(std::sync::Mutex::new(transient_writes)),
-                transient,
-            }
-        }
-    }
-
-    impl crate::adb_transport::ADBTransport for ScriptedTransport {
-        async fn connect(&mut self) -> Result<()> {
-            Ok(())
-        }
-        async fn disconnect(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    impl ADBMessageTransport for ScriptedTransport {
-        async fn write_message_with_timeout(
-            &mut self,
-            _message: ADBTransportMessage,
-            _write_timeout: Duration,
-        ) -> Result<()> {
-            let mut remaining = self.transient_writes_remaining.lock().expect("lock");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(RustADBError::UsbTransferError(self.transient));
-            }
-            Ok(())
-        }
-
-        async fn read_message_with_timeout(
-            &mut self,
-            _read_timeout: Duration,
-        ) -> Result<ADBTransportMessage> {
-            // Canned CNXN banner — a minimal, feature-less device banner so the
-            // handshake completes (delayed_ack negotiates to false, fine here).
-            Ok(msg(
-                MessageCommand::Cnxn,
-                A_VERSION_LEGACY,
-                1_048_576,
-                b"device::",
-            ))
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn do_connect_retries_transient_notresponding_then_succeeds() {
-        // Fewer transient writes than CNXN_MAX_ATTEMPTS → the handshake recovers.
-        let mut transport = ScriptedTransport::new(
-            3,
-            nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING),
-        );
-        let key = ADBRsaKey::new_random().expect("key");
-        let result = PersistentConnection::<ScriptedTransport>::do_connect(
-            &mut transport,
-            &key,
-            &DeviceFeatureSet::default(),
-        )
-        .await;
-        assert!(
-            result.is_ok(),
-            "do_connect must ride out NotResponding transients within CNXN_MAX_ATTEMPTS, got {result:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn do_connect_retries_transient_disconnected_then_succeeds() {
-        let mut transport = ScriptedTransport::new(2, nusb::transfer::TransferError::Disconnected);
-        let key = ADBRsaKey::new_random().expect("key");
-        let result = PersistentConnection::<ScriptedTransport>::do_connect(
-            &mut transport,
-            &key,
-            &DeviceFeatureSet::default(),
-        )
-        .await;
-        assert!(
-            result.is_ok(),
-            "do_connect must ride out Disconnected (NoDevice) transients, got {result:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn do_connect_fails_fast_when_transients_exceed_attempts() {
-        // More transient writes than CONNECT_TRANSIENT_MAX_ATTEMPTS → the in-place
-        // transient arm gives up fast (it does NOT burn the full CNXN_MAX_ATTEMPTS)
-        // so the error propagates to the OUTER reopen layer, which rebuilds the
-        // transport. This is the back-to-back `adb root; adb unroot` fix: on a
-        // re-enumerated device the handle is dead, so in-place retry must be tiny.
-        let mut transport = ScriptedTransport::new(
-            CONNECT_TRANSIENT_MAX_ATTEMPTS + 1,
-            nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING),
-        );
-        let key = ADBRsaKey::new_random().expect("key");
-        let result = PersistentConnection::<ScriptedTransport>::do_connect(
-            &mut transport,
-            &key,
-            &DeviceFeatureSet::default(),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "do_connect must fail fast (not hang) when transients exceed CONNECT_TRANSIENT_MAX_ATTEMPTS"
-        );
-    }
-
-    /// ANTI-AMPLIFICATION / non-re-enumeration invariant: a handle that returns
-    /// `Disconnected` (the re-enumeration signal) FOREVER must make `do_connect`
-    /// give up after only the small `CONNECT_TRANSIENT_MAX_ATTEMPTS` in-place
-    /// retries — NOT the full `CNXN_MAX_ATTEMPTS`. This proves the inner loop no
-    /// longer burns its whole budget on a dead handle; the OUTER reopen layer owns
-    /// re-enumeration recovery. The back-to-back `adb root; adb unroot` trace
-    /// (15/15 in-place failures, then the first reopen succeeded) is why this is
-    /// kept tiny. If this ever needs more inner attempts, the fix is at the reopen
-    /// layer, not by enlarging the inner budget.
-    #[tokio::test(start_paused = true)]
-    async fn do_connect_transient_arm_is_small_constant_not_full_cnxn_budget() {
-        // A transport that is dead forever (Disconnected on every write). The
-        // inner transient arm allows at most CONNECT_TRANSIENT_MAX_ATTEMPTS
-        // in-place retries; the (CONNECT_TRANSIENT_MAX_ATTEMPTS + 1)-th write still
-        // returns Disconnected, so do_connect must propagate that error (NOT the
-        // CNXN-exhausted ADBRequestFailed it would return after CNXN_MAX_ATTEMPTS,
-        // and NOT hang). A small constant is intentionally < CNXN_MAX_ATTEMPTS
-        // (enforced at compile time by `TRANSIENT_BUDGET_IS_SMALL_CONSTANT`).
-        let mut transport =
-            ScriptedTransport::new(u32::MAX, nusb::transfer::TransferError::Disconnected);
-        let key = ADBRsaKey::new_random().expect("key");
-        let result = PersistentConnection::<ScriptedTransport>::do_connect(
-            &mut transport,
-            &key,
-            &DeviceFeatureSet::default(),
-        )
-        .await;
-        assert!(
-            matches!(
-                result,
-                Err(RustADBError::UsbTransferError(
-                    nusb::transfer::TransferError::Disconnected
-                ))
-            ),
-            "a permanently-dead handle must propagate Disconnected after the small in-place budget (handing off to the outer reopen layer), not exhaust CNXN_MAX_ATTEMPTS, got {result:?}"
-        );
-    }
+    // The former fixed-script `ScriptedTransport` mock + its four `do_connect_*`
+    // tests have been GENERALIZED into the stateful `SimulatedDevice` harness
+    // (`super::sim`), which drives the same retry contract end-to-end through the
+    // public `PersistentConnection::new_with_features` rather than the private
+    // `do_connect`. The equivalent coverage now lives there with no loss:
+    //   - transient NotResponding ridden out  → `cnxn_retries_then_succeeds_on_transient_notresponding`
+    //   - transient Disconnected ridden out   → `cnxn_retries_then_succeeds_on_transient_disconnected`
+    //   - transient on the READ side          → `cnxn_retries_then_succeeds_on_transient_read`
+    //   - exceeds in-place budget → fail fast  → `cnxn_fails_fast_when_transients_exceed_in_place_budget`
+    //   - permanently-dead handle propagates   → (same; asserts the Disconnected family)
+    //     Disconnected (anti-amplification), not the CNXN-exhausted error.
+    // Keeping one mock (the stateful sim) instead of two avoids the duplication
+    // the code-reuse guideline warns against. The pure-predicate test below stays
+    // — it exercises the classifier in isolation, not a transport.
 
     #[test]
     fn is_transient_connect_error_classifies_family() {

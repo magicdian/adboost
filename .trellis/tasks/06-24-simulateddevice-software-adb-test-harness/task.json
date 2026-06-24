@@ -1,0 +1,30 @@
+{
+  "id": "simulateddevice-software-adb-test-harness",
+  "name": "simulateddevice-software-adb-test-harness",
+  "title": "SimulatedDevice software ADB test harness",
+  "description": "",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "magicdian",
+  "assignee": "magicdian",
+  "createdAt": "2026-06-24",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-24-sim-phase-a-handshake",
+    "06-24-sim-phase-b-session",
+    "06-24-sim-phase-c-backend"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

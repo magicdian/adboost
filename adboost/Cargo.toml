@@ -27,6 +27,15 @@ framebuffer = ["dep:image"]
 # device backend. The bundled `UsbDeviceBackend` rides on the `usb` stack, so
 # `server` implies `usb`. OFF by default — pure client users are unaffected.
 server = ["usb", "dep:futures-util"]
+# Deterministic in-memory ADB-device simulator for protocol/timing tests
+# (`message_devices::usb::sim`): a stateful adbd model + a byte-level chunked
+# transport, driving the real `PersistentConnection` reader/writer loops without
+# hardware. adboost's own inline tests get it for free via `cfg(test)`; this
+# feature exposes it to SEPARATE test crates (CLI selftest, downstream `xdb`),
+# which cannot see `cfg(test)` symbols. Rides the `usb` stack (the persistent
+# connection + transport seam live under `usb`). OFF by default — pure runtime
+# users never compile it. The standard `tokio`/`proptest` `test-util` idiom.
+test-support = ["usb"]
 # Optional convenience initializer (`init_tracing_from_env`); OFF by default.
 # The library itself never installs a subscriber — it stays a pure emitter.
 tracing-init = ["dep:tracing-subscriber"]

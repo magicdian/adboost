@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-24-sim-phase-c-backend/prd.md", "reason": "本阶段 Acceptance Criteria 与诚实边界（不测真实 socket/TLS/IOKit 重枚举）"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/parity-bug-classes.md", "reason": "逐条核对 host 协议对齐场景 + 桥接/真实死亡缺口是否补齐"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "核对前端回包字节与 AOSP 线节一致"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "核对 backend 事件→frontend 规则保留/释放跨层一致"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "server,test-support 组合 lint/clippy/test 全绿"}

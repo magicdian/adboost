@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-24-sim-phase-b-session/prd.md", "reason": "本阶段 Acceptance Criteria 与 Out-of-Scope"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/protocol-state-edges.md", "reason": "逐条核对 OPEN/ACC/RTE/FC/SES/TD/LIV 边界是否都有端到端测试"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "核对 session/流控断言符合线协议契约"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对致命/可恢复错误分类断言正确"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "lint/clippy/feature 组合全绿"}

@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-24-sim-phase-a-handshake/prd.md", "reason": "本阶段 Acceptance Criteria 与 Out-of-Scope，检查覆盖是否齐全"}
+{"file": ".trellis/tasks/06-24-simulateddevice-software-adb-test-harness/research/protocol-state-edges.md", "reason": "逐条核对握手边界是否都有端到端测试或记录的豁免理由"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "核对 sim 应答与断言符合线协议契约"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "lint/clippy/feature 组合全绿的质量门槛"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 ReadTimeout/错误分类断言正确"}
