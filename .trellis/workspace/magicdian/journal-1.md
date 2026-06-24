@@ -1196,3 +1196,83 @@ Fixed xdb-reported adb root/unroot reconnect handshake issues across two iterati
 ### Next Steps
 
 - None - task complete
+
+---
+
+## Session 30: SimulatedDevice software ADB test harness (Phases A/B/C)
+
+**Date**: 2026-06-24
+**Task**: 06-24-simulateddevice-software-adb-test-harness (parent) + sim-phase-a/b/c subtasks
+**Branch**: `sim-harness-phase-a`
+
+### Summary
+
+Built a comprehensive, hardware-free protocol test harness so the bug classes that
+kept escaping to xdb (delayed_ack negotiation, reconnect/re-enumeration, framing
+desync, host-protocol parity) are now caught by adboost's own `cargo test`. Three
+research agents first mined the escaped-bug history, an ~80-edge protocol-state
+catalog, and the two recurring bug classes; the harness was scoped to that catalog.
+
+Delivered in three independently-committed phases (parent + 3 subtasks):
+
+- **Phase A** — `SimulatedDevice` (frame-level `ADBMessageTransport` adbd state
+  machine: CNXN/AUTH/banner/delayed_ack + outbound queue, empty→ReadTimeout) +
+  `DeviceProfile` (android_11/16, auth, featureless) + `Scenario` (fault injection)
+  + `ChunkedTransport` (byte-level, reassembles via the shared `FrameReadBuffer`).
+  Replaced the 4 fixed-script `ScriptedTransport` `do_connect` tests with stateful
+  end-to-end equivalents through `PersistentConnection::new`. 18 tests; regressions
+  B1 (android_11 classic flow control), B2 (data_check=0 accepted).
+- **Phase B** — session state machine (OPEN/OKAY/WRTE/CLSE, double-OKAY, reject,
+  echo, early-close) + `ChunkedTransport` byte faults. 15 tests; regressions B3a
+  (early-CLSE fast-fail), B8 (half-open is_alive), B-recv (short SYNC frame no
+  panic), B4/B5/B7/B9 (cancel-safety: split/coalesce/truncation/backpressure).
+- **Phase C** — `SimDeviceBackend` + `SimRegistry` over the `DeviceBackend` trait,
+  driving the smartsocket frontend end-to-end. 8 tests: host:devices, -d/-e kind
+  selection, per-device honest host:features (B-feat), the real shell: bridge
+  round trip (closing the `MockBackend` `unimplemented!()` gap), wait-for-disconnect
+  on a real connection death, back-to-back restart recovery via reopen.
+
+### Main Changes
+
+- New `message_devices/usb/sim/` module (mod/device/chunked/profile/scenario/state
+  + 2 test files), gated `#[cfg(any(test, feature = "test-support"))]`.
+- New `server/sim_backend.rs` (`SimDeviceBackend`/`SimRegistry`), same gating.
+- New `test-support` cargo feature (implies `usb`) exposing the harness to external
+  test crates (CLI selftest, xdb) that cannot see `cfg(test)` symbols.
+- Gated observability seams: `PersistentConnection::delayed_ack_negotiated()` and a
+  `pub(crate)` `frontend::handle_client` wrapper (test/test-support only).
+- New `SimulatedDevice::kill` / `SimState::kill_reader` for the restart edge.
+
+### Key Decisions / Lessons
+
+- Two complementary mocks at two layers: a frame-level `SimulatedDevice` for the
+  bulk of the protocol/state-machine edges, plus a byte-level `ChunkedTransport`
+  for the sub-frame cancel-safety class (B4/B5/B7/B9) a whole-frame mock cannot
+  reach. The byte-layer framing bugs already had `framed_read.rs` regression tests,
+  so the sim's unique value is the *consumer-side* (reader/writer-loop) guarantees.
+- An idle read must SLEEP its deadline before returning ReadTimeout, else the
+  spawned reader loop busy-spins and starves the test task (virtual under
+  `start_paused`).
+- `do_connect` issues single-shot reads with a huge timeout: a timeout-aware
+  `ChunkedTransport` (assemble-whole under a large deadline, partial under a short
+  one) carries a clean handshake AND exercises the idle-timeout path on the same
+  trickled stream.
+- Honest boundary (documented in the module): the sim does NOT prove real IOKit
+  codes/latency, TLS, or IOKit re-enumeration to a new registry id — only the
+  reopen-layer *reaction*. Those stay hardware tests.
+
+### Testing
+
+- [OK] `cargo fmt --all --check`; `cargo clippy --all-targets -D warnings` across
+  default / usb / server / test-support / server,test-support — all clean.
+- [OK] 337 lib tests pass under `server,test-support` (41 sim across the 3 phases);
+  default (58) + `adboost_cli` build unaffected.
+
+### Status
+
+[OK] **Completed** (3 commits: Phase A 4a61942, Phase B 49123b3, Phase C 274ca0e)
+
+### Next Steps
+
+- Optional: enable `test-support` from `adboost_cli` selftest / xdb to reuse the
+  harness for their own regression suites.
