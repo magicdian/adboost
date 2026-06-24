@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/06-23-wait-for-bug-okay-disconnect-presence-60s/research/native-disconnect-mechanism.md", "reason": "核心设计依据：原生连接 I/O 层即时断开检测、Form 2 推事件方案、TransportReset 变体而非复用 Disconnected、已发生竞态用 generation 初始检查、5-10s 有界 fallback、所有 adboost 集成点 file:line。"}
+{"file": ".trellis/tasks/06-23-wait-for-bug-okay-disconnect-presence-60s/prd.md", "reason": "需求 R1-R8 + 决策 D1（fallback 双 OKAY + WARN 日志）/D2（先压测验证 reader 致命死亡前提）/D3（Bug1 可先独立修）。"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "wait-for/serve_wait_for 契约、okay_twice 双 OKAY 约定、LifecycleEvent/subscribe_lifecycle/handle_disconnects 既有语义；改动须与之一致并更新。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "双 OKAY framing 与线协议契约一致性；reader fatal-error 分类（UsbTransferError vs ReadTimeout）是 Bug2 信号前提。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "新增 LifecycleEvent 变体 + 连接死亡通知须遵循 RustADBError/Result 与事件流约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "测试风格（inline #[cfg(test)]、mock backend 驱动 subscribe_lifecycle）、clippy pedantic、feature 门控。"}

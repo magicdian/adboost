@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-23-wait-for-bug-okay-disconnect-presence-60s/prd.md", "reason": "对照验收标准与决策核对：双 OKAY、事件驱动 disconnect、TransportReset 不误释放 forward、有界 fallback + WARN 日志、默认 trait 回退。"}
+{"file": ".trellis/tasks/06-23-wait-for-bug-okay-disconnect-presence-60s/research/native-disconnect-mechanism.md", "reason": "对照原生机制核对：信号发于连接死亡而非重开、generation 防快速重开掩盖、Bug1 与 Bug2 同分支但 FAIL 仍单 OKAY。"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "校验 serve_wait_for / LifecycleEvent / handle_disconnects 改动与契约一致，且 spec 已更新。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验双 OKAY framing 与超时单 FAIL 符合线协议。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 clippy pedantic、测试风格、feature 门控全绿。"}
