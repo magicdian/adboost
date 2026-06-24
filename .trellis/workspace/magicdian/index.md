@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 28
-- **Last Active**: 2026-06-23
+- **Total Sessions**: 29
+- **Last Active**: 2026-06-24
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1165 | Active |
+| `journal-1.md` | ~1198 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 29 | 2026-06-24 | adb root/unroot reconnect handshake: two-OKAY + event-driven disconnect + connect-layer re-enumeration recovery | `0977368` | `main` |
 | 28 | 2026-06-23 | adb root reconnect handshake + unroot + USB re-enumeration retry | `19b86d4`, `f84039a`, `423efc9` | `main` |
 | 27 | 2026-06-23 | Fix adb -d/-e: select_tport kind tokens (tport:usb/local) | `43217d2` | `main` |
 | 26 | 2026-06-23 | host-usb/host-local + transport-usb/local for adb -d/-e | `bbc2b3e` | `feat/host-usb-local-transport-kind` |

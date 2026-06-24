@@ -1163,3 +1163,36 @@ Fixed 3 xdb-reported frontend/backend gaps. (1) unroot: mirrored root as a first
 ### Next Steps
 
 - None - task complete
+
+
+## Session 29: adb root/unroot reconnect handshake: two-OKAY + event-driven disconnect + connect-layer re-enumeration recovery
+
+**Date**: 2026-06-24
+**Task**: adb root/unroot reconnect handshake: two-OKAY + event-driven disconnect + connect-layer re-enumeration recovery
+**Branch**: `main`
+
+### Summary
+
+Fixed xdb-reported adb root/unroot reconnect handshake issues across two iterations, all verified on real MTK hardware. (1) wait-for: serve_wait_for now sends two OKAYs (was one -> protocol fault) and wait-for-disconnect is event-driven via a new LifecycleEvent::TransportReset fired on cached-connection reader death (DeathSignal AtomicBool+Notify), replacing the broken 60s presence poll (adbd restart != USB re-enumeration on MTK). (2) connect-layer re-enumeration recovery: real-hardware trace overturned an initial in-place-CNXN-budget approach -- a re-enumerated device gets a new IOKit registry id so the old transport endpoints are permanently dead; in-place retries spin uselessly. Reversed to: tiny in-place transient arm (CONNECT_TRANSIENT_MAX_ATTEMPTS=3) + outer get_or_open/retry_within owns recovery by rebuilding the transport within a 10s wall-clock budget, with a variant-family transient classifier (Unknown(_) catch-all) ending the per-IOKit-code whack-a-mole. Added examples/root_disconnect_probe.rs diagnostic harness that drove the data-first design. Known-acceptable residual (documented in spec): a back-to-back control service can return silently when adbd tears the stream down before its reply text; command still takes effect, native adb shows the same race.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0977368` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
