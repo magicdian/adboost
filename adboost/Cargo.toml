@@ -98,3 +98,11 @@ tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 harness = false
 name = "benchmark_adb_push"
 path = "../benches/benchmark_adb_push.rs"
+
+# Diagnostic harness for the wait-for-disconnect redesign (task PR0). It uses the
+# optional `tracing-subscriber` (the `tracing-init` feature) and the USB stack, so
+# declare those as `required-features`: `cargo build/clippy --all-targets` then
+# skips it unless both are enabled, instead of failing to resolve the optional dep.
+[[example]]
+name = "root_disconnect_probe"
+required-features = ["usb", "tracing-init"]

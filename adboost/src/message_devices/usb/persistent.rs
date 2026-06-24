@@ -53,7 +53,7 @@ use std::time::Duration;
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::message_devices::adb_message_transport::ADBMessageTransport;
@@ -88,11 +88,51 @@ const WRITER_CHANNEL_SIZE: usize = 256;
 /// Channel buffer size for the reader task's session-registry control queue.
 const CONTROL_CHANNEL_SIZE: usize = 64;
 
-/// Max CNXN handshake attempts before giving up. adbd can emit one stale CLSE
-/// per orphaned stream left by a previous connection's unclean teardown; the
-/// multi-session server path can leave several, so this is well above the old
-/// fixed 3. Each stale CLSE also triggers a re-drain (see `do_connect`).
+/// Max CNXN handshake attempts before giving up — governs the overall loop and
+/// the **stale-CLSE drain** specifically. adbd can emit one stale CLSE per
+/// orphaned stream left by a previous connection's unclean teardown; the
+/// multi-session server path can leave several, so this is sized well above the
+/// old fixed 3. Each stale CLSE also triggers a re-drain (see `do_connect`).
+///
+/// This is a genuine **same-handle** case (orphaned CLSEs on a still-valid
+/// endpoint), so a modest in-place bound is the right tool. It is deliberately
+/// NOT sized for the USB re-enumeration window: a re-enumerated device gets a
+/// brand-new `IOKit` registry id and the old transport's endpoints are permanently
+/// dead, so no number of in-place CNXN retries can recover it. The back-to-back
+/// `adb root; adb unroot` real-hardware trace proved this — 15 in-place attempts
+/// ALL failed `device disconnected` on the dead handle, then the FIRST reopen of
+/// a fresh transport succeeded immediately. Re-enumeration recovery therefore
+/// lives at the OUTER reopen layer (`default_backend.rs::get_or_open` rebuilds the
+/// transport each poll), NOT here — see [`is_transient_connect_error`] and
+/// [`CONNECT_TRANSIENT_MAX_ATTEMPTS`].
 const CNXN_MAX_ATTEMPTS: u32 = 8;
+
+/// Max IN-PLACE retries of a transient transfer error (`NotResponding`) on the
+/// CNXN write/read, tracked by its own counter SEPARATE from
+/// [`CNXN_MAX_ATTEMPTS`].
+///
+/// Intentionally tiny. In-place CNXN retry can only recover a genuine
+/// **same-handle** blip — adbd briefly not answering on a still-valid endpoint
+/// before it re-enumerates. It CANNOT recover a re-enumerated device (the handle
+/// is gone; every retry returns `device disconnected` forever — the back-to-back
+/// `adb root; adb unroot` trace: 15/15 same-handle failures, then the first
+/// reopen of a fresh transport succeeded immediately). So this arm catches only
+/// the cheap blip; the OUTER reopen layer (`default_backend.rs::get_or_open`,
+/// which rebuilds the transport each poll within a 10 s wall clock) owns
+/// re-enumeration recovery. Keeping this small is also the non-amplification
+/// guarantee: inner ≤ small constant × outer wall-clock ≈ outer budget, never a
+/// product.
+const CONNECT_TRANSIENT_MAX_ATTEMPTS: u32 = 3;
+
+/// Non-amplification invariant, enforced at COMPILE TIME: the in-place transient
+/// budget must stay a small constant well below the loop budget. If anyone ever
+/// re-enlarges it toward the loop budget (the v1 mistake the back-to-back trace
+/// reversed — burning a big in-place budget on a dead handle), this fails to
+/// compile. Re-enumeration recovery belongs at the outer reopen layer, not here.
+const _: () = assert!(
+    CONNECT_TRANSIENT_MAX_ATTEMPTS < CNXN_MAX_ATTEMPTS,
+    "the in-place transient budget must stay a small constant below the loop budget"
+);
 
 /// Upper bound on frames drained per [`PersistentUsbConnection::drain_stale`]
 /// pass, so a device that keeps emitting frames cannot wedge the drain forever.
@@ -118,22 +158,37 @@ const CONNECT_RETRY_SETTLE: Duration = Duration::from_millis(100);
 /// `root:`/`unroot:`/`tcpip:`/`usb:`/reboot, or a physical replug), vs a permanent
 /// failure.
 ///
-/// Transient family (both observed in real logs right after re-enumeration):
+/// **Scope: this is the NARROW, IN-PLACE same-handle classifier — used ONLY
+/// inside [`PersistentConnection::do_connect`]'s bounded CNXN retry loop, bounded
+/// by the tiny [`CONNECT_TRANSIENT_MAX_ATTEMPTS`].** It is NOT the
+/// re-enumeration-recovery predicate. Re-enumeration recovery lives at the OUTER
+/// reopen layer (`default_backend.rs::is_retryable_open_error` /
+/// `get_or_open`), which rebuilds the transport (fresh endpoints) each poll — the
+/// only thing that can recover a device that re-enumerated under a new `IOKit`
+/// registry id. The back-to-back `adb root; adb unroot` trace proved in-place
+/// retry on a dead handle is futile (15/15 same-handle failures, then the first
+/// reopen of a fresh transport succeeded immediately), so this inner classifier
+/// is deliberately kept NARROW and its retry budget tiny.
+///
+/// Transient family (the cheap same-handle blip — adbd briefly not answering /
+/// the pipe momentarily gone before/during re-enumeration):
 /// - `kIOReturnNotResponding` (`0xe00002ed`) → `TransferError::Unknown(0xe000_02ed)`
 ///   (no named nusb variant; lands in the `Unknown` arm).
 /// - `kIOReturnNoDevice` (`0xe00002c0`) → `TransferError::Disconnected` (nusb maps
-///   `NoDevice` to `Disconnected`).
+///   `NoDevice` to `Disconnected`). On a re-enumerated device this repeats
+///   forever; the tiny [`CONNECT_TRANSIENT_MAX_ATTEMPTS`] bound makes the loop
+///   give up fast and hand off to the outer reopen layer.
 ///
-/// A *bounded* retry on these rides out the re-enumeration window; a truly-absent
-/// device still fails fast within the bound (the code layer alone cannot tell a
-/// transient `NoDevice` from a real unplug, so the bound — never the code — is what
-/// keeps this honest). This mirrors AOSP's transport reconnect handler, which
-/// retries a (re)open within a bounded window rather than surfacing a single
-/// transient (re)open failure to the user.
+/// A *bounded* retry on these rides out a same-handle blip; a truly-absent device
+/// still fails fast within the bound (the code layer alone cannot tell a transient
+/// `NoDevice` from a real unplug, so the bound — never the code — is what keeps
+/// this honest), at which point the outer reopen layer takes over.
 ///
-/// NOT transient: `Stall` (a real endpoint/protocol fault — retrying could mask a
-/// genuine stall), `WrongResponseReceived`, `ADBRequestFailed`, and every
-/// non-USB-transfer error (so this never misfires on a TCP transport's neutral
+/// NOT transient HERE: `Stall` (it is recovered at the OUTER reopen layer's
+/// family predicate, NOT by in-place retry — retrying a stall on a dead handle is
+/// pointless, and a re-enumerated endpoint's stall is only cleared by a fresh
+/// `connect()`), `WrongResponseReceived`, `ADBRequestFailed`, and every non-USB
+/// transfer error (so this never misfires on a TCP transport's neutral
 /// `IOError`/`ReadTimeout`, which carry no `UsbTransferError`).
 pub(crate) fn is_transient_connect_error(e: &RustADBError) -> bool {
     matches!(
@@ -238,6 +293,55 @@ async fn flush_connection_clse_impl(writer: &WriterHandle, conn_closed: &Arc<Ato
         // Best-effort: a closed/full writer at graceful teardown is expected and
         // not warned (unlike Drop's fire-and-forget path).
         let _ = writer.send_with_ack(clse).await;
+    }
+}
+
+/// Connection-death signal: a one-way "this connection's I/O died" edge that is
+/// **never lost**, even if it fires before anyone awaits it.
+///
+/// This is adboost's analogue of native adb's transport teardown: when adbd
+/// closes the connection (e.g. on `adb root`/`unroot` restart) the reader's bulk
+/// read errors out and the reader task hits its fatal `break` — the immediate,
+/// event-driven signal the host learns the old transport is gone, *independent*
+/// of whether USB physically re-enumerates. (PR0 real-hardware data: the reader
+/// died 20/20 cycles, max 250 ms; the serial usually NEVER left USB enumeration,
+/// so a presence poll cannot see this.)
+///
+/// `dead` is set permanently on the first fatal exit of either the reader or the
+/// writer (a connection needs both halves), and `notify` wakes any current
+/// waiters. A late waiter is covered by checking `dead` first in
+/// [`Self::wait`], so the death edge is never missed — the robust
+/// `AtomicBool`+`Notify` shape (a bare `Notify` would drop an edge fired before
+/// the first `notified()`).
+#[derive(Debug, Default)]
+struct DeathSignal {
+    dead: AtomicBool,
+    notify: Notify,
+}
+
+impl DeathSignal {
+    /// Mark the connection dead (idempotent) and wake all current waiters.
+    fn fire(&self) {
+        self.dead.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Resolve as soon as the connection is (or becomes) dead.
+    ///
+    /// Checks `dead` BEFORE awaiting `notified()` so a death that already
+    /// happened is not lost. The `notified()` future is registered before the
+    /// second check to avoid a TOCTOU between the load and the await.
+    async fn wait(&self) {
+        loop {
+            if self.dead.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.dead.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -441,6 +545,15 @@ pub struct PersistentConnection<T: ADBMessageTransport = USBTransport> {
     /// intentionally retired — re-enqueueing per-session CLSEs would only race
     /// the writer's teardown and emit spurious "writer task gone" warnings.
     conn_closed: Arc<AtomicBool>,
+    /// Connection-death signal: fired the instant either the reader or the writer
+    /// task hits its fatal `break` (adbd closed the connection — e.g. an `adb
+    /// root`/`unroot` restart). The server backend awaits this (via
+    /// [`Self::wait_closed`]) to publish a per-serial `TransportReset` lifecycle
+    /// event, the event-driven analogue of native adb's transport teardown — so
+    /// `wait-for-disconnect` returns sub-second without polling the device list
+    /// (which a non-re-enumerating adbd restart never satisfies). See
+    /// [`DeathSignal`].
+    closed: Arc<DeathSignal>,
     /// Marker for the transport type. The transport is owned by the reader /
     /// writer tasks, not the struct, so it appears only here; `fn() -> T` keeps
     /// the struct `Send`/`Sync` regardless of `T`'s auto-traits and imposes no
@@ -536,12 +649,22 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         let reader_transport = transport.clone();
         let writer_transport = transport;
 
+        // Connection-death signal, shared with both I/O tasks. Each task fires it
+        // when its loop returns (a fatal `break` on adbd close, or channel-closed
+        // teardown) — whichever half dies first makes the connection unusable, so
+        // a single fire from either is the correct "transport gone" edge.
+        let closed = Arc::new(DeathSignal::default());
+        let reader_closed = Arc::clone(&closed);
+        let writer_closed = Arc::clone(&closed);
+
         let reader_handle = tokio::spawn(async move {
             Self::reader_loop(reader_transport, control_rx, pending_opens_tx).await;
+            reader_closed.fire();
         });
 
         let writer_handle = tokio::spawn(async move {
             Self::writer_loop(writer_transport, writer_rx).await;
+            writer_closed.fire();
         });
 
         Ok(Self {
@@ -554,6 +677,7 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
             delayed_ack_negotiated,
             pending_opens_rx: std::sync::Mutex::new(Some(pending_opens_rx)),
             conn_closed: Arc::new(AtomicBool::new(false)),
+            closed,
             _transport: PhantomData,
         })
     }
@@ -854,6 +978,20 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         // had open, so a fixed-3 bound was too low under the multi-session server
         // path. Each stale CLSE we hit, we also re-drain before retrying so a burst
         // of buffered CLSEs is cleared in one pass rather than one-per-attempt.
+        //
+        // The TWO retry reasons inside this loop have DIFFERENT budgets:
+        //  - stale-CLSE drain (a real same-handle case) uses the loop's
+        //    `CNXN_MAX_ATTEMPTS`.
+        //  - transient-transfer (NotResponding/Disconnected) uses the tiny,
+        //    independent `CONNECT_TRANSIENT_MAX_ATTEMPTS` tracked below, because an
+        //    in-place transient retry can only catch a same-handle blip; a
+        //    re-enumerated device is recovered ONLY by the OUTER reopen layer
+        //    rebuilding the transport (back-to-back `adb root; adb unroot` trace:
+        //    15/15 in-place attempts failed `device disconnected`, then the first
+        //    reopen succeeded). Burning the full `CNXN_MAX_ATTEMPTS` on a dead
+        //    handle would just delay that outer reopen, so the transient arm gives
+        //    up fast and lets the error propagate to the reopen layer.
+        let mut transient_attempts: u32 = 0;
         for attempt in 1..=CNXN_MAX_ATTEMPTS {
             let cnxn_msg = ADBTransportMessage::try_new(
                 MessageCommand::Cnxn,
@@ -861,17 +999,23 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
                 1_048_576,
                 banner.as_bytes(),
             )?;
-            // CNXN write/read can race a not-ready endpoint right after USB
-            // re-enumeration (adbd restart / replug): the device is enumerated
-            // but adbd is not yet answering, surfacing as a transient transfer
-            // error (kIOReturnNotResponding / kIOReturnNoDevice). Settle briefly
-            // and retry within the same bounded loop instead of propagating, so
-            // EVERY consumer (USB-direct and the server `adb root` reconnect
-            // path) rides out the window. A non-transient error still fails fast.
+            // CNXN write/read can hit a transient transfer error
+            // (kIOReturnNotResponding / kIOReturnNoDevice) when adbd is briefly
+            // not answering on a STILL-VALID handle. Settle + retry ONLY a tiny
+            // `CONNECT_TRANSIENT_MAX_ATTEMPTS` times (its own counter, separate
+            // from the loop's stale-CLSE budget): on a re-enumerated device the
+            // handle is permanently dead and in-place retry is futile, so once the
+            // small budget is spent we propagate the error to let the OUTER reopen
+            // layer rebuild the transport (the only thing that recovers
+            // re-enumeration — see `CONNECT_TRANSIENT_MAX_ATTEMPTS`). A
+            // non-transient error still fails fast.
             if let Err(e) = transport.write_message(cnxn_msg).await {
-                if is_transient_connect_error(&e) {
+                if is_transient_connect_error(&e)
+                    && transient_attempts < CONNECT_TRANSIENT_MAX_ATTEMPTS
+                {
+                    transient_attempts += 1;
                     tracing::debug!(
-                        "PersistentUsb: transient transfer error on CNXN write, attempt {attempt}/{CNXN_MAX_ATTEMPTS} ({e}); settling + retrying"
+                        "PersistentUsb: transient transfer error on CNXN write, transient attempt {transient_attempts}/{CONNECT_TRANSIENT_MAX_ATTEMPTS} ({e}); settling + retrying in place"
                     );
                     tokio::time::sleep(CONNECT_RETRY_SETTLE).await;
                     continue;
@@ -881,9 +1025,13 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
 
             let response = match transport.read_message().await {
                 Ok(response) => response,
-                Err(e) if is_transient_connect_error(&e) => {
+                Err(e)
+                    if is_transient_connect_error(&e)
+                        && transient_attempts < CONNECT_TRANSIENT_MAX_ATTEMPTS =>
+                {
+                    transient_attempts += 1;
                     tracing::debug!(
-                        "PersistentUsb: transient transfer error on CNXN read, attempt {attempt}/{CNXN_MAX_ATTEMPTS} ({e}); settling + retrying"
+                        "PersistentUsb: transient transfer error on CNXN read, transient attempt {transient_attempts}/{CONNECT_TRANSIENT_MAX_ATTEMPTS} ({e}); settling + retrying in place"
                     );
                     tokio::time::sleep(CONNECT_RETRY_SETTLE).await;
                     continue;
@@ -1809,6 +1957,35 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         task_running(&self.reader_handle) && task_running(&self.writer_handle)
     }
 
+    /// Resolve as soon as this connection's I/O has died (the reader or writer
+    /// task hit its fatal `break` / exited) — the event-driven analogue of native
+    /// adb observing its transport torn down.
+    ///
+    /// Unlike polling [`Self::is_alive`], this is a push edge: it fires the
+    /// instant adbd closes the connection (an `adb root`/`unroot` restart), with
+    /// no dependence on USB re-enumeration. The death edge is never lost — a
+    /// caller that awaits *after* the connection already died returns immediately
+    /// (see [`DeathSignal::wait`]). The server backend awaits this per cached
+    /// connection to publish a [`crate::server::LifecycleEvent::TransportReset`].
+    pub async fn wait_closed(&self) {
+        self.closed.wait().await;
+    }
+
+    /// A standalone future that resolves when this connection's I/O dies, holding
+    /// **no** reference to the connection itself.
+    ///
+    /// This lets a watcher (the server backend) await the death edge WITHOUT
+    /// keeping the connection `Arc` alive — important so that dropping the cached
+    /// connection still lets its reader/writer tasks be aborted on `Drop` rather
+    /// than being pinned alive by a lingering watcher. The reader/writer fire the
+    /// underlying [`DeathSignal`] on exit regardless of who holds the connection,
+    /// so the returned future still resolves. The edge is never lost (a death
+    /// that already happened resolves the future immediately).
+    pub fn closed_signal(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let closed = Arc::clone(&self.closed);
+        async move { closed.wait().await }
+    }
+
     /// Flush a single connection-level CLSE while the writer task is still alive,
     /// awaiting its write confirmation, and mark the connection closed.
     ///
@@ -1904,6 +2081,13 @@ impl<T: ADBMessageTransport> Drop for PersistentConnection<T> {
         if let Some(handle) = self.writer_handle.take() {
             handle.abort();
         }
+        // Guarantee the connection-death signal resolves even when the tasks are
+        // ABORTED here (rather than exiting naturally and firing it themselves) —
+        // e.g. a still-alive connection dropped because a concurrent `get_or_open`
+        // won the cache-insert race. Without this, that connection's
+        // TransportReset watcher (in the server backend) would await a signal that
+        // never fires and leak. `fire` is idempotent.
+        self.closed.fire();
     }
 }
 
@@ -2610,6 +2794,33 @@ impl AsyncWrite for MultiplexedSession {
 mod tests {
     use super::*;
 
+    /// `DeathSignal::wait` must resolve when death happens AFTER a waiter is
+    /// already parked (the event path).
+    #[tokio::test]
+    async fn death_signal_wakes_a_parked_waiter() {
+        let sig = Arc::new(DeathSignal::default());
+        let s2 = Arc::clone(&sig);
+        let waiter = tokio::spawn(async move { s2.wait().await });
+        // Give the waiter a moment to park on `notified()`, then fire.
+        tokio::task::yield_now().await;
+        sig.fire();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake on fire")
+            .expect("task");
+    }
+
+    /// `DeathSignal::wait` must resolve immediately when death ALREADY happened
+    /// before anyone awaits (the entry-check race — the edge must never be lost).
+    #[tokio::test]
+    async fn death_signal_resolves_when_already_dead() {
+        let sig = DeathSignal::default();
+        sig.fire(); // death happens first
+        tokio::time::timeout(Duration::from_secs(1), sig.wait())
+            .await
+            .expect("an already-fired signal must resolve immediately");
+    }
+
     /// Build a session registry containing the given local ids (with dummy,
     /// unused channels) for classification tests.
     fn sessions_with(ids: &[u32]) -> HashMap<u32, SessionChannels> {
@@ -2739,9 +2950,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn do_connect_fails_fast_when_transients_exceed_attempts() {
-        // More transient writes than CNXN_MAX_ATTEMPTS → bounded loop gives up.
+        // More transient writes than CONNECT_TRANSIENT_MAX_ATTEMPTS → the in-place
+        // transient arm gives up fast (it does NOT burn the full CNXN_MAX_ATTEMPTS)
+        // so the error propagates to the OUTER reopen layer, which rebuilds the
+        // transport. This is the back-to-back `adb root; adb unroot` fix: on a
+        // re-enumerated device the handle is dead, so in-place retry must be tiny.
         let mut transport = ScriptedTransport::new(
-            CNXN_MAX_ATTEMPTS + 1,
+            CONNECT_TRANSIENT_MAX_ATTEMPTS + 1,
             nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING),
         );
         let key = ADBRsaKey::new_random().expect("key");
@@ -2753,7 +2968,45 @@ mod tests {
         .await;
         assert!(
             result.is_err(),
-            "do_connect must fail fast (not hang) when transients exceed CNXN_MAX_ATTEMPTS"
+            "do_connect must fail fast (not hang) when transients exceed CONNECT_TRANSIENT_MAX_ATTEMPTS"
+        );
+    }
+
+    /// ANTI-AMPLIFICATION / non-re-enumeration invariant: a handle that returns
+    /// `Disconnected` (the re-enumeration signal) FOREVER must make `do_connect`
+    /// give up after only the small `CONNECT_TRANSIENT_MAX_ATTEMPTS` in-place
+    /// retries — NOT the full `CNXN_MAX_ATTEMPTS`. This proves the inner loop no
+    /// longer burns its whole budget on a dead handle; the OUTER reopen layer owns
+    /// re-enumeration recovery. The back-to-back `adb root; adb unroot` trace
+    /// (15/15 in-place failures, then the first reopen succeeded) is why this is
+    /// kept tiny. If this ever needs more inner attempts, the fix is at the reopen
+    /// layer, not by enlarging the inner budget.
+    #[tokio::test(start_paused = true)]
+    async fn do_connect_transient_arm_is_small_constant_not_full_cnxn_budget() {
+        // A transport that is dead forever (Disconnected on every write). The
+        // inner transient arm allows at most CONNECT_TRANSIENT_MAX_ATTEMPTS
+        // in-place retries; the (CONNECT_TRANSIENT_MAX_ATTEMPTS + 1)-th write still
+        // returns Disconnected, so do_connect must propagate that error (NOT the
+        // CNXN-exhausted ADBRequestFailed it would return after CNXN_MAX_ATTEMPTS,
+        // and NOT hang). A small constant is intentionally < CNXN_MAX_ATTEMPTS
+        // (enforced at compile time by `TRANSIENT_BUDGET_IS_SMALL_CONSTANT`).
+        let mut transport =
+            ScriptedTransport::new(u32::MAX, nusb::transfer::TransferError::Disconnected);
+        let key = ADBRsaKey::new_random().expect("key");
+        let result = PersistentConnection::<ScriptedTransport>::do_connect(
+            &mut transport,
+            &key,
+            &DeviceFeatureSet::default(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RustADBError::UsbTransferError(
+                    nusb::transfer::TransferError::Disconnected
+                ))
+            ),
+            "a permanently-dead handle must propagate Disconnected after the small in-place budget (handing off to the outer reopen layer), not exhaust CNXN_MAX_ATTEMPTS, got {result:?}"
         );
     }
 
@@ -2775,7 +3028,11 @@ mod tests {
             !is_transient_connect_error(&RustADBError::UsbTransferError(
                 nusb::transfer::TransferError::Stall
             )),
-            "Stall must NOT be transient (could mask a real endpoint stall)"
+            "Stall must NOT be an IN-PLACE connect transient: a re-enumerated \
+             endpoint's stall is only cleared by a fresh connect(), so Stall is \
+             recovered at the OUTER reopen layer's family predicate \
+             (default_backend::is_retryable_open_error), NOT by in-place retry on a \
+             dead handle"
         );
         assert!(
             !is_transient_connect_error(&RustADBError::WrongResponseReceived(

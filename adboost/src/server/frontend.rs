@@ -605,38 +605,51 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     ///
     /// Two states are observable by this backend:
     /// - `device`: a device of the requested kind is *present* in the list. We
-    ///   cannot see recovery/sideload/bootloader, so those FAIL fast.
-    /// - `disconnect`: the target is *absent* from the list. This is the state the
+    ///   cannot see recovery/sideload/bootloader, so those FAIL fast. Polled
+    ///   (`POLL_INTERVAL` / `MAX_WAIT`); a never-arriving device is a single FAIL.
+    /// - `disconnect`: the target's transport is *torn down*. This is the state the
     ///   `adb root` / `adb unroot` reconnect handshake waits on — after adbd
-    ///   restarts, the device drops out of the list, satisfying the wait. AOSP's
-    ///   server pins this to the exact transport it just talked to and blocks
-    ///   forever; we honor the same pinning via `pinned_serial` but bound the wait
-    ///   by `MAX_WAIT` (see PRD ADR — a 60s safety net vs. a leaked polling task).
+    ///   restarts, the cached connection's reader/writer die. AOSP's server pins
+    ///   this to the exact transport it just talked to and detects teardown at the
+    ///   I/O layer (sub-second, never polling); we mirror that with an entry
+    ///   `transport_alive` check + a `TransportReset` lifecycle event, bounded by a
+    ///   10s `DISCONNECT_FALLBACK` (not 60s, and not presence-polling — see below).
     ///
     /// `pinned_serial` selects the target:
     /// - `Some(s)`: the request named a specific device (`host-serial:<s>:` or
     ///   `host-transport-id:<N>:` resolved to `s`). `disconnect` waits for *that*
-    ///   serial to vanish.
+    ///   serial's transport to die.
     /// - `None`: top-level `host:wait-for-*` with no serial — the wait is over the
     ///   device *set* filtered by transport kind ([`kind_matches`]).
     ///
     /// The transport token *is* honored for the kind-filtered (`None`) paths:
     /// `wait-for-usb-device` waits for a USB device specifically.
     ///
-    /// Framing: a single bare `OKAY` once the wait is satisfied (no length-prefixed
-    /// payload). `ADBProxyServer::wait_for_device` issues the request via
-    /// `send_adb_request` (reads the connect OKAY) then reads a second OKAY — both
-    /// are bare OKAYs, so the connection OKAY the smartsocket layer already implies
-    /// plus this OKAY match its two reads.
+    /// Framing: **two** bare OKAYs once the wait is satisfied (no length-prefixed
+    /// payload), via [`protocol::okay_twice`]. AOSP's client reads two OKAYs for
+    /// `wait-for-*` (accept + satisfied); adboost does NOT emit a blanket accept
+    /// OKAY at the smartsocket layer (the old doc comment here wrongly claimed it
+    /// did — `handle_client` dispatches straight to the service), so each service
+    /// that needs two emits them itself, exactly as the `forward` family does
+    /// (`okay_twice`). Sending only one desyncs modern clients
+    /// (`error: protocol fault (couldn't read status)`).
     async fn serve_wait_for(
         &self,
         stream: &mut TcpStream,
         arg: &str,
         pinned_serial: Option<&str>,
     ) -> std::io::Result<()> {
-        // Poll cadence + overall bound for the wait.
+        // Poll cadence + overall bound for the `device`-present branch (a device
+        // appearing is observable only by polling enumeration).
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        // Bounded fallback for the event-driven `disconnect` branch. PR0
+        // real-hardware data: the connection died within 250 ms max on every adbd
+        // restart, so 10 s is generous headroom while being far shorter than the
+        // old 60 s presence ceiling. It only ever fires when adbd did NOT actually
+        // restart (a no-op `root`), in which case we still return cleanly (no FAIL)
+        // to match native adb's "assume disconnected" semantics.
+        const DISCONNECT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10);
 
         // Split `<transport>-<state>` on the LAST '-': the state is a single token
         // (device/recovery/sideload/bootloader/disconnect); the transport may be
@@ -650,26 +663,88 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 (parse_transport_kind(transport), state)
             });
 
-        // `disconnect`: wait for the target to be ABSENT, then OKAY. AOSP unblocks
-        // when the pinned transport is torn down; our analogue is "the pinned
-        // serial (or any device of the requested kind) is no longer listed".
+        // `disconnect`: wait until the target transport is torn down, then OKAY.
+        //
+        // This is EVENT-DRIVEN (mirroring native adb's transport teardown), NOT a
+        // presence poll. The old presence poll (`list_devices` until the serial
+        // vanished) was fundamentally broken: an `adb root`/`unroot` restarts adbd
+        // but on most devices (MTK et al.) the USB device never re-enumerates, so
+        // the serial stays listed forever and the wait hung the full 60 s (the
+        // reported bug). PR0 proved the serial never left enumeration on 19/20
+        // restart cycles.
+        //
+        // Two signals, ordered by PR0 data:
+        //   1. PRIMARY — entry `transport_alive` check. The connection death
+        //      routinely PRECEDES the `wait-for-disconnect` request (5/20 cycles
+        //      the reader died before adbd's reply was even read), so checking on
+        //      entry catches the common case immediately. Subscribe BEFORE this
+        //      check so a death racing in just after it is still caught by the
+        //      event (broadcast does not replay → TOCTOU-free only with this
+        //      ordering).
+        //   2. SECONDARY — a `TransportReset` (or a real `Disconnected`) lifecycle
+        //      event, for the minority case where the wait arrives before the
+        //      death. No generation counter is needed: between `root:` and
+        //      `wait-for-disconnect` the client sends no device command, so no
+        //      reopen can race in and mask the death (PRD R6).
+        //
+        // No FAIL on this branch: both satisfaction and the bounded fallback send
+        // two OKAYs (the fallback assumes "disconnected, return cleanly", matching
+        // native; logged at WARN so a never-restarting adbd is still diagnosable).
         if state == "disconnect" {
-            let deadline = tokio::time::Instant::now() + MAX_WAIT;
+            let mut events = self.backend.subscribe_lifecycle().await;
+
+            // Entry check (primary path). `target_matches` decides which serial(s)
+            // satisfy the wait.
+            let alive = match pinned_serial {
+                Some(s) => self.backend.transport_alive(s).await,
+                // Kind-filtered top-level wait: "alive" iff some device of the
+                // requested kind is still present (no per-connection liveness to
+                // consult without a pinned serial).
+                None => self
+                    .backend
+                    .list_devices()
+                    .await
+                    .iter()
+                    .any(|d| kind_matches(want, d.kind)),
+            };
+            if !alive {
+                return stream.write_all(&protocol::okay_twice()).await;
+            }
+
+            let started = tokio::time::Instant::now();
+            let deadline = started + DISCONNECT_FALLBACK;
+            let target_matches = |s: &str| match pinned_serial {
+                Some(pinned) => s == pinned,
+                // Kind-filtered: any reset is a candidate; we cannot cheaply map a
+                // bare serial back to its kind here, so accept it (the pinned case
+                // — what the real `adb root` handshake uses — is the precise one).
+                None => true,
+            };
             loop {
-                let devices = self.backend.list_devices().await;
-                let absent = match pinned_serial {
-                    Some(s) => !devices.iter().any(|d| d.serial == s),
-                    None => !devices.iter().any(|d| kind_matches(want, d.kind)),
-                };
-                if absent {
-                    return stream.write_all(&protocol::okay()).await;
+                tokio::select! {
+                    ev = events.recv() => match ev {
+                        Some(LifecycleEvent::TransportReset(s)) if target_matches(&s) => {
+                            return stream.write_all(&protocol::okay_twice()).await;
+                        }
+                        // A genuine unplug also satisfies a disconnect wait.
+                        Some(LifecycleEvent::Disconnected(s)) if target_matches(&s) => {
+                            return stream.write_all(&protocol::okay_twice()).await;
+                        }
+                        // Other serial / non-matching event: keep waiting (loop).
+                        Some(_) => {}
+                        // Lifecycle stream closed (server teardown): return cleanly.
+                        None => return stream.write_all(&protocol::okay_twice()).await,
+                    },
+                    () = tokio::time::sleep_until(deadline) => {
+                        tracing::warn!(
+                            serial = ?pinned_serial,
+                            waited_ms = started.elapsed().as_millis(),
+                            "wait-for-disconnect fallback fired (no transport-reset signal; \
+                             adbd may not have restarted); assuming disconnected and returning"
+                        );
+                        return stream.write_all(&protocol::okay_twice()).await;
+                    }
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    return stream
-                        .write_all(&protocol::fail("wait-for timed out"))
-                        .await;
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
             }
         }
 
@@ -693,9 +768,14 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 .iter()
                 .any(|d| kind_matches(want, d.kind))
             {
-                return stream.write_all(&protocol::okay()).await;
+                // Satisfaction: two bare OKAYs (accept + satisfied), like the
+                // disconnect branch and the `forward` family (R1).
+                return stream.write_all(&protocol::okay_twice()).await;
             }
             if tokio::time::Instant::now() >= deadline {
+                // The device-present branch KEEPS a single FAIL on timeout: a
+                // device that never appeared is a genuine failure (unlike the
+                // disconnect branch, where the fallback means "assume disconnected").
                 return stream
                     .write_all(&protocol::fail("wait-for timed out"))
                     .await;
@@ -1463,7 +1543,20 @@ async fn handle_disconnects<B: DeviceBackend>(
     handle: ForwardHandle<B>,
     policy: OnDisconnect,
 ) {
-    while let Some(LifecycleEvent::Disconnected(serial)) = events.recv().await {
+    // Drain with a `match` (NOT `while let Some(Disconnected(..))`): only
+    // `Disconnected` (a permanent unplug / `host:disconnect`) releases the
+    // serial's forward + reverse rules. `TransportReset` (an adbd restart — `adb
+    // root`/`unroot`) must NOT release them (native adb keeps the host-side
+    // listeners across a restart), so it is ignored here and the loop KEEPS
+    // RUNNING. A `while let Some(Disconnected(..))` pattern would instead TERMINATE
+    // the loop on the first `TransportReset`, silently disabling all subsequent
+    // forward/reverse cleanup — a real bug trap.
+    while let Some(event) = events.recv().await {
+        let LifecycleEvent::Disconnected(serial) = event else {
+            // `TransportReset` (or any future non-Disconnected variant): not a
+            // permanent disconnect — release nothing, keep draining.
+            continue;
+        };
         match &policy {
             OnDisconnect::ReleaseAll => {
                 let n = handle.release(&serial).await;
@@ -2563,10 +2656,10 @@ mod tests {
     #[tokio::test]
     async fn host_wait_for_device_returns_okay_when_present() {
         // `adb wait-for-device` (→ host:wait-for-any-device) returns immediately
-        // with OKAY when a device is already present.
+        // with TWO OKAYs (R1: accept + satisfied) when a device is already present.
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
         let resp = round_trip(f, "host:wait-for-any-device").await;
-        assert_eq!(resp, b"OKAY");
+        assert_eq!(resp, b"OKAYOKAY");
     }
 
     #[tokio::test]
@@ -2575,7 +2668,7 @@ mod tests {
         // device (kind: None) matches any token, so a `usb` wait still resolves.
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
         let resp = round_trip(f, "host:wait-for-usb-device").await;
-        assert_eq!(resp, b"OKAY");
+        assert_eq!(resp, b"OKAYOKAY");
     }
 
     #[tokio::test]
@@ -2606,7 +2699,7 @@ mod tests {
         // `device` state when a device is present.
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
         let resp = round_trip(f, "host:wait-for-device").await;
-        assert_eq!(resp, b"OKAY");
+        assert_eq!(resp, b"OKAYOKAY");
     }
 
     #[tokio::test]
@@ -2656,13 +2749,14 @@ mod tests {
 
     #[tokio::test]
     async fn host_wait_for_disconnect_with_no_devices_returns_okay_immediately() {
-        // R7 disconnect state: with no matching device present (pinned_serial =
-        // None, empty list), the target is absent immediately, so a single bare
-        // OKAY is returned without waiting the 60s bound. This is the state the
-        // `adb root` reconnect handshake blocks on.
+        // Disconnect state, entry-check (primary) path: with no matching device
+        // present (pinned_serial = None, empty list), the target is already
+        // not-alive on entry, so TWO OKAYs (R1) are returned immediately without
+        // waiting the 10s fallback. This is the state the `adb root` reconnect
+        // handshake blocks on.
         let f = Arc::new(frontend_with(vec![]));
         let resp = round_trip(f, "host:wait-for-any-disconnect").await;
-        assert_eq!(resp, b"OKAY");
+        assert_eq!(resp, b"OKAYOKAY");
     }
 
     #[test]
@@ -3061,5 +3155,212 @@ mod tests {
         let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
         let resp = post_transport_round_trip(f, "dev1", "reverse:killforward-all").await;
         assert_eq!(resp, b"OKAYOKAY", "killforward-all success is two OKAYs");
+    }
+
+    // ----- Bug 2: event-driven wait-for-disconnect -----------------------------
+
+    /// A backend whose `transport_alive` and `subscribe_lifecycle` are controllable
+    /// so the event-driven `wait-for-disconnect` path can be exercised without USB
+    /// hardware. `alive` starts true; a `TransportReset`/`Disconnected` is pushed
+    /// via the returned `broadcast` sender.
+    struct WaitDisconnectBackend {
+        serial: String,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        lifecycle: tokio::sync::broadcast::Sender<LifecycleEvent>,
+    }
+
+    impl WaitDisconnectBackend {
+        fn new(serial: &str, alive: bool) -> Self {
+            let (lifecycle, _rx) = tokio::sync::broadcast::channel(8);
+            Self {
+                serial: serial.to_owned(),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(alive)),
+                lifecycle,
+            }
+        }
+    }
+
+    impl DeviceBackend for WaitDisconnectBackend {
+        async fn list_devices(&self) -> Vec<DeviceEntry> {
+            // The serial stays enumerated even after the connection dies — exactly
+            // the MTK-adbd-restart shape the presence poll could not handle.
+            vec![DeviceEntry::new(self.serial.clone())]
+        }
+        async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+        async fn open_local_service(
+            &self,
+            _serial: &str,
+            _cmd: &ADBLocalCommand,
+        ) -> Result<crate::usb::MultiplexedSession> {
+            unimplemented!("not exercised")
+        }
+        async fn transport_alive(&self, serial: &str) -> bool {
+            serial == self.serial && self.alive.load(std::sync::atomic::Ordering::Acquire)
+        }
+        async fn subscribe_lifecycle(&self) -> mpsc::Receiver<LifecycleEvent> {
+            let mut bcast = self.lifecycle.subscribe();
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                while let Ok(ev) = bcast.recv().await {
+                    if tx.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            rx
+        }
+    }
+
+    /// Drive `host-serial:<serial>:wait-for-any-disconnect` against a
+    /// `WaitDisconnectBackend`, returning the bytes the server wrote. Generic over
+    /// the backend so it can carry the controllable disconnect backend.
+    async fn round_trip_disconnect(backend: Arc<WaitDisconnectBackend>, serial: &str) -> Vec<u8> {
+        let frontend = Arc::new(AdbServerFrontend::builder(backend).build());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = frontend.handle_client(stream).await;
+        });
+        let request = format!("host-serial:{serial}:wait-for-any-disconnect");
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(format!("{:04x}{request}", request.len()).as_bytes())
+            .await
+            .expect("write req");
+        client.flush().await.expect("flush");
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf).await;
+        server.await.expect("server task");
+        buf
+    }
+
+    /// Entry-check (primary) path: the transport is already dead on entry (the
+    /// common case — PR0 showed the connection usually dies before the
+    /// `wait-for-disconnect` request even arrives). The wait returns TWO OKAYs
+    /// immediately, with no lifecycle event and no fallback wait.
+    #[tokio::test]
+    async fn wait_for_disconnect_entry_check_dead_returns_two_okays_immediately() {
+        let backend = Arc::new(WaitDisconnectBackend::new("DEADDEV", false));
+        let resp = round_trip_disconnect(backend, "DEADDEV").await;
+        assert_eq!(
+            resp, b"OKAYOKAY",
+            "a transport already dead on entry returns two OKAYs at once"
+        );
+    }
+
+    /// Event (secondary) path: the transport is alive on entry, then a
+    /// `TransportReset` for the pinned serial arrives — the wait must unblock with
+    /// TWO OKAYs promptly (NOT after the 10s fallback, and NOT after the old 60s
+    /// presence ceiling).
+    #[tokio::test]
+    async fn wait_for_disconnect_unblocks_on_transport_reset_event() {
+        let backend = Arc::new(WaitDisconnectBackend::new("LIVEDEV", true));
+        let lifecycle = backend.lifecycle.clone();
+        // Fire the reset shortly after the wait subscribes + passes the entry check.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = lifecycle.send(LifecycleEvent::TransportReset("LIVEDEV".to_string()));
+        });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            round_trip_disconnect(backend, "LIVEDEV"),
+        )
+        .await
+        .expect("must unblock on the event well before the 10s fallback");
+        assert_eq!(
+            resp, b"OKAYOKAY",
+            "a TransportReset for the pinned serial satisfies wait-for-disconnect"
+        );
+    }
+
+    /// A real `Disconnected` (permanent unplug) also satisfies a disconnect wait.
+    #[tokio::test]
+    async fn wait_for_disconnect_unblocks_on_disconnected_event() {
+        let backend = Arc::new(WaitDisconnectBackend::new("UNPLUG", true));
+        let lifecycle = backend.lifecycle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = lifecycle.send(LifecycleEvent::Disconnected("UNPLUG".to_string()));
+        });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            round_trip_disconnect(backend, "UNPLUG"),
+        )
+        .await
+        .expect("must unblock on the disconnect event");
+        assert_eq!(resp, b"OKAYOKAY");
+    }
+
+    /// Bounded-fallback path: the transport stays alive and no event ever arrives.
+    /// Using paused time, the wait must fire the 10s fallback (NOT the old 60s)
+    /// and still return TWO OKAYs (D1: assume-disconnected, clean return).
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_disconnect_fallback_fires_at_10s_with_two_okays() {
+        let backend = Arc::new(WaitDisconnectBackend::new("STUCK", true));
+        let handle = tokio::spawn(round_trip_disconnect(backend, "STUCK"));
+        // Advance just past the 10s bounded fallback; with paused time this does
+        // not actually sleep. (If the bound were still 60s this would hang.)
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        let resp = handle.await.expect("task");
+        assert_eq!(
+            resp, b"OKAYOKAY",
+            "the bounded fallback returns two OKAYs (assume disconnected), not a FAIL"
+        );
+    }
+
+    /// `handle_disconnects` must IGNORE `TransportReset` (an adbd restart is not a
+    /// permanent disconnect — forward/reverse rules must survive) while still
+    /// releasing on a later `Disconnected`. A `while let Some(Disconnected(..))`
+    /// loop would instead terminate on the `TransportReset` and silently disable
+    /// all subsequent cleanup — this locks the `match`-and-continue fix.
+    #[tokio::test]
+    async fn handle_disconnects_ignores_transport_reset_but_still_releases_on_disconnected() {
+        let (frontend, reverse_log) =
+            disconnect_fixture("RESETDEV", OnDisconnect::ReleaseAll).await;
+        let handle = frontend.handle();
+        assert!(frontend.forwards.contains(7000).await, "precondition");
+
+        let (tx, rx) = mpsc::channel(4);
+        let driver = tokio::spawn(handle_disconnects(rx, handle, OnDisconnect::ReleaseAll));
+        // A TransportReset must NOT release and must NOT end the loop.
+        tx.send(LifecycleEvent::TransportReset("RESETDEV".to_string()))
+            .await
+            .expect("send reset");
+        // A subsequent Disconnected on the SAME loop must still release.
+        tx.send(LifecycleEvent::Disconnected("RESETDEV".to_string()))
+            .await
+            .expect("send disconnect");
+        drop(tx);
+        driver.await.expect("handler task");
+
+        assert!(
+            !frontend.forwards.contains(7000).await,
+            "Disconnected after a TransportReset must still release (loop did not terminate early)"
+        );
+        assert_eq!(
+            reverse_log.lock().expect("test lock").as_slice(),
+            ["RESETDEV"],
+            "exactly one release (the Disconnected); the TransportReset released nothing"
+        );
+    }
+
+    /// The default `transport_alive` trait impl falls back to presence — a serial
+    /// in `list_devices` reads as alive, an absent one as not. This keeps
+    /// unadapted backends non-breaking (they degrade to the bounded fallback, not
+    /// a 60s hang).
+    #[tokio::test]
+    async fn transport_alive_default_impl_falls_back_to_presence() {
+        let b = MockBackend {
+            devices: vec![DeviceEntry::new("present")],
+        };
+        assert!(b.transport_alive("present").await, "listed serial is alive");
+        assert!(
+            !b.transport_alive("absent").await,
+            "unlisted serial is not alive (default presence fallback)"
+        );
     }
 }

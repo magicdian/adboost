@@ -134,10 +134,25 @@ impl DeviceEntry {
 /// and it fires whether or not any client is tracking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleEvent {
-    /// The named serial's transport went away — USB unplug, TCP `host:disconnect`,
-    /// or its persistent connection's reader task dying. Any `forward` listeners
-    /// or `reverse` rules bound to it are now stale.
+    /// The named serial's transport went away **for good** — USB unplug or TCP
+    /// `host:disconnect`. Any `forward` listeners or `reverse` rules bound to it
+    /// are now stale, so the frontend's `handle_disconnects` releases them.
     Disconnected(String),
+    /// The named serial's persistent connection died but the device is expected
+    /// to come back — an adbd **restart** (`adb root` / `unroot` / `tcpip` /
+    /// `usb` / `reboot`). This is the event-driven analogue of native adb's
+    /// transport teardown: it fires the instant the cached connection's reader /
+    /// writer task hits its fatal `break`, *independent* of whether USB
+    /// physically re-enumerates (a non-re-enumerating adbd restart never changes
+    /// the device list, so a presence poll cannot see it).
+    ///
+    /// Deliberately **distinct** from [`Self::Disconnected`]: a restart is not a
+    /// permanent disconnect, so `handle_disconnects` must NOT release the
+    /// device's `forward` / `reverse` rules on it (native adb keeps the host-side
+    /// listeners across an adbd restart). It exists so the `wait-for-disconnect`
+    /// reconnect handshake (`serve_wait_for`) can unblock sub-second on the
+    /// restart without polling.
+    TransportReset(String),
 }
 
 /// A device's connection state, in its host-protocol wire spelling.
@@ -231,6 +246,37 @@ pub trait DeviceBackend: Send + Sync + 'static {
             let (_tx, rx) = mpsc::channel(1);
             rx
         }
+    }
+
+    /// Whether `serial`'s transport is still alive — i.e. its persistent
+    /// connection's I/O is still running, NOT merely whether the device is still
+    /// enumerated.
+    ///
+    /// This is the **primary** signal behind the `wait-for-disconnect` reconnect
+    /// handshake (`serve_wait_for`): on `adb root`/`unroot`, adbd closes the
+    /// connection (reader/writer die) but on many devices (MTK and others) the
+    /// USB device never leaves enumeration — so a presence check over
+    /// [`Self::list_devices`] would report it forever-present and the wait would
+    /// hang. PR0 real-hardware data: the reader died on 20/20 restart cycles
+    /// (max 250 ms), and the serial *never* left enumeration on 19/20 — proving
+    /// presence-polling is fundamentally broken for this. A backend that tracks
+    /// connection liveness reports `false` here the instant the connection dies,
+    /// even while the device is still listed.
+    ///
+    /// The default falls back to presence (`list_devices` contains `serial`) so
+    /// an unadapted backend keeps its old, non-breaking behavior — it simply
+    /// won't get the sub-second disconnect detection (it falls through to the
+    /// bounded fallback instead of hanging 60 s; see `serve_wait_for`).
+    /// adboost's [`DefaultDeviceBackend`] overrides it to check the cached
+    /// connection's `is_alive()`.
+    ///
+    /// [`DefaultDeviceBackend`]: crate::server::DefaultDeviceBackend
+    // NOTE: `#[trait_variant::make(Send)]` rewrites this `async fn` into
+    // `fn ... -> impl Future + Send`, so the default body must itself be a future
+    // — hence the explicit `async move` block (matching the other defaulted
+    // methods in this trait).
+    async fn transport_alive(&self, serial: &str) -> bool {
+        async move { self.list_devices().await.iter().any(|d| d.serial == serial) }
     }
 
     /// Release a serial's `reverse` rules **without** re-establishing its

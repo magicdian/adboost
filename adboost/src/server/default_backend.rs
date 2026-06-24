@@ -98,20 +98,67 @@ where
 
 /// Whether an open-time error is worth retrying within [`OPEN_RETRY_BUDGET`].
 ///
-/// Two cases, both transient during the USB re-enumeration window:
-/// - a transient transfer error on the CNXN handshake (the shared classifier;
-///   the device is enumerated but adbd is not yet answering), and
+/// **This layer OWNS re-enumeration recovery.** Each [`Self::get_or_open`]
+/// `retry_within` poll calls `new_from_serial` → `USBTransport::new_by_serial` →
+/// a *fresh* `connect()` → fresh bulk endpoints. When `adb root`/`unroot`
+/// restarts adbd, the device re-enumerates under a NEW `IOKit` registry id and the
+/// old transport's endpoints are permanently dead — so rebuilding the transport
+/// is the ONLY thing that recovers it. The back-to-back `adb root; adb unroot`
+/// real-hardware trace proved this: 15 in-place CNXN retries on the dead handle
+/// ALL failed `device disconnected`, then the FIRST reopen of a fresh transport
+/// succeeded immediately. The inner `do_connect` retry is therefore only a
+/// same-handle blip catcher (tiny `CONNECT_TRANSIENT_MAX_ATTEMPTS`);
+/// re-enumeration recovery is HERE, at the reopen layer. `open_sync_session` /
+/// `open_shell_v2` inherit this via bare `get_or_open`; `open_local_service`
+/// keeps `open_session_with_reopen` for the first-OPEN race on top.
+///
+/// So the predicate is a **reopen-window FAMILY** classifier, not a code list:
+/// any `TransferError` EXCEPT the structurally-fatal ones is a re-enumeration
+/// transient, because the outer retry rebuilds the transport each poll and the
+/// 10 s wall clock keeps a real unplug/fault failing fast. Classifying by VARIANT
+/// FAMILY (not by enumerating `IOKit` codes — `0xe00002ed` `NotResponding`,
+/// `0xe00002d8` `NotReady`, … all land in `Unknown(_)`) ends the whack-a-mole of
+/// adding one constant per newly-observed code.
+///
+/// Retryable (rebuild the transport, bounded by the 10 s wall clock):
+/// - `UsbTransferError(Stall | Disconnected | Unknown(_))` — every re-enumeration
+///   transient (endpoint stall while adbd restarts, `NoDevice` during the gap,
+///   and any OS-specific code in the `Unknown` catch-all).
+/// - [`RustADBError::ADBRequestFailed`] — a CNXN-exhausted handshake out of
+///   `do_connect`: the explicit "the old transport is dead, reopen" signal. (At
+///   the `new_from_serial` open layer the realistic `ADBRequestFailed` IS the
+///   CNXN-exhaustion case — other `ADBRequestFailed`s arise later, on an
+///   established session, not during open. Matching it broadly is acceptable
+///   because the 10 s wall clock bounds it; a precise message-substring match was
+///   rejected as fragile.)
 /// - [`RustADBError::DeviceNotFound`] — the device is *momentarily absent from
 ///   enumeration* (`USBTransport::new_by_serial` returns this), which the
-///   handshake-layer retry structurally cannot see because the transport is not
-///   even built yet.
+///   handshake layer cannot see because the transport is not even built yet.
 ///
-/// Deliberately NOT retried: [`RustADBError::DeviceBusy`] — another process holds
-/// the single USB claim; that will not clear by waiting, so failing fast with the
-/// existing message is correct.
+/// NOT retried (structurally fatal — must fail fast, never masked by the budget):
+/// - `UsbTransferError(InvalidArgument)` — a programming error / unsupported
+///   request, never a re-enumeration blip.
+/// - `UsbTransferError(Fault)` — a hardware issue / protocol violation, not a
+///   re-enumeration blip (conservative; the wall clock would bound it either way).
+/// - [`RustADBError::DeviceBusy`] — another process holds the single USB claim;
+///   waiting will not clear it.
+///
+/// **This REVERSES the previous task's anti-amplification decoupling** (which
+/// excluded `Stall`/`ADBRequestFailed` here so an enlarged inner CNXN budget would
+/// not multiply with this outer one). The trace showed that decoupling was the
+/// bug: it BLOCKED the outer layer from recovering re-enumeration. The inversion
+/// is now SAFE because the inner transient arm is a small constant
+/// (`persistent::CONNECT_TRANSIENT_MAX_ATTEMPTS`, a few hundred ms), so the total
+/// worst-case ≈ this outer wall clock (10 s), NOT a product.
 fn is_retryable_open_error(e: &RustADBError) -> bool {
-    crate::usb::persistent::is_transient_connect_error(e)
-        || matches!(e, RustADBError::DeviceNotFound(_))
+    use nusb::transfer::TransferError;
+    matches!(
+        e,
+        RustADBError::UsbTransferError(
+            TransferError::Stall | TransferError::Disconnected | TransferError::Unknown(_)
+        ) | RustADBError::ADBRequestFailed(_)
+            | RustADBError::DeviceNotFound(_)
+    )
 }
 
 /// Default [`DeviceBackend`]: serial-keyed [`PersistentUsbConnection`] cache +
@@ -357,6 +404,14 @@ impl DefaultDeviceBackend {
             return Ok(Arc::clone(existing));
         }
         conns.insert(serial.to_owned(), Arc::clone(&conn));
+        // Spawn the connection-death → TransportReset watcher ONLY if the
+        // lifecycle hub already exists (a frontend has subscribed). Before that,
+        // nobody consumes the event, so there is nothing to publish to. The
+        // frontend subscribes at `serve()` time, well before any service request
+        // reaches `get_or_open`, so in practice the hub is always present here.
+        if let Some(tx) = self.lifecycle.get() {
+            Self::spawn_transport_reset_watch(tx.clone(), serial.to_owned(), &conn);
+        }
         Ok(conn)
     }
 
@@ -424,6 +479,38 @@ impl DefaultDeviceBackend {
             // `send` errs only when there are no live receivers; that's fine.
             let _ = tx.send(LifecycleEvent::Disconnected(serial.to_owned()));
         }
+    }
+
+    /// Spawn a one-shot watcher that awaits `conn`'s death and then publishes a
+    /// [`LifecycleEvent::TransportReset`] for `serial`.
+    ///
+    /// This is the event-driven half of the disconnect detection (the entry
+    /// `transport_alive` check is the primary path; PR0 data showed the
+    /// connection usually dies *before* the `wait-for-disconnect` request even
+    /// arrives, but this covers the minority case where the wait arrives first).
+    /// The watcher awaits a standalone death future
+    /// ([`PersistentUsbConnection::closed_signal`]) that holds NO reference to the
+    /// connection, so it never pins a dead connection alive: replacing/reaping
+    /// the cache entry drops the `Arc` and lets its reader/writer be aborted,
+    /// while the death future still resolves (the tasks fire the signal on exit
+    /// regardless of who holds the connection). One watcher per cached
+    /// connection; the edge is never lost even if death already happened.
+    fn spawn_transport_reset_watch(
+        tx: broadcast::Sender<LifecycleEvent>,
+        serial: String,
+        conn: &Arc<PersistentUsbConnection>,
+    ) {
+        let death = conn.closed_signal();
+        tokio::spawn(async move {
+            death.await;
+            tracing::debug!(
+                serial = %serial,
+                "cached connection died; emitting TransportReset lifecycle event"
+            );
+            // `send` errs only when no live receivers remain; best-effort,
+            // never fatal (mirrors `emit_disconnected`).
+            let _ = tx.send(LifecycleEvent::TransportReset(serial));
+        });
     }
 
     /// Spawn the single USB hotplug-diff watcher. It maintains the set of
@@ -509,6 +596,22 @@ impl DeviceBackend for DefaultDeviceBackend {
             }
         });
         rx
+    }
+
+    async fn transport_alive(&self, serial: &str) -> bool {
+        // Primary path for `wait-for-disconnect`: a cached connection whose
+        // reader/writer died reads as NOT alive even while the device is still
+        // enumerated (the bug fix — an adbd restart that does not re-enumerate USB
+        // never leaves `list_devices`). Only when there is no cached connection do
+        // we fall back to presence — that's the genuine "never opened / already
+        // reaped" case, where enumeration is the best available signal.
+        if let Some(conn) = self.conns.lock().await.get(serial) {
+            return conn.is_alive();
+        }
+        if let Some(conn) = self.tcp_devices.lock().await.get(serial) {
+            return conn.is_alive();
+        }
+        self.list_devices().await.iter().any(|d| d.serial == serial)
     }
 
     async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>> {
@@ -991,20 +1094,100 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_open_error_covers_transient_and_device_not_found_not_busy() {
+    fn is_retryable_open_error_is_the_reopen_window_family() {
+        use nusb::transfer::TransferError;
+        // RETRYABLE — the reopen-window family. The outer layer rebuilds the
+        // transport each poll (the only thing that recovers re-enumeration); the
+        // 10 s wall clock keeps a real fault/unplug failing fast.
         assert!(
             is_retryable_open_error(&RustADBError::DeviceNotFound("absent".into())),
             "DeviceNotFound (device momentarily not enumerated) must be retryable"
         );
         assert!(
-            is_retryable_open_error(&RustADBError::UsbTransferError(
-                nusb::transfer::TransferError::Disconnected
+            is_retryable_open_error(&RustADBError::UsbTransferError(TransferError::Disconnected)),
+            "Disconnected (NoDevice, re-enumeration gap) must be retryable"
+        );
+        assert!(
+            is_retryable_open_error(&RustADBError::UsbTransferError(TransferError::Stall)),
+            "Stall (re-enumerated endpoint stalls until a fresh connect) must be retryable AT THE REOPEN LAYER — this REVERSES the v1 decoupling"
+        );
+        assert!(
+            is_retryable_open_error(&RustADBError::UsbTransferError(TransferError::Unknown(
+                0xe000_02ed
+            ))),
+            "NotResponding (0xe00002ed) lands in Unknown(_) and must be retryable"
+        );
+        assert!(
+            is_retryable_open_error(&RustADBError::UsbTransferError(TransferError::Unknown(
+                0xe000_02d8
+            ))),
+            "NotReady (0xe00002d8) — the NEW code — is covered by the Unknown(_) family, no new constant needed (ends the whack-a-mole)"
+        );
+        assert!(
+            is_retryable_open_error(&RustADBError::ADBRequestFailed(
+                "CNXN failed after 8 attempts (stale CLSE or transient transfer error)".into()
             )),
-            "transient transfer errors must be retryable at the backend too"
+            "a CNXN-exhausted ADBRequestFailed is the explicit 'old transport dead, reopen' signal and MUST be retried — this REVERSES the v1 anti-amplification decoupling (now safe: inner is a small constant, total ≈ outer wall clock, not a product)"
+        );
+
+        // FATAL — must fail fast, never masked by the budget.
+        assert!(
+            !is_retryable_open_error(&RustADBError::UsbTransferError(
+                TransferError::InvalidArgument
+            )),
+            "InvalidArgument (programming error / unsupported request) must NOT be retried"
+        );
+        assert!(
+            !is_retryable_open_error(&RustADBError::UsbTransferError(TransferError::Fault)),
+            "Fault (hardware issue / protocol violation) must NOT be retried"
         );
         assert!(
             !is_retryable_open_error(&RustADBError::DeviceBusy),
-            "DeviceBusy (another process holds the claim) must NOT be retried"
+            "DeviceBusy (another process holds the single USB claim) must NOT be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_within_redrives_cnxn_exhaustion_by_reopening() {
+        // The CORE outer-layer fix: a first attempt whose handshake exhausts (the
+        // CNXN-exhausted `ADBRequestFailed` out of `do_connect` on a now-dead
+        // transport) must be RE-DRIVEN by `retry_within` — the next poll rebuilds a
+        // fresh transport (modelled by the closure returning Ok the second time),
+        // which the back-to-back `adb root; adb unroot` trace proved is the only
+        // thing that recovers re-enumeration. This locks the v1 reversal: the outer
+        // layer now owns re-enumeration recovery through `is_retryable_open_error`.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result: Result<u32> = retry_within(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            is_retryable_open_error,
+            || {
+                let attempts = std::sync::Arc::clone(&attempts);
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        // First (stale) transport: CNXN exhausts on the dead handle.
+                        Err(RustADBError::ADBRequestFailed(
+                            "CNXN failed after 8 attempts (stale CLSE or transient transfer error)"
+                                .into(),
+                        ))
+                    } else {
+                        // Reopen rebuilt a fresh transport → handshake succeeds.
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            result.ok(),
+            Some(7),
+            "retry_within must re-drive a CNXN-exhausted ADBRequestFailed by reopening (fresh transport) and then succeed"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one reopen: first attempt exhausts CNXN, second (fresh transport) succeeds"
         );
     }
 }

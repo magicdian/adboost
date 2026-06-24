@@ -165,28 +165,57 @@ second wait entirely, so the frontend only has to answer the disconnect wait.
 
 `serve_wait_for(arg, pinned_serial)` parses `<transport>-<state>` and supports
 two states: `device` (wait until a matching device is **present**) and
-`disconnect` (wait until the target is **absent**). The absence target is:
+`disconnect` (wait until the target's transport is **torn down**). The target is:
 
 - `pinned_serial = Some(s)` (from `host-serial:`/`host-transport-id:` routing):
-  the specific serial `s` is no longer in `list_devices()`. This mirrors AOSP,
-  where `wait-for-disconnect` unblocks when the *exact* pinned transport
+  the specific serial `s`'s transport is dead. This mirrors AOSP, where
+  `wait-for-disconnect` unblocks when the *exact* pinned transport
   (`t->id == transport_id`) is torn down, not when "any device" disconnects.
 - `pinned_serial = None` (top-level `host:wait-for-*`): no device of the
   requested kind (`kind_matches(want, kind)`) is present.
 
-Both states reply a **single bare `OKAY`** (the smartsocket connect-ack OKAY is
-emitted by the layer above; `serve_wait_for` writes only the post-wait OKAY) and
-share the 200 ms poll / **60 s `MAX_WAIT`** bound.
+Both states reply **two bare `OKAY`s** on satisfaction (`protocol::okay_twice()`),
+because AOSP's client reads two OKAYs for `wait-for-*` (accept + satisfied) — the
+SAME contract the `forward` family follows. adboost does **not** emit a blanket
+accept OKAY at the smartsocket layer (`handle_client` dispatches straight to the
+service), so each service needing two emits them itself. Sending only one desyncs
+modern clients (`error: protocol fault (couldn't read status)`).
 
-> **Deliberate divergence from AOSP — bounded wait.** Native adb's server waits
-> *forever* for a disconnect (it polls the client fd and bails only when the
-> client closes the socket). adboost's `serve_wait_for` is poll-only (it does not
-> watch the client socket), so it bounds the disconnect wait at 60 s to avoid
-> leaking a polling task if the device never disconnects (e.g. `root` was a
-> no-op because adbd was already root). adbd restarts drop the device within
-> seconds, so the 60 s ceiling only ever bites the no-restart edge, where
-> `FAIL("wait-for timed out")` is the correct signal. Revisit if client-fd
-> awareness is ever added.
+> **`disconnect` is EVENT-DRIVEN, not presence-polling (mirrors AOSP timing).**
+> Native adb detects a disconnect at the connection I/O layer (the read pump
+> errors out the instant adbd closes the socket → transport torn down), so `adb
+> root`/`unroot` returns sub-second and never hangs. adboost mirrors this:
+> `serve_wait_for`'s `disconnect` branch does NOT poll `list_devices()`. Instead
+> it (1) subscribes to `subscribe_lifecycle()`, (2) does an entry
+> `DeviceBackend::transport_alive(serial)` check — the **primary** path, because
+> the cached connection's reader/writer routinely die *before* the
+> `wait-for-disconnect` request even arrives (PR0 real-hardware data) — and
+> (3) `select!`s a matching `LifecycleEvent::TransportReset`/`Disconnected` event
+> against a **bounded 10 s fallback**. `transport_alive` reports a cached
+> connection's `is_alive()`, NOT mere enumeration: a dead-but-still-enumerated
+> device (an adbd restart that does not re-enumerate USB — the MTK case) reads as
+> NOT alive, which the old presence poll could never see (the serial never left
+> `list_devices()` → hung the full 60 s).
+>
+> **Why a separate `TransportReset` event, not `Disconnected`.** An adbd restart
+> is not a permanent unplug, so `handle_disconnects` must NOT release the device's
+> `forward`/`reverse` rules on it (native keeps the host-side listeners across a
+> restart). `TransportReset` is therefore distinct from `Disconnected`;
+> `handle_disconnects` ignores it (and KEEPS looping — it uses a `match`+`continue`,
+> never `while let Some(Disconnected(..))`, which would terminate on the first
+> reset and silently disable all later cleanup).
+>
+> **Bounded fallback (10 s) — deliberate divergence from AOSP.** Native waits
+> *forever* (it watches the client fd). adboost's `serve_wait_for` does not watch
+> the client socket, so the `disconnect` branch caps the wait at 10 s (PR0: the
+> connection died within 250 ms max on every real restart, so 10 s is generous
+> and far shorter than the old 60 s). The fallback fires only when adbd did NOT
+> actually restart (a no-op `root`); on expiry it still sends **two OKAYs** (assume
+> disconnected, clean return — matching native), with a WARN log so a
+> never-restarting adbd stays diagnosable. The `device`-present branch keeps its
+> 200 ms poll / 60 s `MAX_WAIT` and a single `FAIL("wait-for timed out")` on
+> expiry — a device that never appears is a genuine failure (unlike a disconnect
+> we can safely assume).
 
 ## Gotcha: modern `adb` selects a transport via `host:tport:any` BEFORE the local service
 
@@ -339,6 +368,23 @@ set (and against look-alikes like `usbfoo:` / `rebooting:` / `tcp:`).
 > **not** treat the post-restart connection drop as an error. After such a
 > restart, a modern client runs the reconnect handshake (see *The `adb root` /
 > `adb tcpip` reconnect handshake* above).
+
+> **Known-acceptable: a back-to-back control service can return SILENTLY.** When
+> a control service (e.g. `adb root`) is issued immediately after a prior one
+> that is still restarting adbd, its `OPEN` can land on the connection in the
+> instant adbd tears it down — adbd closes the stream before emitting its
+> `"restarting adbd as root"` / `"adbd is already running as root"` text, so the
+> bridge sees a clean EOF and the client gets an **empty** reply (exit 0, no
+> message). Real-hardware back-to-back `adb root; adb unroot` ×4 confirmed this is
+> occasional (~3/16), the control service still TOOK EFFECT (a follow-up `root`
+> reports `already running as root`), and native `adb` shows the same multi-second
+> latency under the same race. This is **not a regression** — do not "fix" it by
+> failing the command or retrying the control service (re-running a restart-class
+> service is not idempotent-free). The connect-layer re-enumeration retry
+> (`is_retryable_open_error` reopen-window family + small in-place
+> `CONNECT_TRANSIENT_MAX_ATTEMPTS`) ensures the command SUCCEEDS; surfacing the
+> reply text across an adbd-teardown race would need bridge-layer work (tracked
+> separately), not a control-service retry.
 
 > **`unroot:` is bridged but also a first-class `ADBLocalCommand::Unroot`.** As a
 > client library, adboost exposes `ADBDeviceExt::unroot()` mirroring `root()`
