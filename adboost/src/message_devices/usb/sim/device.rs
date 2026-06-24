@@ -100,7 +100,7 @@ impl ADBMessageTransport for SimulatedDevice {
 
     async fn read_message_with_timeout(
         &mut self,
-        _read_timeout: Duration,
+        read_timeout: Duration,
     ) -> Result<ADBTransportMessage> {
         // Resolve the read outcome under the lock, then drop the guard. Outcomes,
         // in priority order:
@@ -139,8 +139,16 @@ impl ADBMessageTransport for SimulatedDevice {
             Outcome::Transient(err) => Err(RustADBError::UsbTransferError(err)),
             Outcome::Frame(frame) => Ok(frame),
             // The single transport-neutral idle signal mandated by the trait's
-            // read-timeout contract. Drives `ReadStep::ReadTimeout => continue`.
-            Outcome::Idle => Err(RustADBError::ReadTimeout),
+            // read-timeout contract. A real transport BLOCKS for the deadline
+            // before reporting an idle timeout; we sleep it too so the spawned
+            // reader loop yields between idle polls instead of busy-spinning
+            // (under `start_paused` the sleep is virtual — it advances instantly
+            // yet still yields to other tasks). Drives `ReadStep::ReadTimeout =>
+            // continue`.
+            Outcome::Idle => {
+                tokio::time::sleep(read_timeout).await;
+                Err(RustADBError::ReadTimeout)
+            }
         }
     }
 }

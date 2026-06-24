@@ -16,13 +16,19 @@ use crate::message_devices::adb_transport_message::{
 use crate::message_devices::message_commands::MessageCommand;
 
 use super::profile::DeviceProfile;
-use super::scenario::Scenario;
+use super::scenario::{OpenResponse, Scenario};
+use crate::message_devices::usb::flow_control::{INITIAL_DELAYED_ACK_BYTES, encode_okay_payload};
 
 /// A fixed 20-byte AUTH challenge token. adbd's real token is random; the host
 /// signs whatever bytes it receives, so a constant is faithful for the handshake
 /// (the simulated device accepts by policy, not by verifying the signature —
 /// see [`SimState::react_to`]).
 const AUTH_CHALLENGE_TOKEN: [u8; 20] = [0x5a; 20];
+
+/// The device's own local-id for the session it accepts. The host routes inbound
+/// frames by their `arg1` (its own local id); this is the device's `arg0` on
+/// replies (the host stores it as `remote_id`). Any fixed non-zero value works.
+const DEVICE_LOCAL_ID: u32 = 0x5151_5151;
 
 /// Where the device is in its CNXN/AUTH handshake. Drives [`SimState::react_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,14 @@ pub(super) struct SimState {
     /// Set once the reader half has emitted its fatal death error, so it stays
     /// dead on every subsequent read (a re-enumeration handle never revives).
     reader_dead: bool,
+    /// The single active session's host-side local id (the OPEN's `arg0`), set
+    /// when the device accepts a host `OPEN`. `None` before any session is open.
+    session_host_id: Option<u32>,
+    /// Whether the active session has already seen its first host `WRTE` (drives
+    /// `close_after_first_write`, which must fire exactly once).
+    session_first_write_seen: bool,
+    /// Count of `write_message` calls seen so far (drives `write_fault`).
+    writes_seen: u32,
 }
 
 impl SimState {
@@ -79,6 +93,9 @@ impl SimState {
             transient_reads_remaining,
             reads_while_connected: 0,
             reader_dead: false,
+            session_host_id: None,
+            session_first_write_seen: false,
+            writes_seen: 0,
         }
     }
 
@@ -113,6 +130,25 @@ impl SimState {
         } else {
             false
         }
+    }
+
+    /// Account for one `write_message` call and report whether this write should
+    /// be the injected `write_fault`. Returns `Some(after_bytes)` when it should
+    /// fail (`after_bytes > 0` = fatal mid-frame truncation, `0` = recoverable
+    /// backpressure with nothing committed), else `None`. Used by
+    /// [`super::chunked::ChunkedTransport`] (byte-level B7/B9).
+    pub(super) fn take_write_fault(&mut self) -> Option<usize> {
+        self.writes_seen += 1;
+        match self.scenario.write_fault {
+            Some(f) if f.on_write == self.writes_seen => Some(f.after_bytes),
+            _ => None,
+        }
+    }
+
+    /// How many device frames to coalesce into one read delivery (B5
+    /// over-delivery). `1` = no coalescing.
+    pub(super) fn coalesce_frames(&self) -> usize {
+        self.scenario.coalesce_frames.unwrap_or(1).max(1)
     }
 
     // -- read-side fault accounting ----------------------------------------
@@ -203,11 +239,99 @@ impl SimState {
                 self.send_cnxn_banner();
                 self.phase = Phase::Connected;
             }
-            // Repeated CNXN writes (e.g. do_connect retrying after a transient
-            // read error) once already connected are a no-op: the banner reply is
-            // already queued, so we must not double-enqueue it.
+            // Session-level reactions once the handshake is complete.
+            (Phase::Connected, MessageCommand::Open) => self.react_to_open(msg),
+            (Phase::Connected, MessageCommand::Write) => self.react_to_write(msg),
+            (Phase::Connected, MessageCommand::Clse) => self.react_to_clse(msg),
+            // OKAY from the host is a flow-control credit / readiness poke; the
+            // device does not need to reply to it. Repeated CNXN writes (e.g.
+            // do_connect retrying after a transient read error) once already
+            // connected are likewise a no-op — the banner reply is already queued.
             _ => {}
         }
+    }
+
+    /// React to a host `OPEN`, per the scenario's [`OpenResponse`] policy. The
+    /// host's `arg0` is its local id; the device routes replies back with
+    /// `arg1 = host_local_id` (the host's reader keys on `arg1`).
+    fn react_to_open(&mut self, msg: &ADBTransportMessage) {
+        let host_id = msg.header().arg0();
+        let windowed = self.windowed_session();
+        match self.scenario.open_response {
+            OpenResponse::Accept => {
+                self.session_host_id = Some(host_id);
+                self.session_first_write_seen = false;
+                self.enqueue_okay(host_id, windowed);
+            }
+            OpenResponse::AcceptDoubleOkay => {
+                self.session_host_id = Some(host_id);
+                self.session_first_write_seen = false;
+                // Two OKAYs back-to-back: the host's open must tolerate the extra.
+                self.enqueue_okay(host_id, windowed);
+                self.enqueue_okay(host_id, windowed);
+            }
+            OpenResponse::RejectWithClse => {
+                // CLSE(arg0 = 0, arg1 = host_local_id) on the data channel — the
+                // AOSP rejection. The host must fast-fail, not hang (bug #3a).
+                self.enqueue(MessageCommand::Clse, 0, host_id, &[]);
+            }
+            OpenResponse::Ignore => {
+                // Send nothing: the host hits its OPEN-response timeout.
+            }
+        }
+    }
+
+    /// React to a host `WRTE`: acknowledge with `OKAY`, optionally echo bytes
+    /// back as a device `WRTE`, and optionally close the stream early.
+    fn react_to_write(&mut self, msg: &ADBTransportMessage) {
+        let Some(host_id) = self.session_host_id else {
+            return; // WRTE with no open session — drop (a real adbd would too).
+        };
+        let windowed = self.windowed_session();
+        // Acknowledge the host's WRTE with a crediting OKAY.
+        self.enqueue_okay(host_id, windowed);
+
+        let first_write = !self.session_first_write_seen;
+        // A crafted first-write reply (e.g. a truncated SYNC frame) takes priority
+        // over the generic echo and fires only on the first WRTE.
+        if first_write && let Some(bytes) = self.scenario.first_write_reply.clone() {
+            self.enqueue(MessageCommand::Write, DEVICE_LOCAL_ID, host_id, &bytes);
+        } else if let Some(n) = self.scenario.echo_bytes {
+            let take = n.min(msg.payload().len());
+            let echo: Vec<u8> = msg.payload()[..take].to_vec();
+            self.enqueue(MessageCommand::Write, DEVICE_LOCAL_ID, host_id, &echo);
+        }
+
+        if self.scenario.close_after_first_write && first_write {
+            self.enqueue(MessageCommand::Clse, DEVICE_LOCAL_ID, host_id, &[]);
+        }
+        self.session_first_write_seen = true;
+    }
+
+    /// React to a host `CLSE`: mirror a `CLSE` back and forget the session.
+    fn react_to_clse(&mut self, msg: &ADBTransportMessage) {
+        if let Some(host_id) = self.session_host_id.take() {
+            self.enqueue(MessageCommand::Clse, DEVICE_LOCAL_ID, host_id, &[]);
+            let _ = msg; // arg matching not needed; one active session in this model
+        }
+        self.session_first_write_seen = false;
+    }
+
+    /// Whether this connection negotiated windowed flow control — mirrors the
+    /// host's `delayed_ack` gate so the device's OKAY payloads match the mode the
+    /// host negotiated (else the host rejects a 4-byte OKAY in classic mode).
+    fn windowed_session(&self) -> bool {
+        crate::models::DeviceFeatureSet::from_banner(&self.profile.banner).delayed_ack
+            && self.profile.version >= super::profile::A_VERSION_SKIP_CHECKSUM
+    }
+
+    /// Enqueue an `OKAY(arg0 = device_local_id, arg1 = host_local_id)` carrying a
+    /// window grant (windowed) or empty payload (classic), built with the
+    /// production `encode_okay_payload` so the on-wire bytes match exactly.
+    fn enqueue_okay(&mut self, host_id: u32, windowed: bool) {
+        let grant = usize::try_from(INITIAL_DELAYED_ACK_BYTES).unwrap_or(usize::MAX);
+        let payload = encode_okay_payload(windowed, grant);
+        self.enqueue(MessageCommand::Okay, DEVICE_LOCAL_ID, host_id, &payload);
     }
 
     /// Enqueue the device's CNXN banner reply, carrying its profile version/banner.

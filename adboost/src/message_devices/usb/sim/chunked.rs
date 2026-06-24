@@ -130,18 +130,44 @@ impl ADBMessageTransport for ChunkedTransport {
         message: ADBTransportMessage,
         _write_timeout: Duration,
     ) -> Result<()> {
-        let transient = {
+        // Outcome resolved under the lock, then the guard is dropped.
+        enum WriteOutcome {
+            Transient(nusb::transfer::TransferError),
+            /// A mid-frame truncation (committed `> 0` bytes) — fatal; the
+            /// persistent writer must poison the connection, not warn-and-continue.
+            FatalTruncation,
+            /// Backpressure: nothing reached the wire — recoverable `WriteTimeout`.
+            Backpressure,
+            Delivered,
+        }
+        let outcome = {
             let mut state = self.lock()?;
             if state.take_transient_write() {
-                Some(state.transient_err())
+                WriteOutcome::Transient(state.transient_err())
+            } else if let Some(after_bytes) = state.take_write_fault() {
+                // The injected fault pre-empts delivery: the frame does not reach
+                // the device's reaction (a real truncated write never arrives).
+                if after_bytes > 0 {
+                    WriteOutcome::FatalTruncation
+                } else {
+                    WriteOutcome::Backpressure
+                }
             } else {
                 state.react_to(&message);
-                None
+                WriteOutcome::Delivered
             }
         };
-        match transient {
-            Some(err) => Err(RustADBError::UsbTransferError(err)),
-            None => Ok(()),
+        match outcome {
+            WriteOutcome::Transient(err) => Err(RustADBError::UsbTransferError(err)),
+            // A partial frame on the wire poisons the stream: surface a generic
+            // transfer error (NOT WriteTimeout), which the persistent writer
+            // treats as fatal.
+            WriteOutcome::FatalTruncation => Err(RustADBError::UsbTransferError(
+                nusb::transfer::TransferError::Fault,
+            )),
+            // Nothing committed → the frame-atomic recoverable signal.
+            WriteOutcome::Backpressure => Err(RustADBError::WriteTimeout),
+            WriteOutcome::Delivered => Ok(()),
         }
     }
 
@@ -188,7 +214,17 @@ impl ADBMessageTransport for ChunkedTransport {
                     } else if state.take_transient_read() {
                         Refill::Transient(state.transient_err())
                     } else if let Some(frame) = state.pop_outbound() {
-                        Refill::Bytes(Self::frame_to_bytes(&frame))
+                        // Coalesce up to `coalesce_frames` device frames into one
+                        // delivery (bulk-IN over-delivery, B5): the reassembly
+                        // buffer must still split them into individual frames.
+                        let mut bytes = Self::frame_to_bytes(&frame);
+                        for _ in 1..state.coalesce_frames() {
+                            match state.pop_outbound() {
+                                Some(next) => bytes.extend(Self::frame_to_bytes(&next)),
+                                None => break,
+                            }
+                        }
+                        Refill::Bytes(bytes)
                     } else if state.should_die_on_idle_read() {
                         Refill::Dead
                     } else {
@@ -203,8 +239,13 @@ impl ADBMessageTransport for ChunkedTransport {
                     }
                     Refill::Transient(err) => return Err(RustADBError::UsbTransferError(err)),
                     Refill::Bytes(bytes) => self.pending_bytes.extend(bytes),
-                    // No frame queued: a genuine idle read.
-                    Refill::Idle => return Err(RustADBError::ReadTimeout),
+                    // No frame queued: a genuine idle read. Sleep the deadline so
+                    // the spawned reader loop yields rather than busy-spinning
+                    // (virtual under `start_paused`). Mirrors `SimulatedDevice`.
+                    Refill::Idle => {
+                        tokio::time::sleep(read_timeout).await;
+                        return Err(RustADBError::ReadTimeout);
+                    }
                 }
             }
 

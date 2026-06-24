@@ -77,10 +77,15 @@ mod state;
 pub use chunked::ChunkedTransport;
 pub use device::SimulatedDevice;
 pub use profile::DeviceProfile;
-pub use scenario::Scenario;
+pub use scenario::{OpenResponse, Scenario};
 
 // Phase A handshake/CNXN/DRAIN/AUTH/DACK edge suite + B1/B2/B-feat regressions.
 // Only compiled for adboost's own test runs (the `test-support` feature exposes
 // the harness types to external crates, which bring their own tests).
 #[cfg(test)]
 mod tests;
+
+// Phase B session/flow-control/teardown edge suite + ChunkedTransport byte-level
+// fault scenarios (B3a/B8/B-recv/B4/B5/B7/B9).
+#[cfg(test)]
+mod tests_session;
