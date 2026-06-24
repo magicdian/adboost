@@ -63,6 +63,17 @@ impl SimulatedDevice {
     pub fn is_connected(&self) -> bool {
         self.lock().is_ok_and(|s| s.is_connected())
     }
+
+    /// Force the device's reader to die on its next read — the adbd-restart edge.
+    /// Because every clone shares one [`SimState`], calling this on a handle held
+    /// outside the connection makes the connection's reader clone die on its next
+    /// poll, firing the connection's `DeathSignal` and flipping `is_alive()` false
+    /// while the connection stays cached. Best-effort: a poisoned lock is ignored.
+    pub fn kill(&self) {
+        if let Ok(mut state) = self.lock() {
+            state.kill_reader();
+        }
+    }
 }
 
 impl ADBTransport for SimulatedDevice {

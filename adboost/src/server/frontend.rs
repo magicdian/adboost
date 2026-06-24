@@ -193,7 +193,25 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
 
     /// Per-client state machine: one host service, then optionally a local
     /// service if a transport was selected.
-    async fn handle_client(&self, mut stream: TcpStream) -> std::io::Result<()> {
+    ///
+    /// Crate-visible under `test`/`test-support` so the in-memory
+    /// [`SimDeviceBackend`](crate::server::sim_backend) harness (a sibling module)
+    /// can drive one client connection end-to-end without going through
+    /// [`Self::serve`]'s accept loop; otherwise private (this is not a stable
+    /// public API).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn handle_client(&self, stream: TcpStream) -> std::io::Result<()> {
+        self.handle_client_impl(stream).await
+    }
+
+    /// Private production entry point (the accept loop calls this directly).
+    #[cfg(not(any(test, feature = "test-support")))]
+    async fn handle_client(&self, stream: TcpStream) -> std::io::Result<()> {
+        self.handle_client_impl(stream).await
+    }
+
+    /// The actual per-client state machine body.
+    async fn handle_client_impl(&self, mut stream: TcpStream) -> std::io::Result<()> {
         let Some(service) = read_request(&mut stream).await? else {
             return Ok(()); // clean EOF before any request
         };

@@ -56,6 +56,12 @@ mod forward;
 mod forward_handle;
 mod frontend;
 mod on_disconnect;
+/// In-memory [`DeviceBackend`] over the [`sim`](crate::message_devices::usb::sim)
+/// harness, for driving the smartsocket frontend end-to-end in tests without
+/// hardware. Double-gated like the transport sim: free for adboost's own tests
+/// via `cfg(test)`, exposed to external test crates via `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim_backend;
 
 pub use backend::{
     BackendCapabilities, DeviceBackend, DeviceEntry, DeviceState, LifecycleEvent, ReversePolicy,
@@ -68,3 +74,5 @@ pub use default_backend::UsbDeviceBackend;
 pub use forward_handle::ForwardHandle;
 pub use frontend::{AdbServerFrontend, AdbServerFrontendBuilder};
 pub use on_disconnect::OnDisconnect;
+#[cfg(any(test, feature = "test-support"))]
+pub use sim_backend::{SimDeviceBackend, SimRegistry};

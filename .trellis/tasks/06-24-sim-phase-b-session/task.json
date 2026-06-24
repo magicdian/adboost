@@ -3,7 +3,7 @@
   "name": "sim-phase-b-session",
   "title": "Sim harness Phase B: session + flow-control + ChunkedTransport",
   "description": "",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

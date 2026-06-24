@@ -119,6 +119,13 @@ impl SimState {
         self.phase == Phase::Connected
     }
 
+    /// Force the device's reader to die on its next read (and stay dead) — the
+    /// adbd-restart edge. Latches `reader_dead` so `should_die_on_idle_read` is
+    /// not even needed; the next `read_message` returns the fatal error.
+    pub(super) fn kill_reader(&mut self) {
+        self.reader_dead = true;
+    }
+
     // -- write-side fault accounting ---------------------------------------
 
     /// Consume one transient-write credit if any remain; returns `true` when the
