@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/06-24-back-to-back-root-unroot-open-stall-cnxn/prd.md", "reason": "对照验收：Stall 窗口重试、CNXN 预算稳超 1177ms、外层不加 Stall/CNXN-耗尽（无乘积）、成功路径不变慢、持续 stall 仍 bounded 失败。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "校验 CNXN 重试改动未破坏握手契约。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验 clippy pedantic、mock transport 测试风格、feature 门控全绿。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 Stall 分类与错误处理符合 RustADBError 约定，非窗口持续 stall 仍 fail-fast。"}

@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/06-24-back-to-back-root-unroot-open-stall-cnxn/prd.md", "reason": "三 gap 诊断 + connect 层根治决策 + 防乘积爆炸约束（外层 is_retryable_open_error 不得加 Stall/CNXN-耗尽）+ 预算定标（稳超实测 1177ms）。"}
+{"file": ".trellis/tasks/archive/2026-06/06-23-backend-get-or-open-settle-retry-root-bug/research/reenumeration-readiness.md", "reason": "上个任务研究：IOKit 码、两层重试结构、PR0 reopen 487-1177ms 数据、scripted mock transport 测试 seam。本任务预算定标与 Stall 纳入直接基于此。"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "do_connect CNXN 重试改动须守 CNXN version/delayed_ack 握手契约；预算调大不得破坏握手语义。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Stall 纳入 transient 分类、CNXN 耗尽错误处理须遵循 RustADBError/Result 约定。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "scripted mock transport 单测风格（fail-Stall-N-then-ok）、clippy pedantic、feature 门控。"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "已记录 backend 重枚举重试与 IOKit 码的子节；本任务调整 Stall/预算后需同步更新该处。"}
