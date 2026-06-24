@@ -346,6 +346,55 @@ pub trait DeviceBackend: Send + Sync + 'static {
         async move { None }
     }
 
+    /// Supply a custom FAIL reason for a post-transport **local service** the
+    /// frontend has decided to reject for `serial` — called immediately before it
+    /// would emit the generic `protocol::fail`. Return `Some(reason)` to substitute
+    /// an actionable message (adb then prints it verbatim:
+    /// `adb: error: connect failed: <reason>`); return `None` to keep adboost's
+    /// default string. The default returns `None`, so existing backends are
+    /// byte-for-byte unaffected.
+    ///
+    /// `default_reason` is the string the frontend would otherwise send (e.g.
+    /// `"service not supported: sync:"` or `"invalid tcp port: tcp:x"`), passed in
+    /// so a backend can **wrap** rather than only **replace** it — e.g.
+    /// `format!("{default_reason} — use `xdb pull --target hyp …` instead")`.
+    ///
+    /// ## Why this is the right (and only) seam
+    ///
+    /// `serve_local_service` has two FAIL paths, and this hook deliberately covers
+    /// only the first:
+    /// - The **`map_local_service` rejection** — a wire-framing service the device's
+    ///   banner lacks (`sync:` / `shell,v2`), an unbridged service, or a malformed
+    ///   `tcp:` port. The reason there is **frontend-hardcoded**, so the backend
+    ///   otherwise has no voice. This hook fires on *every* such rejection; the
+    ///   backend self-selects by inspecting `service` and returns `None` for the
+    ///   ones it does not care about.
+    /// - The **`open_local_service` failure** (`"open session failed: {e}"`) — there
+    ///   `{e}` is *already the backend's own error*, so the backend controls that
+    ///   wording through its `Result`; a hook there would be redundant. Hence this
+    ///   method is scoped to the map-rejection path only — not an oversight.
+    ///
+    /// This **only** customizes the human-facing reason for an *already-decided*
+    /// rejection. It never changes routing or gating: it cannot turn a rejected
+    /// service into an accepted one, cannot pick a different [`ADBLocalCommand`],
+    /// and cannot make the frontend advertise a feature it did not negotiate (the
+    /// honest-banner principle stays intact). A backend that bridges a non-adbd
+    /// endpoint (SSH, serial, a proxy, a simulator) uses this to explain *why* a
+    /// service is unavailable and *what to do instead*.
+    ///
+    // NOTE: `#[trait_variant::make(Send)]` rewrites this `async fn` into
+    // `fn ... -> impl Future + Send { <body> }`, so the default body must itself be
+    // a future — hence the explicit `async move` block (matching the other
+    // defaulted methods in this trait).
+    async fn local_service_reject_reason(
+        &self,
+        _serial: &str,
+        _service: &str,
+        _default_reason: &str,
+    ) -> Option<String> {
+        async move { None }
+    }
+
     /// Open a SYNC v1 file-transfer session (`sync:`) for `adb push`/`pull`.
     ///
     /// The default returns an `unsupported` error so existing backends keep

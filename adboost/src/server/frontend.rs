@@ -1128,7 +1128,17 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
 
         let cmd = match self.map_local_service(service, device_caps.as_ref()) {
             Ok(cmd) => cmd,
-            Err(reason) => {
+            Err(default_reason) => {
+                // The reason here is frontend-hardcoded; give the backend a chance
+                // to substitute an actionable one (e.g. a non-adbd bridge pointing
+                // at its own transfer path). `None` keeps the default verbatim, so
+                // a backend that does not override stays byte-identical. Still
+                // exactly one FAIL frame — the hook only chooses its payload.
+                let reason = self
+                    .backend
+                    .local_service_reject_reason(serial, service, &default_reason)
+                    .await
+                    .unwrap_or(default_reason);
                 stream.write_all(&protocol::fail(&reason)).await?;
                 return Ok(());
             }
@@ -1765,6 +1775,87 @@ mod tests {
         drop(client); // EOF → server's next read_request returns None → clean exit
         server.await.expect("server task");
         resp
+    }
+
+    /// Drive a transport-select followed by a local-service request on the **same**
+    /// socket (the two-phase shape native `adb` uses), returning the bytes the
+    /// server writes for the local service — a single FAIL frame on the
+    /// `map_local_service` reject path. Generic over the backend so the
+    /// reject-reason hook tests can supply their own implementation.
+    async fn round_trip_local_service<B: DeviceBackend>(
+        frontend: Arc<AdbServerFrontend<B>>,
+        select_req: &str,
+        service_req: &str,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = frontend.handle_client(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        // Phase 1: select a transport, consume the bare OKAY (socket stays open).
+        client
+            .write_all(format!("{:04x}{select_req}", select_req.len()).as_bytes())
+            .await
+            .expect("write select");
+        client.flush().await.expect("flush select");
+        let mut okay = [0u8; 4];
+        client.read_exact(&mut okay).await.expect("read OKAY");
+        assert_eq!(&okay, b"OKAY", "transport select should reply bare OKAY");
+        // Phase 2: issue the local service; the reject path writes one FAIL then
+        // returns, so read to EOF to capture exactly that frame.
+        client
+            .write_all(format!("{:04x}{service_req}", service_req.len()).as_bytes())
+            .await
+            .expect("write service");
+        client.flush().await.expect("flush service");
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf).await;
+        server.await.expect("server task");
+        buf
+    }
+
+    /// A backend that overrides [`DeviceBackend::local_service_reject_reason`] for
+    /// `sync:` only — proving the hook's reason reaches the client, that it can
+    /// *wrap* the default string, and that a service it does not target falls back
+    /// to adboost's default (the per-service `None` path).
+    struct RejectReasonBackend {
+        devices: Vec<DeviceEntry>,
+    }
+
+    impl DeviceBackend for RejectReasonBackend {
+        async fn list_devices(&self) -> Vec<DeviceEntry> {
+            self.devices.clone()
+        }
+        async fn subscribe_changes(&self) -> mpsc::Receiver<Vec<DeviceEntry>> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+        async fn open_local_service(
+            &self,
+            _serial: &str,
+            _cmd: &ADBLocalCommand,
+        ) -> Result<crate::usb::MultiplexedSession> {
+            unimplemented!("reject path returns before bridging")
+        }
+        async fn local_service_reject_reason(
+            &self,
+            serial: &str,
+            service: &str,
+            default_reason: &str,
+        ) -> Option<String> {
+            // Only `sync:` gets a tailored pointer; everything else falls back to
+            // the default by returning `None`. Wraps (does not discard) the
+            // default string to prove `default_reason` is available.
+            match service {
+                "sync:" => Some(format!(
+                    "{default_reason} — use `xdb pull --target hyp` for '{serial}'"
+                )),
+                _ => None,
+            }
+        }
     }
 
     /// A backend that records reverse-release calls, for disconnect-handler
@@ -3105,6 +3196,72 @@ mod tests {
         // not exercised here. jdwp/localabstract remain unbridged.
         assert!(f.map_local_service("jdwp:1234", None).is_err());
         assert!(f.map_local_service("localabstract:foo", None).is_err());
+    }
+
+    // ---- `local_service_reject_reason` backend hook ---------------------------
+    //
+    // The hook lets an injected backend substitute/wrap the frontend's hardcoded
+    // FAIL reason on the `map_local_service` reject path, without changing routing
+    // or gating. These drive the full two-phase wire flow through `handle_client`.
+
+    /// An overriding backend's reason reaches the client verbatim, and it can wrap
+    /// the default string (which is passed in as `default_reason`).
+    #[tokio::test]
+    async fn reject_reason_hook_overrides_and_wraps_default() {
+        let f = Arc::new(
+            AdbServerFrontend::builder(Arc::new(RejectReasonBackend {
+                devices: vec![DeviceEntry::new("hyp1")],
+            }))
+            .build(),
+        );
+        // sync: is rejected by the gate (sync_v2 not advertised); the hook fires.
+        let resp = round_trip_local_service(f, "host:transport:hyp1", "sync:").await;
+        let body = String::from_utf8(resp).expect("utf8");
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        // Wraps the default `service not supported: sync:` and appends guidance.
+        assert!(
+            body.contains("service not supported: sync:"),
+            "default reason should be preserved (wrapped): {body}"
+        );
+        assert!(
+            body.contains("use `xdb pull --target hyp` for 'hyp1'"),
+            "custom guidance should reach the client: {body}"
+        );
+    }
+
+    /// The same overriding backend returns `None` for a service it does not target
+    /// (`shell,v2`), so the client sees adboost's default string unchanged.
+    #[tokio::test]
+    async fn reject_reason_hook_falls_back_to_default_for_untargeted_service() {
+        let f = Arc::new(
+            AdbServerFrontend::builder(Arc::new(RejectReasonBackend {
+                devices: vec![DeviceEntry::new("hyp1")],
+            }))
+            .build(),
+        );
+        // shell,v2 is rejected (shell_v2 not advertised); the hook returns None.
+        let resp = round_trip_local_service(f, "host:transport:hyp1", "shell,v2,raw:ls").await;
+        let body = String::from_utf8(resp).expect("utf8");
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(
+            body.contains("service not supported: shell,v2,raw:ls"),
+            "untargeted service keeps the default reason: {body}"
+        );
+        assert!(
+            !body.contains("xdb"),
+            "hook must not inject guidance for an untargeted service: {body}"
+        );
+    }
+
+    /// A backend that does NOT override the hook produces byte-identical FAIL
+    /// output to today — the backward-compatibility guarantee. Uses the plain
+    /// `MockBackend` (default `local_service_reject_reason` → None).
+    #[tokio::test]
+    async fn reject_reason_hook_default_backend_is_byte_identical() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("dev1")]));
+        let resp = round_trip_local_service(f, "host:transport:dev1", "sync:").await;
+        // Exactly one FAIL frame carrying the unchanged default string.
+        assert_eq!(resp, protocol::fail("service not supported: sync:"));
     }
 
     /// Select a transport then send one post-transport request, returning the

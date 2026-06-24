@@ -472,6 +472,30 @@ caps (unknown) drops both framing features — conservative.
 > advertised to us"). Per-device negotiation reads `peer_features()`. Conflating
 > them is exactly the misread the original bug report made.
 
+### Customizing the FAIL reason on a `map_local_service` rejection
+
+When `map_local_service` rejects a service (a wire-framing service the device's
+banner lacks, an unbridged service, or a malformed `tcp:` port), the reason is
+otherwise **frontend-hardcoded** (`service not supported: <svc>` /
+`invalid tcp port: <svc>`). `serve_local_service` consults
+`DeviceBackend::local_service_reject_reason(serial, service, default_reason)`
+immediately before the single `protocol::fail`, so an injected backend that
+bridges a non-adbd endpoint (SSH/serial/proxy/sim) can substitute or **wrap** an
+actionable reason (e.g. point the user at its own transfer path). Invariants:
+
+- **Reason only, never routing/gating.** It rewrites the FAIL text of an
+  *already-decided* rejection; it cannot accept an otherwise-rejected service,
+  change the opened `ADBLocalCommand`, or alter advertised features (honest
+  banner intact).
+- **One seam, scoped to the map-rejection path.** It fires on *every*
+  `map_local_service` `Err`; the backend self-selects by `service` and returns
+  `None` for the rest. It is deliberately **not** on the `open_local_service`
+  failure path — there the reason is already the backend's own error (`open
+  session failed: {e}`), so a hook would be redundant.
+- **Default `None` → byte-identical.** A backend that does not override emits the
+  exact same single FAIL frame as before (locked by
+  `reject_reason_hook_default_backend_is_byte_identical`).
+
 ## `host:connect` / `host:disconnect` and the unified device table
 
 `host:connect:<addr>` / `host:disconnect:<addr>` route to
