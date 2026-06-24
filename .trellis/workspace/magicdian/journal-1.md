@@ -1276,3 +1276,36 @@ Delivered in three independently-committed phases (parent + 3 subtasks):
 
 - Optional: enable `test-support` from `adboost_cli` selftest / xdb to reuse the
   harness for their own regression suites.
+
+
+## Session 30: backend hook: local-service reject reason
+
+**Date**: 2026-06-24
+**Task**: backend hook: local-service reject reason
+**Branch**: `main`
+
+### Summary
+
+Evaluated xdb feature request and implemented it as a contract-layer fix: new defaulted DeviceBackend::local_service_reject_reason(serial, service, default_reason) -> Option<String> hook, consulted in serve_local_service before the hardcoded FAIL on a map_local_service rejection. Err->Err only (reason text, never routing/gating); one unified seam over all map rejections with per-service None fallback; default_reason passed for wrap-not-just-replace; default None => byte-identical for non-overriding backends. Added 3 round-trip tests (override+wrap, untargeted fallback, byte-identical default) and documented the seam+invariants in server-host-protocol.md. fmt/clippy clean, 340 tests + 6 doctests green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6d5ee3e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
