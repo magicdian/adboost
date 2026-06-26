@@ -74,6 +74,24 @@ impl SimulatedDevice {
             state.kill_reader();
         }
     }
+
+    /// Number of live clones of this device's shared state (`Arc::strong_count`).
+    ///
+    /// Test-only probe for the claim-release seam: a `SimulatedDevice` clone is
+    /// structurally the analogue of a [`USBTransport`] clone — both share the
+    /// underlying handle via an `Arc`, and the OS resource (the nusb `Interface`
+    /// claim, here the `SimState`) is freed only when the **last** clone drops.
+    /// `PersistentConnection` moves one clone into the reader task and one into
+    /// the writer task, so after construction this reads 3 (external + reader +
+    /// writer). When BOTH I/O tasks have released their clones on the connection's
+    /// death edge it falls to the count of clones the test still holds — letting a
+    /// regression test assert the claim is freed WITHOUT dropping the external
+    /// `Arc<PersistentConnection>`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn state_strong_count(&self) -> usize {
+        Arc::strong_count(&self.state)
+    }
 }
 
 impl ADBTransport for SimulatedDevice {

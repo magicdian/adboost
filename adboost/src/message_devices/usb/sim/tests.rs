@@ -333,6 +333,86 @@ async fn reader_death_after_handshake_flips_is_alive_and_resolves_wait_closed() 
     );
 }
 
+/// Regression lock for the downstream-reported "reader single-sided death pins
+/// the USB `Interface` claim forever" bug.
+///
+/// When ONLY the reader dies (fatal read) the writer used to park on
+/// `writer_rx.recv()` forever — the connection struct keeps a live
+/// `WriterHandle` sender, so the channel never closes on its own — pinning the
+/// writer's transport clone, and thus the shared OS claim, until the LAST
+/// external `Arc<PersistentConnection>` dropped (which a long-lived relay/proxy
+/// holder never triggers). A `SimulatedDevice` clone is the structural analogue
+/// of a `USBTransport` clone: both share the underlying handle via an `Arc`, and
+/// the resource frees only when the last clone drops. So the writer-clone leak
+/// shows up as `state_strong_count()` never falling back to the external-only
+/// count while the connection is still held alive.
+///
+/// On PRE-fix code the writer never wakes, the count stays at the
+/// reader-released level (writer clone pinned), and this test times out. POST-fix
+/// the writer races `recv()` against the death signal in a `select!`, wakes on
+/// the death edge, drops its clone, and the count falls to the external-only
+/// count — WITHOUT dropping the `Arc<PersistentConnection>` and WITHOUT closing
+/// the writer channel.
+#[tokio::test]
+async fn reader_death_releases_writer_transport_clone_without_dropping_connection() {
+    // Real-time test (not paused): we wait for the death edge to propagate from
+    // the reader task to the writer task across the shared DeathSignal.
+    let device = SimulatedDevice::with_scenario(
+        DeviceProfile::android_16(),
+        // Die on the first idle read after the handshake completes.
+        Scenario::healthy().with_death_after_reads(1),
+    );
+    // External probe clone, held for the whole test — this is the "long-lived
+    // holder" whose continued existence used to pin the claim.
+    let probe = device.clone();
+
+    let conn = connect_default(device)
+        .await
+        .expect("handshake completes before the reader dies");
+
+    // Sanity precondition: after construction both I/O tasks each hold a clone, so
+    // alongside the external probe the shared state has strictly more than one
+    // live clone (reader + writer + probe). The exact number is asserted as the
+    // observed invariant; the load-bearing claim is that it must DROP after death.
+    let initial = probe.state_strong_count();
+    assert!(
+        initial > 1,
+        "after construction the reader and writer tasks each hold a transport clone \
+         (observed strong_count = {initial}); the external probe is additional"
+    );
+
+    // Wait for the reader's fatal death to fire the DeathSignal.
+    tokio::time::timeout(Duration::from_secs(5), conn.wait_closed())
+        .await
+        .expect("wait_closed must resolve once the reader hits its fatal death");
+
+    // The writer's death-edge wakeup + clone drop is asynchronous after
+    // wait_closed resolves, so poll (real time) until both I/O task clones are
+    // gone — leaving only the external `probe`. PRE-fix this never happens (the
+    // writer stays parked) and the loop times out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = probe.state_strong_count();
+        if count == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both I/O task transport clones must be released on the death edge, \
+             leaving only the external probe (strong_count == 1), but it stayed at \
+             {count} — the writer clone leaked (pre-fix behavior)"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The connection is still held (never dropped) and the writer channel was
+    // never closed: the release happened purely on the death edge.
+    assert!(
+        !conn.is_alive(),
+        "the connection still held alive must report not-alive after the death edge"
+    );
+}
+
 // ===========================================================================
 // ChunkedTransport (byte-level) — Phase A: carries a normal handshake, including
 // trickled byte delivery across idle ReadTimeouts.

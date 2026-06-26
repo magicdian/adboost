@@ -326,6 +326,17 @@ impl DeathSignal {
         self.notify.notify_waiters();
     }
 
+    /// Whether the connection has already been marked dead. A non-async,
+    /// non-blocking snapshot for callers that already have a natural polling
+    /// boundary (the reader loop's idle [`ReadStep::ReadTimeout`]) and must NOT
+    /// `.await` there — awaiting `wait()` inside the read path would risk
+    /// cancelling a non-cancel-safe in-flight frame read. The writer loop, whose
+    /// idle point (`recv().await`) IS cancel-safe, uses `wait()` in a `select!`
+    /// instead.
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
     /// Resolve as soon as the connection is (or becomes) dead.
     ///
     /// Checks `dead` BEFORE awaiting `notified()` so a death that already
@@ -657,13 +668,31 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
         let reader_closed = Arc::clone(&closed);
         let writer_closed = Arc::clone(&closed);
 
+        // Each loop also WATCHES the shared death signal so that when EITHER half
+        // dies, the other returns promptly too — dropping its `transport` clone on
+        // the same death edge. This is what releases the OS resource (the nusb
+        // `Interface` claim, shared by the two clones via `Arc<Mutex<Connection>>`)
+        // at the death edge, independent of how many external
+        // `Arc<PersistentConnection>` holders remain. Without it, a single-sided
+        // reader death leaves the writer parked forever on `recv()`, pinning its
+        // clone — and thus the claim — until refcount hits zero (which a long-lived
+        // relay/proxy holder never triggers), so the device stays `DeviceBusy`.
+        let reader_death_watch = Arc::clone(&closed);
+        let writer_death_watch = Arc::clone(&closed);
+
         let reader_handle = tokio::spawn(async move {
-            Self::reader_loop(reader_transport, control_rx, pending_opens_tx).await;
+            Self::reader_loop(
+                reader_transport,
+                control_rx,
+                pending_opens_tx,
+                reader_death_watch,
+            )
+            .await;
             reader_closed.fire();
         });
 
         let writer_handle = tokio::spawn(async move {
-            Self::writer_loop(writer_transport, writer_rx).await;
+            Self::writer_loop(writer_transport, writer_rx, writer_death_watch).await;
             writer_closed.fire();
         });
 
@@ -1209,11 +1238,12 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     // Not per-session: this task demuxes ALL sessions, so the span is just a
     // task label (no single `local_id`). Every routed-frame event emitted inside
     // inherits the `reader` label so interleaved lines are attributable to the task.
-    #[tracing::instrument(name = "reader", skip(transport, control_rx, pending_opens_tx))]
+    #[tracing::instrument(name = "reader", skip(transport, control_rx, pending_opens_tx, closed))]
     async fn reader_loop(
         mut transport: T,
         mut control_rx: mpsc::Receiver<ReaderControl>,
         pending_opens_tx: mpsc::Sender<ADBTransportMessage>,
+        closed: Arc<DeathSignal>,
     ) {
         let mut sessions: HashMap<u32, SessionChannels> = HashMap::new();
         let mut raw_subscribers: Vec<RawSubscriber> = Vec::new();
@@ -1247,8 +1277,24 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
                 // `RustADBError::ReadTimeout` (USB maps `nusb`'s
                 // `TransferError::Cancelled` to it; TCP maps its read-future
                 // timeout to it). `Control`: a control message was applied
-                // (registry already mutated). Both just keep looping.
-                ReadStep::ReadTimeout => continue,
+                // (registry already mutated). Both just keep looping — UNLESS the
+                // connection has already been declared dead by the OTHER half (the
+                // writer hit its fatal write error and fired the signal). This idle
+                // boundary is the only place it is safe to observe the death edge
+                // from the read path: a non-cancel-safe in-flight frame read has
+                // just completed/timed out, so breaking here cannot truncate a
+                // partial frame. Exiting drops the reader's `transport` clone,
+                // releasing the shared claim on the death edge instead of waiting
+                // for the last external `Arc<PersistentConnection>` to drop.
+                ReadStep::ReadTimeout => {
+                    if closed.is_dead() {
+                        tracing::debug!(
+                            "PersistentUsb reader: other half died, exiting to release the transport"
+                        );
+                        break;
+                    }
+                    continue;
+                }
                 ReadStep::Closed => {
                     tracing::debug!("PersistentUsb reader: control channel closed, exiting");
                     break;
@@ -1469,11 +1515,45 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     /// (`WithAck`) report their write `Result` back over a `oneshot`; OKAY /
     /// CLSE / OPEN / raw (`FireForget`) are written best-effort and logged on
     /// failure. The task exits when every sender (the connection + all session
-    /// halves) has been dropped, draining the channel first.
+    /// halves) has been dropped, draining the channel first, OR as soon as the
+    /// OTHER half (the reader) dies and fires `closed`.
+    ///
+    /// The death-edge `select!` is what makes a single-sided reader death release
+    /// the OS claim promptly: the writer otherwise parks on `recv()` forever
+    /// (the connection struct keeps a live [`WriterHandle`] sender, so the channel
+    /// never closes on its own), pinning its `transport` clone — and thus the
+    /// shared nusb `Interface` claim — until the last external
+    /// `Arc<PersistentConnection>` drops. Racing `recv()` against `closed.wait()`
+    /// is cancel-safe: an mpsc `recv()` future dropped before it resolves loses no
+    /// message, and we only ever race at this idle point, never mid-write.
     // Task-label span (single bulk-OUT pump for all sessions; no per-session id).
-    #[tracing::instrument(name = "writer", skip(transport, writer_rx))]
-    async fn writer_loop(mut transport: T, mut writer_rx: mpsc::Receiver<OutboundFrame>) {
-        while let Some(frame) = writer_rx.recv().await {
+    #[tracing::instrument(name = "writer", skip(transport, writer_rx, closed))]
+    async fn writer_loop(
+        mut transport: T,
+        mut writer_rx: mpsc::Receiver<OutboundFrame>,
+        closed: Arc<DeathSignal>,
+    ) {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                frame = writer_rx.recv() => match frame {
+                    Some(frame) => frame,
+                    // All senders dropped (graceful teardown): drain done, exit.
+                    None => break,
+                },
+                // The reader died (fatal read error / adbd closed the connection).
+                // Stop pumping and exit so this task's `transport` clone drops,
+                // releasing the shared claim on the death edge. We do NOT flush a
+                // connection CLSE here: the device already tore the connection down
+                // (that is why the reader died), so a CLSE would be undeliverable
+                // noise. Graceful CLSE stays exclusive to `shutdown`/`close`.
+                () = closed.wait() => {
+                    tracing::debug!(
+                        "PersistentUsb writer: other half died, exiting to release the transport"
+                    );
+                    break;
+                }
+            };
             let write_result = match frame {
                 OutboundFrame::FireForget(msg) => transport.write_message(msg).await,
                 OutboundFrame::WithAck(msg, ack) => {
