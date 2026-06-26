@@ -4,35 +4,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     ADBDeviceExt, ADBListItemType, Result, RustADBError,
+    message_devices::shell_v2_codec::{HEADER_LEN, ShellChannel, decode_header},
     models::{ADBCommand, ADBLocalCommand, AdbStatResponse, HostFeatures, RemountInfo},
 };
 
 use super::ADBProxyDevice;
 
 const BUFFER_SIZE: usize = 65535;
-
-#[derive(Eq, PartialEq)]
-enum ShellChannel {
-    Stdout,
-    Stderr,
-    ExitStatus,
-}
-
-impl TryFrom<u8> for ShellChannel {
-    type Error = std::io::Error;
-
-    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Stdout),
-            2 => Ok(Self::Stderr),
-            3 => Ok(Self::ExitStatus),
-            _ => Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "Invalid channel",
-            )),
-        }
-    }
-}
 
 impl ADBDeviceExt for ADBProxyDevice {
     async fn shell_command(
@@ -301,9 +279,9 @@ async fn decode_shell_v2_stream<R: AsyncRead + Unpin>(
     let mut exit = None;
     let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
     loop {
-        // 1 byte of channel + 4 bytes of payload size.
-        let mut pckt_metadata = [0u8; 5];
-        if let Err(err) = input.read_exact(&mut pckt_metadata).await {
+        // 1 byte of channel + 4 bytes of payload size (shared codec framing).
+        let mut header = [0u8; HEADER_LEN];
+        if let Err(err) = input.read_exact(&mut header).await {
             match err.kind() {
                 // Stream closed cleanly between frames — return whatever exit
                 // code we already captured. Returning `Ok(None)` here would
@@ -314,11 +292,10 @@ async fn decode_shell_v2_stream<R: AsyncRead + Unpin>(
             }
         }
 
-        let (channel, payload_size) = {
-            let channel = pckt_metadata[0];
-            let payload_size = u32::from_le_bytes(pckt_metadata[1..5].try_into()?) as usize;
-            (ShellChannel::try_from(channel)?, payload_size)
-        };
+        let crate::message_devices::shell_v2_codec::FrameHeader {
+            channel,
+            payload_len: payload_size,
+        } = decode_header(header)?;
 
         if payload_size == 0 {
             continue;
@@ -330,30 +307,20 @@ async fn decode_shell_v2_stream<R: AsyncRead + Unpin>(
                 while remainder > 0 {
                     let to_read = std::cmp::min(remainder, BUFFER_SIZE);
                     match input.read(&mut buffer[0..to_read]).await {
+                        Ok(0) => return Ok(exit),
                         Ok(size) => {
-                            if size == 0 {
-                                return Ok(exit);
-                            }
-
-                            match channel {
-                                ShellChannel::Stdout => {
-                                    if let Some(stdout) = stdout.as_mut() {
-                                        stdout.write_all(&buffer[..size]).await?;
-                                    }
+                            if channel == ShellChannel::Stdout {
+                                if let Some(stdout) = stdout.as_mut() {
+                                    stdout.write_all(&buffer[..size]).await?;
                                 }
-                                ShellChannel::Stderr => {
-                                    // first stderr if existing, else a merged output into stdout
-                                    if let Some(writer) = stderr.as_mut() {
-                                        writer.write_all(&buffer[..size]).await?;
-                                    } else if let Some(writer) = stdout.as_mut() {
-                                        writer.write_all(&buffer[..size]).await?;
-                                    }
-                                }
-                                ShellChannel::ExitStatus => {
-                                    // unreachable
+                            } else {
+                                // stderr: first stderr if present, else merge into stdout.
+                                if let Some(writer) = stderr.as_mut() {
+                                    writer.write_all(&buffer[..size]).await?;
+                                } else if let Some(writer) = stdout.as_mut() {
+                                    writer.write_all(&buffer[..size]).await?;
                                 }
                             }
-
                             remainder -= size;
                         }
                         Err(e) => {
@@ -378,6 +345,21 @@ async fn decode_shell_v2_stream<R: AsyncRead + Unpin>(
                         ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Ok(exit),
                         _ => return Err(RustADBError::IOError(err)),
                     },
+                }
+            }
+            // stdin / close-stdin / window-size are host→device (or interactive)
+            // ids never expected on the device→host stream; consume the payload
+            // and ignore so a stray frame cannot desync the decoder (mirrors the
+            // USB `ShellV2Session` decoder for cross-path symmetry).
+            ShellChannel::Stdin | ShellChannel::CloseStdin | ShellChannel::WindowSizeChange => {
+                let mut remainder = payload_size;
+                while remainder > 0 {
+                    let to_read = std::cmp::min(remainder, BUFFER_SIZE);
+                    match input.read(&mut buffer[0..to_read]).await {
+                        Ok(0) => return Ok(exit),
+                        Ok(size) => remainder -= size,
+                        Err(e) => return Err(RustADBError::IOError(e)),
+                    }
                 }
             }
         }

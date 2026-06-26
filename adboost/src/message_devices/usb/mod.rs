@@ -18,6 +18,7 @@ mod sync_session;
 pub(crate) mod usb_transport;
 mod utils;
 
+pub use crate::message_devices::shell_v2_codec::ShellChannel;
 pub use adb_usb_device::ADBUSBDevice;
 pub use bridge::bridge_tcp_session;
 pub use persistent::{
@@ -26,7 +27,7 @@ pub use persistent::{
 };
 pub use reverse_engine::ReverseEngine;
 pub use reverse_policy::ReversePolicy;
-pub use shell_v2_session::{ShellChannel, ShellV2Output, ShellV2Session};
+pub use shell_v2_session::{ShellV2Output, ShellV2Session};
 pub use sync_session::SyncSession;
 pub use usb_transport::USBTransport;
 pub use utils::{ADBDeviceInfo, find_all_connected_adb_devices};
