@@ -64,6 +64,56 @@ pub async fn persistent_shell_v2(conn: &PersistentUsbConnection) -> Outcome {
     }
 }
 
+/// `shell,v2 cat` over the persistent connection: writes stdin, closes stdin,
+/// and streams the echoed stdout frames back until the exit-status frame.
+///
+/// Proves the writable + streaming + close-stdin path end-to-end on a real
+/// device: `cat` with no args echoes stdin to stdout and exits 0 on EOF, so
+/// `write_stdin(marker)` + `close_stdin()` must yield `marker` on stdout and a
+/// clean exit. This is the close-stdin EOF semantic xdb depends on.
+pub async fn persistent_shell_v2_stdin(conn: &PersistentUsbConnection) -> Outcome {
+    use adboost::usb::ShellChannel;
+
+    let mut session = match conn.open_shell_v2("cat").await {
+        Ok(s) => s,
+        Err(e) => return Outcome::Failed(format!("open_shell_v2(cat) failed: {e}")),
+    };
+
+    if let Err(e) = session.write_stdin(ECHO_MARKER.as_bytes()).await {
+        return Outcome::Failed(format!("write_stdin failed: {e}"));
+    }
+    // Close stdin → `cat` reads EOF, flushes its echo, and exits 0.
+    if let Err(e) = session.close_stdin().await {
+        return Outcome::Failed(format!("close_stdin failed: {e}"));
+    }
+
+    let mut stdout = Vec::new();
+    let mut exit_code = None;
+    loop {
+        match session.read_frame().await {
+            Ok(Some(frame)) => match frame.channel {
+                ShellChannel::Stdout => stdout.extend_from_slice(&frame.payload),
+                ShellChannel::ExitStatus => exit_code = frame.payload.first().copied(),
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => return Outcome::Failed(format!("read_frame failed: {e}")),
+        }
+    }
+
+    let got = String::from_utf8_lossy(&stdout);
+    if got.trim_end() != ECHO_MARKER {
+        return Outcome::Failed(format!(
+            "cat echoed stdin as {got:?}, expected {ECHO_MARKER:?}"
+        ));
+    }
+    match exit_code {
+        Some(0) => Outcome::Passed,
+        Some(c) => Outcome::Failed(format!("cat exited {c}, expected 0 on stdin EOF")),
+        None => Outcome::Failed("cat reported no exit code after close-stdin".into()),
+    }
+}
+
 /// SYNC push→pull round-trip over the persistent connection's sync session.
 pub async fn persistent_push_pull(conn: &PersistentUsbConnection) -> Outcome {
     let payload = b"adboost selftest payload \x00\x01\x02 end".to_vec();

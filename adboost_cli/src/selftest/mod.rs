@@ -124,10 +124,10 @@ pub async fn run(cmd: SelftestCommand) -> ADBCliResult<()> {
 }
 
 /// Approximate automated cases per device, for the run banner count only:
-/// 3 `usb_direct` + 5 `through_server` + forward + parity ≈ 10. The banner is an
+/// 4 `usb_direct` + 5 `through_server` + forward + parity ≈ 11. The banner is an
 /// estimate; the final summary reports exact counts.
 fn estimated_cases_per_device() -> usize {
-    10
+    11
 }
 
 /// Run the automated `root → unroot` cycle ONCE, on the FIRST serial, THROUGH the
@@ -382,6 +382,12 @@ async fn run_usb_direct_suite(reporter: &mut Reporter, serial: &str) {
         "usb_direct",
         "shell_v2",
         guarded_persistent_case(&conn, cases::persistent_shell_v2(&conn)).await,
+    );
+    run_one(
+        reporter,
+        "usb_direct",
+        "shell_v2_stdin",
+        guarded_persistent_case(&conn, cases::persistent_shell_v2_stdin(&conn)).await,
     );
     run_one(
         reporter,

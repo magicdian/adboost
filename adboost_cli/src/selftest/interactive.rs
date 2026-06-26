@@ -78,6 +78,9 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
         forward_release,
     );
 
+    let pty_hup = case_pty_hup_kills_process_group(&subject).await;
+    record(reporter, "interactive", "pty_hup_process_group", pty_hup);
+
     let tcpip = case_tcpip_through_server(&subject).await;
     record(reporter, "tcpip", "shell_through_tcp_device", tcpip);
 
@@ -89,6 +92,130 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
     // ALWAYS LAST — see the ordering invariant above.
     let reboot = case_reboot_recovery(&subject).await;
     record(reporter, "interactive", "reboot_recovery", reboot);
+}
+
+/// PTY-HUP process-group kill: open a PTY-allocated `shell,v2` session running a
+/// long-lived child (`sleep`), record the child PID, then DROP the session. The
+/// host close tears the ADB stream down; on the device the PTY master closes and
+/// the kernel delivers `SIGHUP` to the **entire foreground process group**, so
+/// the `sleep` child must be gone when we check from a fresh shell.
+///
+/// This is the load-bearing mechanism behind "local disconnect/cancel → device
+/// process gets a signal and exits" (the v1 path could only CLSE the ADB stream,
+/// which does NOT signal the remote process group). It is hardware/kernel
+/// behavior no unit test can assert — hence operator-gated and live-device only.
+/// On MTK 8676 / Android 16 the PTY-HUP-reaches-the-group property is the one
+/// this case proves.
+async fn case_pty_hup_kills_process_group(serial: &str) -> Outcome {
+    use adboost::ShellV2Service;
+
+    if !prompt_yes_no(&format!(
+        "[pty_hup] Open a PTY shell on {serial}, start a `sleep`, then drop the session and \
+         verify the kernel SIGHUPs the process group? (non-destructive)"
+    )) {
+        return Outcome::Skipped("operator declined PTY-HUP case".into());
+    }
+
+    let conn = match PersistentUsbConnection::new_from_serial(serial, None).await {
+        Ok(c) => c,
+        Err(e) => return Outcome::Failed(format!("cannot open device: {e}")),
+    };
+
+    // A unique marker so we can find (and clean up) exactly our child.
+    let marker = "adboost_pty_hup_probe_3c7e";
+    // Spawn a long sleep tagged with the marker as an argument, print a ready
+    // line, then block so the shell stays the PTY foreground process group.
+    // `exec` so the sleep IS the foreground process (the PTY's controlling group).
+    let pty_cmd = format!("echo READY; exec sleep 3600 {marker}");
+
+    let mut session = match conn
+        .open_shell_v2_service(ShellV2Service::new(&pty_cmd).with_pty())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            conn.close().await;
+            return Outcome::Failed(format!("open PTY shell,v2 failed: {e}"));
+        }
+    };
+
+    // Wait until the shell signals READY (so the sleep is actually running)
+    // before we cancel — otherwise we might drop before the child exists.
+    if let Err(e) = wait_for_ready_frame(&mut session).await {
+        conn.close().await;
+        return Outcome::Failed(format!("PTY shell never became READY: {e}"));
+    }
+
+    // Confirm the child IS running right now (sanity: the probe is valid).
+    let running_before = pgrep_marker(&conn, marker).await;
+    if !running_before {
+        drop(session);
+        conn.close().await;
+        return Outcome::Skipped(
+            "sleep child not observed before cancel; cannot validate PTY-HUP".into(),
+        );
+    }
+
+    // THE CANCEL: drop the session. Host-side close → PTY master closes on the
+    // device → kernel SIGHUPs the foreground process group (the sleep).
+    drop(session);
+
+    // Poll for the child to disappear. If PTY-HUP reaches the group, the sleep
+    // dies promptly; allow a short window for adbd + kernel to deliver it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut still_running = true;
+    while Instant::now() < deadline {
+        if !pgrep_marker(&conn, marker).await {
+            still_running = false;
+            break;
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+
+    if still_running {
+        // Clean up the leaked child so the rig is left tidy, then fail.
+        let _ = conn.shell_exec(&format!("pkill -f {marker}")).await;
+        conn.close().await;
+        return Outcome::Failed(format!(
+            "PTY-HUP did NOT reach the process group: `sleep {marker}` still running 10s after \
+             session drop (expected SIGHUP on PTY master close)"
+        ));
+    }
+
+    conn.close().await;
+    Outcome::Passed
+}
+
+/// Read shell-v2 frames until a stdout frame contains `READY`, or the stream
+/// ends / a bounded number of frames pass without it.
+async fn wait_for_ready_frame(session: &mut adboost::usb::ShellV2Session) -> Result<(), String> {
+    use adboost::usb::ShellChannel;
+
+    for _ in 0..64 {
+        match session.read_frame().await {
+            Ok(Some(frame)) => {
+                if frame.channel == ShellChannel::Stdout
+                    && String::from_utf8_lossy(&frame.payload).contains("READY")
+                {
+                    return Ok(());
+                }
+            }
+            Ok(None) => return Err("stream closed before READY".into()),
+            Err(e) => return Err(format!("read_frame error: {e}")),
+        }
+    }
+    Err("READY not seen within 64 frames".into())
+}
+
+/// Whether a process whose command line contains `marker` is currently running,
+/// via a fresh `pgrep -f` shell on the connection.
+async fn pgrep_marker(conn: &PersistentUsbConnection, marker: &str) -> bool {
+    // `pgrep -f` matches against the full command line (so it finds `sleep 3600
+    // <marker>`). Exit code is non-zero when nothing matches; we key on stdout.
+    match conn.shell_exec(&format!("pgrep -f {marker}")).await {
+        Ok((out, _)) => out.split_whitespace().any(|t| t.parse::<u32>().is_ok()),
+        Err(_) => false,
+    }
 }
 
 /// End-to-end tcpip closed loop (`PR4b`): switch a USB device to TCP/IP mode,
