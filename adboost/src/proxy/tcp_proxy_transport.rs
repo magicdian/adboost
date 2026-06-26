@@ -94,6 +94,22 @@ impl TCPProxyTransport {
             )))
     }
 
+    /// Take ownership of the underlying [`TcpStream`], leaving the transport
+    /// disconnected.
+    ///
+    /// Used to hand a now-dedicated socket (after a `shell,v2` request has been
+    /// accepted) to an owning session, so dropping that session closes the
+    /// socket and the device observes EOF. The transport must be reconnected
+    /// before its next request.
+    pub(crate) fn take_raw_connection(&mut self) -> Result<TcpStream> {
+        self.tcp_stream
+            .take()
+            .ok_or(RustADBError::IOError(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "not connected",
+            )))
+    }
+
     /// Gets the body length from hexadecimal value
     pub(crate) async fn get_hex_body_length(&mut self) -> Result<u32> {
         let length_buffer = self.read_body_length().await?;

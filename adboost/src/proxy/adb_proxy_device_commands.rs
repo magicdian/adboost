@@ -1,10 +1,12 @@
 use std::{io::ErrorKind, path::Path, pin::Pin};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 
 use crate::{
     ADBDeviceExt, ADBListItemType, Result, RustADBError,
     message_devices::shell_v2_codec::{HEADER_LEN, ShellChannel, decode_header},
+    message_devices::shell_v2_session::ShellV2Session,
     models::{
         ADBCommand, ADBLocalCommand, AdbStatResponse, HostFeatures, RemountInfo, ShellV2Service,
     },
@@ -13,6 +15,12 @@ use crate::{
 use super::ADBProxyDevice;
 
 const BUFFER_SIZE: usize = 65535;
+
+/// A writable / streaming / cancelable `shell,v2` session over the proxy's TCP
+/// connection: the transport-generic
+/// [`ShellV2Session`](crate::message_devices::shell_v2_session::ShellV2Session)
+/// pinned to the split halves of the owned [`TcpStream`].
+pub type ProxyShellV2Session = ShellV2Session<ReadHalf<TcpStream>, WriteHalf<TcpStream>>;
 
 impl ADBDeviceExt for ADBProxyDevice {
     async fn shell_command(
@@ -191,6 +199,38 @@ impl ADBProxyDevice {
         // https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/shell_protocol.h
         let input = self.transport.get_raw_connection()?;
         decode_shell_v2_stream(input, stdout, stderr).await
+    }
+
+    /// Open a writable / streaming / cancelable `shell,v2` session over the proxy
+    /// connection — the proxy counterpart of
+    /// [`PersistentUsbConnection::open_shell_v2_service`].
+    ///
+    /// Sends the `shell,v2[,TERM=…][,raw|pty]:cmd` request, then hands the now-
+    /// dedicated socket to an owning [`ProxyShellV2Session`]. Because the session
+    /// owns the `TcpStream` (split into read/write halves), dropping it closes
+    /// the socket and the device reads EOF — the proxy's cancel path, symmetric
+    /// with the USB session's drop-fires-CLSE.
+    ///
+    /// [`PersistentUsbConnection::open_shell_v2_service`]: crate::usb::PersistentUsbConnection::open_shell_v2_service
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport errors from selecting the device or sending the
+    /// request.
+    pub async fn open_shell_v2_service(
+        &mut self,
+        service: ShellV2Service,
+    ) -> Result<ProxyShellV2Session> {
+        self.set_serial_transport().await?;
+        self.transport
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellV2(service)))
+            .await?;
+
+        // The socket is now a dedicated shell-v2 pipe; move it into the session
+        // so its lifetime (and the cancel-on-drop) is owned by the caller.
+        let stream = self.transport.take_raw_connection()?;
+        let (reader, writer) = tokio::io::split(stream);
+        Ok(ShellV2Session::new(reader, writer))
     }
 
     async fn bidirectional_session(

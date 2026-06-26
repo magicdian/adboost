@@ -9,6 +9,7 @@ mod models;
 mod tcp_proxy_transport;
 
 pub use adb_proxy_device::ADBProxyDevice;
+pub use adb_proxy_device_commands::ProxyShellV2Session;
 pub use adb_proxy_server::ADBProxyServer;
 pub use models::*;
 pub use tcp_proxy_transport::TCPProxyTransport;
