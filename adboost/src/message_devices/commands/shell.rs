@@ -23,10 +23,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         _stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
         let mut session = self
-            .open_session(&ADBLocalCommand::ShellCommand(
-                command.as_ref().to_string(),
-                Vec::new(),
-            ))
+            .open_session(&ADBLocalCommand::ShellCommand(command.as_ref().to_string()))
             .await?;
 
         loop {

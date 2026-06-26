@@ -1218,9 +1218,9 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 Err(format!("service not supported: {service}"))
             };
         }
-        // Bare `shell:` is v1 (ShellCommand with empty args), NOT v2.
+        // Bare `shell:` is v1 (ShellCommand, no inner framing), NOT v2.
         if let Some(shell_cmd) = service.strip_prefix("shell:") {
-            return Ok(ADBLocalCommand::ShellCommand(shell_cmd.to_string(), vec![]));
+            return Ok(ADBLocalCommand::ShellCommand(shell_cmd.to_string()));
         }
         if let Some(port_str) = service.strip_prefix("tcp:") {
             return port_str
@@ -3033,7 +3033,7 @@ mod tests {
         // prove they are accepted regardless.
         assert!(matches!(
             f.map_local_service("shell:ls", Some(&dev)).unwrap(),
-            ADBLocalCommand::ShellCommand(c, args) if c == "ls" && args.is_empty()
+            ADBLocalCommand::ShellCommand(c) if c == "ls"
         ));
         assert!(matches!(
             f.map_local_service("tcp:5555", Some(&dev)).unwrap(),
@@ -3103,7 +3103,7 @@ mod tests {
         // But bare v1 shell still works on that same device.
         assert!(matches!(
             f.map_local_service("shell:ls", Some(&stripped)).unwrap(),
-            ADBLocalCommand::ShellCommand(c, _) if c == "ls"
+            ADBLocalCommand::ShellCommand(c) if c == "ls"
         ));
     }
 

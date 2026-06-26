@@ -68,7 +68,9 @@ use crate::message_devices::usb::flow_control::{
 use crate::message_devices::usb::shell_v2_session::ShellV2Session;
 use crate::message_devices::usb::sync_session::SyncSession;
 use crate::message_devices::usb::usb_transport::USBTransport;
-use crate::models::{ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK, RebootType};
+use crate::models::{
+    ADBLocalCommand, DeviceFeatureSet, FEATURE_DELAYED_ACK, RebootType, ShellV2Service,
+};
 use crate::tcp::TcpTransport;
 use crate::utils::get_default_adb_key_path;
 use crate::{Result, RustADBError};
@@ -1982,9 +1984,9 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     // Labeled span (the per-session `local_id` span is entered inside `open_session`).
     #[tracing::instrument(name = "open_shell_v2", skip(self))]
     pub async fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> {
-        // Non-empty args ⇒ `ADBLocalCommand` formats the service as
-        // `shell,v2,raw:<cmd>` (shell-v2), vs the empty-args `shell:<cmd>` (v1).
-        let command = ADBLocalCommand::ShellCommand(cmd.to_string(), vec!["v2".to_string()]);
+        // `ShellV2` formats the service as `shell,v2,raw:<cmd>` (shell-v2 inner
+        // framing), vs `ShellCommand` → `shell:<cmd>` (v1, no framing).
+        let command = ADBLocalCommand::ShellV2(ShellV2Service::new(cmd));
         let session = self.open_session(&command).await?;
         Ok(ShellV2Session::new(session))
     }
@@ -1997,7 +1999,7 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     pub async fn shell_exec(&self, cmd: &str) -> Result<(String, Option<u8>)> {
         use tokio::io::AsyncReadExt;
 
-        let command = ADBLocalCommand::ShellCommand(cmd.to_string(), vec![]);
+        let command = ADBLocalCommand::ShellCommand(cmd.to_string());
         let mut session = self.open_session(&command).await?;
 
         let mut output = Vec::new();

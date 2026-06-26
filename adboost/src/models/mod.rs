@@ -16,7 +16,7 @@ mod framebuffer_info;
 
 pub use adb_command::ADBCommand;
 pub use adb_host_command::ADBHostCommand;
-pub use adb_local_command::ADBLocalCommand;
+pub use adb_local_command::{ADBLocalCommand, ShellPtyMode, ShellV2Service};
 pub use adb_request_status::AdbRequestStatus;
 pub use adb_stat_extended_response::{ADBStatExtendedResponse, ADBStatMapping};
 pub use adb_stat_response::AdbStatResponse;

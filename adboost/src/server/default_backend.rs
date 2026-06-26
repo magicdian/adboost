@@ -673,12 +673,13 @@ impl DeviceBackend for DefaultDeviceBackend {
     ) -> Result<MultiplexedSession> {
         // Reject services the bridge does not support BEFORE opening a session,
         // with a stable reason (mirrors the frontend's pre-open guard). Bridged:
-        // `shell:` v1 (empty-args ShellCommand), `tcp:`, and the verbatim `Raw`
+        // `shell:` v1 (ShellCommand), `tcp:`, and the verbatim `Raw`
         // pass-through (the frontend uses `Raw` for `sync:` / `shell,v2`, which
         // it has already capability-gated).
         match cmd {
-            ADBLocalCommand::ShellCommand(_, args) if args.is_empty() => {}
-            ADBLocalCommand::TcpConnect(_) | ADBLocalCommand::Raw(_) => {}
+            ADBLocalCommand::ShellCommand(_)
+            | ADBLocalCommand::TcpConnect(_)
+            | ADBLocalCommand::Raw(_) => {}
             other => {
                 return Err(RustADBError::ADBRequestFailed(format!(
                     "DefaultDeviceBackend: unsupported local service: {other}"
@@ -966,7 +967,7 @@ mod tests {
         // hardware), but it must NOT be the old TCP-unsupported message — it must
         // route to the USB path instead.
         let backend = DefaultDeviceBackend::new();
-        let cmd = ADBLocalCommand::ShellCommand(String::new(), vec![]);
+        let cmd = ADBLocalCommand::ShellCommand(String::new());
         // `MultiplexedSession` is not `Debug`, so inspect the error directly
         // rather than via `unwrap_err`.
         let Err(err) = backend.open_local_service("10.0.0.5:5555", &cmd).await else {

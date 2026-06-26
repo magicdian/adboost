@@ -2,9 +2,85 @@ use std::fmt::Display;
 
 use crate::RebootType;
 
+/// PTY-allocation mode for a shell-v2 service — the mutually-exclusive final
+/// argument in the AOSP `shell[,v2][,TERM=…][,pty|raw]:cmd` grammar.
+///
+/// `pty` and `raw` are alternatives, never both: passing both (the bogus
+/// `shell,v2,pty,raw:` form) is what this type exists to make unrepresentable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellPtyMode {
+    /// `raw`: no PTY; stdin/stdout are raw pipes. The default for a
+    /// non-interactive `adb shell CMD`.
+    #[default]
+    Raw,
+    /// `pty`: allocate a pseudo-terminal. Closing the PTY master (host-side
+    /// session close / stdin EOF) makes the kernel deliver `SIGHUP` to the
+    /// device-side foreground process group — the basis for "local cancel →
+    /// remote process gets a signal and exits cleanly".
+    Pty,
+}
+
+impl ShellPtyMode {
+    /// The on-wire service-string argument for this mode (`"raw"` / `"pty"`).
+    #[must_use]
+    pub const fn as_arg(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+/// A typed shell-v2 service request: `shell,v2[,TERM=…][,raw|pty]:command`.
+///
+/// Replaces the former stringly-typed `ShellCommand(String, Vec<String>)` +
+/// hardcoded `,raw:` suffix. Built with [`ShellV2Service::new`] (standard
+/// defaults: no TERM, raw mode) and customized via the opt-in
+/// [`with_term`](Self::with_term) / [`with_pty`](Self::with_pty) setters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellV2Service {
+    /// The command to run. Empty = an interactive v2 shell (no command).
+    pub command: String,
+    /// Optional `TERM=…` argument (terminal type), set for interactive/PTY use.
+    pub term: Option<String>,
+    /// Whether to allocate a PTY (`pty`) or run raw (`raw`, the default).
+    pub mode: ShellPtyMode,
+}
+
+impl ShellV2Service {
+    /// A shell-v2 request for `command` with standard defaults (no TERM, raw).
+    #[must_use]
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            term: None,
+            mode: ShellPtyMode::Raw,
+        }
+    }
+
+    /// Set the `TERM=…` argument (opt-in).
+    #[must_use]
+    pub fn with_term(mut self, term: impl Into<String>) -> Self {
+        self.term = Some(term.into());
+        self
+    }
+
+    /// Allocate a PTY for this session (opt-in; default is raw).
+    #[must_use]
+    pub fn with_pty(mut self) -> Self {
+        self.mode = ShellPtyMode::Pty;
+        self
+    }
+}
+
 /// ADB commands that relates to an actual device.
 pub enum ADBLocalCommand {
-    ShellCommand(String, Vec<String>),
+    /// Shell v1 (`shell:cmd`): no inner protocol framing, no exit code. An empty
+    /// command is the legacy bare `shell:` form.
+    ShellCommand(String),
+    /// Shell v2 (`shell,v2[,TERM=…][,raw|pty]:cmd`): inner stdin/stdout/stderr/
+    /// exit framing, optional PTY allocation. See [`ShellV2Service`].
+    ShellV2(ShellV2Service),
     Shell,
     Exec(String),
     Sync,
@@ -43,15 +119,18 @@ impl Display for ADBLocalCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sync => write!(f, "sync:"),
-            Self::ShellCommand(command, shell_args) => {
-                if shell_args.is_empty() {
-                    // Shell v1: simple format for older ADB versions
-                    write!(f, "shell:{command}")
-                } else {
-                    // Shell v2: with arguments
-                    let args_s = shell_args.join(",");
-                    write!(f, "shell,{args_s},raw:{command}")
+            Self::ShellCommand(command) => {
+                // Shell v1: simple format for older ADB versions (no framing).
+                write!(f, "shell:{command}")
+            }
+            Self::ShellV2(svc) => {
+                // Shell v2 grammar: shell,v2[,TERM=…][,raw|pty]:cmd. The mode
+                // (raw/pty) is the mutually-exclusive final argument — never both.
+                write!(f, "shell,v2")?;
+                if let Some(term) = &svc.term {
+                    write!(f, ",TERM={term}")?;
                 }
+                write!(f, ",{}:{}", svc.mode.as_arg(), svc.command)
             }
             Self::Shell => match std::env::var("TERM") {
                 Ok(term) => write!(f, "shell,TERM={term},raw:"),
@@ -148,5 +227,57 @@ fn test_raw_command_is_verbatim() {
     assert_eq!(
         ADBLocalCommand::Raw("shell,v2,TERM=xterm,raw:ls".to_string()).to_string(),
         "shell,v2,TERM=xterm,raw:ls"
+    );
+}
+
+#[test]
+fn shell_v1_renders_bare_shell_service() {
+    // v1 has no inner framing and no args: `shell:<cmd>`.
+    assert_eq!(
+        ADBLocalCommand::ShellCommand("echo hi".to_string()).to_string(),
+        "shell:echo hi"
+    );
+}
+
+#[test]
+fn shell_v2_default_is_raw_no_term() {
+    // Standard default: v2, raw mode, no TERM.
+    assert_eq!(
+        ADBLocalCommand::ShellV2(ShellV2Service::new("ls")).to_string(),
+        "shell,v2,raw:ls",
+        "default v2 service must render as shell,v2,raw:<cmd>"
+    );
+}
+
+#[test]
+fn shell_v2_with_term_inserts_term_before_mode() {
+    assert_eq!(
+        ADBLocalCommand::ShellV2(ShellV2Service::new("top").with_term("xterm-256color"))
+            .to_string(),
+        "shell,v2,TERM=xterm-256color,raw:top",
+        "TERM must appear between v2 and the raw/pty mode segment"
+    );
+}
+
+#[test]
+fn shell_v2_pty_renders_pty_not_pty_raw() {
+    // The whole point of the typed mode: PTY renders `…,pty:` — NOT the bogus
+    // `…,pty,raw:` the old stringly-typed path would have produced if "pty" were
+    // pushed into the args vec ahead of the hardcoded ",raw:" suffix.
+    let svc = ShellV2Service::new("tcpdump -w -").with_pty();
+    assert_eq!(
+        ADBLocalCommand::ShellV2(svc).to_string(),
+        "shell,v2,pty:tcpdump -w -",
+        "pty mode must render shell,v2,pty:<cmd> (pty and raw are mutually exclusive)"
+    );
+}
+
+#[test]
+fn shell_v2_pty_with_term() {
+    let svc = ShellV2Service::new("").with_term("xterm").with_pty();
+    assert_eq!(
+        ADBLocalCommand::ShellV2(svc).to_string(),
+        "shell,v2,TERM=xterm,pty:",
+        "an interactive PTY shell with TERM and no command renders trailing colon"
     );
 }

@@ -5,7 +5,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     ADBDeviceExt, ADBListItemType, Result, RustADBError,
     message_devices::shell_v2_codec::{HEADER_LEN, ShellChannel, decode_header},
-    models::{ADBCommand, ADBLocalCommand, AdbStatResponse, HostFeatures, RemountInfo},
+    models::{
+        ADBCommand, ADBLocalCommand, AdbStatResponse, HostFeatures, RemountInfo, ShellV2Service,
+    },
 };
 
 use super::ADBProxyDevice;
@@ -144,7 +146,6 @@ impl ADBProxyDevice {
         self.transport
             .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
                 command.as_ref().to_string(),
-                vec![],
             )))
             .await?;
 
@@ -176,18 +177,14 @@ impl ADBProxyDevice {
         stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
         stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<Option<u8>> {
-        let mut args = vec!["v2".to_string()];
-
+        let mut service = ShellV2Service::new(command.as_ref());
         if let Ok(term) = std::env::var("TERM") {
-            args.push(format!("TERM={term}"));
+            service = service.with_term(term);
         }
 
         // Send the request
         self.transport
-            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellCommand(
-                command.as_ref().to_string(),
-                args,
-            )))
+            .send_adb_request(&ADBCommand::Local(ADBLocalCommand::ShellV2(service)))
             .await?;
 
         // Now decode the shell v2 protocol packets, reference:
