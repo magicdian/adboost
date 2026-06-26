@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 30
-- **Last Active**: 2026-06-24
+- **Total Sessions**: 31
+- **Last Active**: 2026-06-26
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1311 | Active |
+| `journal-1.md` | ~1344 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 31 | 2026-06-26 | Release USB claim on PersistentConnection half-death edge | `0a16916` | `fix/persistent-release-claim-on-half-death` |
 | 30 | 2026-06-24 | backend hook: local-service reject reason | `6d5ee3e` | `main` |
 | 29 | 2026-06-24 | adb root/unroot reconnect handshake: two-OKAY + event-driven disconnect + connect-layer re-enumeration recovery | `0977368` | `main` |
 | 28 | 2026-06-23 | adb root reconnect handshake + unroot + USB re-enumeration retry | `19b86d4`, `f84039a`, `423efc9` | `main` |

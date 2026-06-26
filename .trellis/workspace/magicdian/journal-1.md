@@ -1309,3 +1309,36 @@ Evaluated xdb feature request and implemented it as a contract-layer fix: new de
 ### Next Steps
 
 - None - task complete
+
+
+## Session 31: Release USB claim on PersistentConnection half-death edge
+
+**Date**: 2026-06-26
+**Task**: Release USB claim on PersistentConnection half-death edge
+**Branch**: `fix/persistent-release-claim-on-half-death`
+
+### Summary
+
+Fixed a downstream-reported (xdb) permanent USB DeviceBusy leak: when a PersistentConnection's reader died single-sided while the writer parked on recv(), the writer's transport clone was never dropped, pinning the shared nusb Interface claim until the last external Arc dropped. Bound resource release to the death edge instead of refcount-zero — each I/O loop now watches the shared DeathSignal and returns when the other half dies (writer races recv() vs closed.wait(); reader checks is_dead() at its idle ReadTimeout boundary, preserving frame-read cancel-safety). Graceful shutdown/close/Drop and flow control unchanged; transport-generic (USB+TCP). Regression-locked in the sim harness via a strong_count probe (3->1 on death). Full suite green (341 lib tests), clippy/fmt clean. adboost_cli selftest intentionally out of scope (cannot deterministically trigger reader-only death on real hardware).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0a16916` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
