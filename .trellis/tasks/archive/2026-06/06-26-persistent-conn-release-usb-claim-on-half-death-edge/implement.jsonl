@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "本 bug 是典型跨层抽象泄漏：USBTransport 的 clone/claim 所有权模型(底层) 与 PersistentConnection 的 task 生命周期(消费层) 在死亡边沿割裂；修复须从层边界的资源所有权数据流审视，确保 contract 层根治而非局部补丁"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "多特性组合(usb/test-support/tcp/server) 下 clippy -D warnings + test 全绿；sim 回归测试的风格(start_paused/real-time 取舍、命名规范)须符合既有测试约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "R5 要求死亡边沿 self-teardown 路径不得产生虚假 'writer task gone' 警告；新增/调整的 tracing 事件须符合 tracing 约定与级别选择"}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "需确认死亡边沿主动停 writer 不破坏 graceful CLSE 语义(self-abort 不 flush 连接级 CLSE)，与帧读取的 cancel-safety 约定不冲突"}
