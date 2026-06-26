@@ -79,6 +79,18 @@ pub struct Scenario {
     /// modeling a mid-frame truncation (B7). The persistent writer must treat a
     /// partial-frame write as fatal (poison), not warn-and-continue.
     pub(super) write_fault: Option<WriteFault>,
+    /// Byte chunks the device sends as device→host `WRTE` frames immediately
+    /// after accepting a host `OPEN`, before any host `WRTE`. Each chunk becomes
+    /// one `WRTE`, so a multi-chunk script models output streamed across several
+    /// frames (and a sub-protocol frame split across transport boundaries).
+    ///
+    /// Used to drive a real `ShellV2Session` over a sim-backed
+    /// `MultiplexedSession`: the test encodes shell-v2 frames with the shared
+    /// codec and the device "produces" them here, with no host write required.
+    pub(super) post_open_writes: Vec<Vec<u8>>,
+    /// If true, the device sends a `CLSE` after draining [`Self::post_open_writes`],
+    /// so a consumer reading to EOF (e.g. `ShellV2Session::execute`) terminates.
+    pub(super) close_after_post_open: bool,
 }
 
 /// A mid-frame write truncation injected by [`ChunkedTransport`] (B7).
@@ -186,6 +198,23 @@ impl Scenario {
             on_write,
             after_bytes,
         });
+        self
+    }
+
+    /// Have the device stream `chunks` back as device→host `WRTE` frames right
+    /// after accepting the session's `OPEN` (one `WRTE` per chunk), with no host
+    /// write required. Drives a real `ShellV2Session` over a sim session.
+    #[must_use]
+    pub fn with_post_open_writes(mut self, chunks: Vec<Vec<u8>>) -> Self {
+        self.post_open_writes = chunks;
+        self
+    }
+
+    /// Send a `CLSE` after the [`with_post_open_writes`](Self::with_post_open_writes)
+    /// chunks, so a reader draining to EOF terminates.
+    #[must_use]
+    pub fn with_close_after_post_open(mut self) -> Self {
+        self.close_after_post_open = true;
         self
     }
 }

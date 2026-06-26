@@ -269,6 +269,7 @@ impl SimState {
                 self.session_host_id = Some(host_id);
                 self.session_first_write_seen = false;
                 self.enqueue_okay(host_id, windowed);
+                self.enqueue_post_open_writes(host_id);
             }
             OpenResponse::AcceptDoubleOkay => {
                 self.session_host_id = Some(host_id);
@@ -285,6 +286,21 @@ impl SimState {
             OpenResponse::Ignore => {
                 // Send nothing: the host hits its OPEN-response timeout.
             }
+        }
+    }
+
+    /// Enqueue the scenario's post-open device→host `WRTE` chunks (one frame per
+    /// chunk), then an optional trailing `CLSE`. Lets the device "produce" a
+    /// stream of bytes (e.g. encoded shell-v2 frames) without a host write.
+    fn enqueue_post_open_writes(&mut self, host_id: u32) {
+        if self.scenario.post_open_writes.is_empty() {
+            return;
+        }
+        for chunk in self.scenario.post_open_writes.clone() {
+            self.enqueue(MessageCommand::Write, DEVICE_LOCAL_ID, host_id, &chunk);
+        }
+        if self.scenario.close_after_post_open {
+            self.enqueue(MessageCommand::Clse, DEVICE_LOCAL_ID, host_id, &[]);
         }
     }
 

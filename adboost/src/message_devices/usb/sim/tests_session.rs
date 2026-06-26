@@ -452,3 +452,111 @@ async fn chunked_write_start_backpressure_is_recoverable() {
         "B9: a 0-byte-committed WriteTimeout (backpressure) must NOT tear down the connection"
     );
 }
+
+// ===========================================================================
+// shell-v2 session over a real sim-backed MultiplexedSession (S5)
+//
+// The device "produces" encoded shell-v2 frames via `post_open_writes`, so a
+// real `ShellV2Session` decodes them through the live reader/writer loops —
+// proving the generic session works end-to-end over the USB split halves, not
+// just over the in-memory `Cursor` unit tests.
+// ===========================================================================
+
+/// `ShellV2Session::execute` decodes stdout/stderr/exit streamed by the device
+/// as shell-v2 frames over a real session, terminating on the device CLSE.
+#[tokio::test(start_paused = true)]
+async fn shell_v2_session_execute_over_sim() {
+    use crate::message_devices::shell_v2_codec::{ShellChannel, encode};
+
+    // Two stdout frames + a stderr frame + exit-status, each its own WRTE.
+    let frames = vec![
+        encode(ShellChannel::Stdout, b"hello "),
+        encode(ShellChannel::Stdout, b"world"),
+        encode(ShellChannel::Stderr, b"warn"),
+        encode(ShellChannel::ExitStatus, &[7]),
+    ];
+    let conn = connect(
+        DeviceProfile::android_16(),
+        Scenario::healthy()
+            .with_post_open_writes(frames)
+            .with_close_after_post_open(),
+    )
+    .await
+    .expect("handshake completes");
+
+    let mut session = conn.open_shell_v2("run").await.expect("open shell v2");
+    let out = session.execute().await.expect("execute drains to exit");
+    assert_eq!(out.stdout, b"hello world", "stdout frames concatenate");
+    assert_eq!(out.stderr, b"warn", "stderr routes separately");
+    assert_eq!(out.exit_code, Some(7), "exit-status frame yields the code");
+}
+
+/// Streaming `read_frame` yields each shell-v2 frame as it arrives, and dropping
+/// the session before the exit frame (mid-stream cancel) does not panic.
+#[tokio::test(start_paused = true)]
+async fn shell_v2_session_streaming_then_mid_stream_drop() {
+    use crate::message_devices::shell_v2_codec::{ShellChannel, encode};
+
+    let frames = vec![
+        encode(ShellChannel::Stdout, b"first"),
+        encode(ShellChannel::Stdout, b"second"),
+        encode(ShellChannel::ExitStatus, &[0]),
+    ];
+    let conn = connect(
+        DeviceProfile::android_16(),
+        Scenario::healthy()
+            .with_post_open_writes(frames)
+            .with_close_after_post_open(),
+    )
+    .await
+    .expect("handshake completes");
+
+    let mut session = conn.open_shell_v2("run").await.expect("open shell v2");
+    let f1 = session
+        .read_frame()
+        .await
+        .expect("frame 1")
+        .expect("a first stdout frame");
+    assert_eq!(f1.channel, ShellChannel::Stdout);
+    assert_eq!(f1.payload, b"first", "first frame streamed before exit");
+
+    // Cancel mid-stream: drop the session before reading the exit frame.
+    drop(session);
+    // Reaching here without a panic is the assertion; also confirm the
+    // connection itself survived a per-session cancel.
+    assert!(
+        conn.is_alive(),
+        "dropping a shell-v2 session mid-stream must not tear down the connection"
+    );
+}
+
+/// A shell-v2 frame split across two device WRTEs (transport-boundary split)
+/// must still reassemble — the header in one frame, the payload in the next.
+#[tokio::test(start_paused = true)]
+async fn shell_v2_session_reassembles_frame_split_across_writes() {
+    use crate::message_devices::shell_v2_codec::{ShellChannel, encode};
+
+    let full = encode(ShellChannel::Stdout, b"split-across-wrtes");
+    let split = full.len() / 2;
+    let frames = vec![
+        full[..split].to_vec(),
+        full[split..].to_vec(),
+        encode(ShellChannel::ExitStatus, &[0]),
+    ];
+    let conn = connect(
+        DeviceProfile::android_16(),
+        Scenario::healthy()
+            .with_post_open_writes(frames)
+            .with_close_after_post_open(),
+    )
+    .await
+    .expect("handshake completes");
+
+    let mut session = conn.open_shell_v2("run").await.expect("open shell v2");
+    let out = session.execute().await.expect("execute");
+    assert_eq!(
+        out.stdout, b"split-across-wrtes",
+        "a frame split across two WRTEs must reassemble into one payload"
+    );
+    assert_eq!(out.exit_code, Some(0));
+}
