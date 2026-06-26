@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "verify the shared codec + session preserve the wire-protocol/flow-control contract; check no regression in WRTE/OKAY framing (S1, S3, S4)."}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "verify Raw(String) verbatim passthrough still holds after the service-string builder refactor (S2)."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy config, CI commands, and testing-style bar the changes must pass; gates the codec/sim/selftest tests."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify error propagation in the new session APIs and proxy cancel path matches the per-layer strategy (S3, S4)."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "verify the duplication was actually removed (two ShellChannel enums + two decoders gone), not just wrapped."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "USB and proxy must stay symmetric; this guide frames the cross-path consistency check the convergence is meant to guarantee."}

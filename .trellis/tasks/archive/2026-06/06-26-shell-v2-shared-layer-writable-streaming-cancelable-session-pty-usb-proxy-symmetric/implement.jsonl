@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "shell-v2 inner framing rides the WRTE/OKAY byte stream; the codec + windowed flow-control coupling is the load-bearing contract for the writable/streaming session (S1, S3, S4)."}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "service-string builder (S2) must keep Raw(String) verbatim passthrough for the server frontend; this doc owns the host-protocol request-routing/byte-pipe contract."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "where the new shared shell-v2 codec module + transport-generic session belong in the workspace layout (S1, S3)."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "per-layer error strategy for the new session APIs and the proxy cancel path (S3, S4)."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "new session/codec code must emit via tracing per the established convention."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "this task is fundamentally de-duplication/convergence (delete two ShellChannel enums + two decoders); the reuse guide frames the shared-layer approach."}
