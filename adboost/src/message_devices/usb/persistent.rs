@@ -1976,7 +1976,9 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     /// protocol (separate stdout/stderr + exit code).
     ///
     /// Requests the shell-v2 service (`shell,v2,raw:<cmd>`) and returns a
-    /// [`ShellV2Session`] that decodes the `[id][len][payload]` frames.
+    /// [`ShellV2Session`] that decodes the `[id][len][payload]` frames. The
+    /// returned session is writable (`write_stdin` / `close_stdin`), streaming
+    /// (`read_frame`), and cancelable (drop fires the underlying CLSE).
     ///
     /// # Errors
     ///
@@ -1984,11 +1986,24 @@ impl<T: ADBMessageTransport> PersistentConnection<T> {
     // Labeled span (the per-session `local_id` span is entered inside `open_session`).
     #[tracing::instrument(name = "open_shell_v2", skip(self))]
     pub async fn open_shell_v2(&self, cmd: &str) -> Result<ShellV2Session> {
-        // `ShellV2` formats the service as `shell,v2,raw:<cmd>` (shell-v2 inner
-        // framing), vs `ShellCommand` → `shell:<cmd>` (v1, no framing).
-        let command = ADBLocalCommand::ShellV2(ShellV2Service::new(cmd));
+        self.open_shell_v2_service(ShellV2Service::new(cmd)).await
+    }
+
+    /// Open a `shell,v2` session for a fully-specified [`ShellV2Service`] — the
+    /// opt-in path for PTY allocation (`service.with_pty()`) and a custom
+    /// `TERM`. [`open_shell_v2`](Self::open_shell_v2) is the bare-defaults
+    /// convenience wrapper.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Self::open_session`].
+    #[tracing::instrument(name = "open_shell_v2_service", skip(self))]
+    pub async fn open_shell_v2_service(&self, service: ShellV2Service) -> Result<ShellV2Session> {
+        // `ShellV2` formats the service as `shell,v2[,TERM=…][,raw|pty]:<cmd>`
+        // (shell-v2 inner framing), vs `ShellCommand` → `shell:<cmd>` (v1).
+        let command = ADBLocalCommand::ShellV2(service);
         let session = self.open_session(&command).await?;
-        Ok(ShellV2Session::new(session))
+        Ok(crate::message_devices::usb::shell_v2_session::from_multiplexed(session))
     }
 
     /// Convenience: execute a shell command and return stdout + exit code.
