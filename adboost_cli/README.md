@@ -110,7 +110,9 @@ It runs two automated channels per device, then an optional interactive phase:
 
 - **`usb_direct`** — drives a `PersistentUsbConnection` straight to the device
   (no adb server in the path): `shell`, `shell,v2` (separated stdout + exit
-  code), and a SYNC `push`→`pull` round-trip. Validates the library's own stack.
+  code), `shell,v2` **stdin** (a `cat` round-trip: `write_stdin` → stream the
+  echoed stdout frames → `close_stdin` → clean exit on EOF), and a SYNC
+  `push`→`pull` round-trip. Validates the library's own stack.
 - **`through_server`** — stands up adboost's **own** ADB server frontend on an
   ephemeral loopback port (so it never disturbs a real `:5037`) and connects to
   it as a client: `shell`, `push`/`pull`, `list`, `stat`, and a `forward`
@@ -120,12 +122,43 @@ It runs two automated channels per device, then an optional interactive phase:
   interoperates. SKIPPED when `adb` is absent.
 - **`tcpip`** — pre-wired placeholder, reported SKIPPED (pending an emulator
   debug environment).
-- **`interactive`** — USB unplug/replug recovery and reboot recovery (120 s
-  timeout). Each is gated behind a prompt; reboot recovery excludes tcpip
-  devices (their post-reboot reconnect is a separate scenario).
+- **`interactive`** — USB unplug/replug recovery, **PTY-HUP process-group kill**
+  (see below), and reboot recovery (120 s timeout). Each is gated behind a
+  prompt; reboot recovery excludes tcpip devices (their post-reboot reconnect is
+  a separate scenario).
 
 Multiple devices are handled automatically: each addressable device is tested by
 serial (the `-s <serial>` equivalent).
+
+### PTY-HUP verification (`pty_hup_process_group`)
+
+This interactive case proves the hardware/kernel mechanism behind *"local
+disconnect/cancel → the device-side process gets a signal and exits cleanly"* —
+the capability the v1 path could **not** deliver (a CLSE tears down the ADB
+stream but does not signal the remote process group).
+
+What it does, on the operator's confirmation:
+
+1. Opens a **PTY-allocated** `shell,v2` session
+   (`open_shell_v2_service(ShellV2Service::new(cmd).with_pty())`) running
+   `echo READY; exec sleep 3600 <marker>` — so a long-lived `sleep` is the PTY's
+   foreground process group.
+2. Waits for the `READY` stdout frame, then confirms via a fresh `pgrep -f
+   <marker>` shell that the `sleep` is running.
+3. **Drops the session** (the cancel). Host-side close → the device's PTY master
+   closes → the kernel delivers `SIGHUP` to the entire foreground process group.
+4. Polls (up to 10 s) for the `sleep` to disappear. PASS = it is gone (the HUP
+   reached the group); FAIL = still running (and the leaked child is `pkill`ed).
+
+A PASS on **MTK 8676 / Android 16** is the verification target: it confirms
+PTY-HUP reaches the process group on that platform, which is what xdb relies on
+for cancel-driven cleanup (e.g. a `tcpdump`/`su` child exiting and flushing on
+disconnect). Run it with the device on USB and authorized:
+
+```bash
+adb kill-server
+adboost_cli selftest          # answer "yes" at the [pty_hup] prompt
+```
 
 ### Prerequisites
 
