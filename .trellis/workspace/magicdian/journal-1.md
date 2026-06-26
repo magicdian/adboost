@@ -1342,3 +1342,42 @@ Fixed a downstream-reported (xdb) permanent USB DeviceBusy leak: when a Persiste
 ### Next Steps
 
 - None - task complete
+
+
+## Session 32: shell-v2 shared layer: writable/streaming/cancelable + PTY, USB+proxy symmetric
+
+**Date**: 2026-06-26
+**Task**: shell-v2 shared layer: writable/streaming/cancelable + PTY, USB+proxy symmetric
+**Branch**: `main`
+
+### Summary
+
+Converged shell-v2 into one shared layer across USB and proxy. S1: extracted a single ShellChannel(0..5)+encode/decode codec into always-compiled message_devices/, deleted both duplicated enums/decoders. S2: replaced stringly-typed ShellCommand(String,Vec<String>)+hardcoded ,raw: with typed ShellV2Service{cmd,term,ShellPtyMode} (pty/raw mutually exclusive at type level), renders shell,v2[,TERM][,raw|pty]:cmd. S3: ShellV2Session<R,W> generic over split AsyncRead/AsyncWrite with read_frame/write_stdin/close_stdin/execute; USB binds via into_split, cancel=drop. S4: ADBProxyDevice::open_shell_v2_service owns the TcpStream (drop closes socket->EOF), symmetric. S5: sim shell-v2 frame producer (post_open_writes) + end-to-end streaming/mid-drop/split regressions. S6: selftest automated shell_v2_stdin cat round-trip + interactive PTY-HUP process-group case. S7: documented PTY-HUP verification (MTK 8676 operator gate). All quality gates green (352 default + 190 usb tests, clippy default+usb, fmt).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d19d252` | (see git log) |
+| `0f14e92` | (see git log) |
+| `eda01cc` | (see git log) |
+| `4bc153e` | (see git log) |
+| `a3bd4e2` | (see git log) |
+| `227f049` | (see git log) |
+| `b41aa75` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
