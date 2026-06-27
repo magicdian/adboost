@@ -1381,3 +1381,36 @@ Converged shell-v2 into one shared layer across USB and proxy. S1: extracted a s
 ### Next Steps
 
 - None - task complete
+
+
+## Session 33: Fix USB reader timeout dropping raced-completion bytes (shell-v2 PTY desync)
+
+**Date**: 2026-06-27
+**Task**: Fix USB reader timeout dropping raced-completion bytes (shell-v2 PTY desync)
+**Branch**: `main`
+
+### Summary
+
+Root-caused an external bug report: a connection-fatal ConversionError desync under sustained shell-v2 PTY output. The USB reader's per-transfer timeout cancels the in-flight bulk-IN transfer and forces Cancelled status, but a transfer completing in the same instant is drained with real bytes intact; read_into_buffer ran the status->error map before reading actual_len, dropping those bytes -> offset shift -> bad command word -> whole PersistentUsbConnection torn down. Fix: classify completions on (status, byte_count) together via a new pure classify_read_completion (salvage bytes whenever present, ReadTimeout only when genuinely empty), removed the subsumed map_transfer_status, added 6 hardware-free unit tests, tightened framed_read.rs feed-layer invariant doc. Confirmed sim cannot reach this layer (it plugs in above the nusb cancel/drain race). Deferred the larger select!-without-cancel reader refactor as a follow-up. All 355 tests + clippy -D warnings green.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a121461` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 32
-- **Last Active**: 2026-06-26
+- **Total Sessions**: 33
+- **Last Active**: 2026-06-27
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1383 | Active |
+| `journal-1.md` | ~1416 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 33 | 2026-06-27 | Fix USB reader timeout dropping raced-completion bytes (shell-v2 PTY desync) | `a121461` | `main` |
 | 32 | 2026-06-26 | shell-v2 shared layer: writable/streaming/cancelable + PTY, USB+proxy symmetric | `d19d252`, `0f14e92`, `eda01cc`, `4bc153e`, `a3bd4e2`, `227f049`, `b41aa75` | `main` |
 | 31 | 2026-06-26 | Release USB claim on PersistentConnection half-death edge | `0a16916` | `fix/persistent-release-claim-on-half-death` |
 | 30 | 2026-06-24 | backend hook: local-service reject reason | `6d5ee3e` | `main` |
