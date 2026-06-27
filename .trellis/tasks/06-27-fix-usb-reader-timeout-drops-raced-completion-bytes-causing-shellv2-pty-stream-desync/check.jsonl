@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/06-27-fix-usb-reader-timeout-drops-raced-completion-bytes-causing-shellv2-pty-stream-desync/prd.md", "reason": "Acceptance criteria + ADR to verify the implementation against (salvage-before-decide, pure fn, 3 unit cases, doc update, out-of-scope respected)."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify clippy/test/lint bar, Edition 2024 / MSRV 1.88.0 compliance, and testing style for the new pure fn + unit tests."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify the salvage classifier returns the correct RustADBError variants (ReadTimeout vs propagated transfer error) per the layer's conventions."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Verify the framing/cancel-safety invariant is honored — no mid-frame ReadTimeout, lossless feed — and the framed_read.rs doc reflects the feed-layer salvage contract."}

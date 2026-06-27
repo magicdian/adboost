@@ -297,10 +297,12 @@ impl USBTransport {
 /// drain it — a cancelled transfer is still returned from `next_complete`, so
 /// the endpoint queue returns to `pending() == 0` and is never left with a
 /// dangling transfer. We then force the status to `TransferError::Cancelled`,
-/// which [`map_transfer_status`] turns into [`RustADBError::ReadTimeout`],
+/// which [`classify_read_completion`] turns into [`RustADBError::ReadTimeout`]
+/// **only when the drained completion carried no bytes** — a completion that
+/// completed in the same instant the timer fired is drained with its real bytes
+/// intact and those are salvaged losslessly (see [`classify_read_completion`]),
 /// preserving the timeout-vs-disconnect distinction the persistent reader loop
-/// relies on (even in the rare race where the transfer completed during
-/// cancellation, a timeout must never surface as a successful transfer).
+/// relies on while never dropping bytes that are genuinely on the wire.
 async fn transfer_with_timeout<Dir>(
     endpoint: &mut nusb::Endpoint<Bulk, Dir>,
     buf: Buffer,
@@ -324,28 +326,10 @@ where
     }
 }
 
-/// Map a `nusb` transfer status into the crate error type.
-///
-/// `TransferError::Cancelled` is what a timed-out transfer surfaces (see
-/// [`transfer_with_timeout`]); it is translated to the transport-neutral
-/// [`RustADBError::ReadTimeout`] (per the
-/// [`ADBMessageTransport::read_message_with_timeout`] contract) so callers
-/// (notably the persistent reader loop) can distinguish a normal timeout from a
-/// genuine disconnect via a structured match instead of string matching.
-///
-/// [`ADBMessageTransport::read_message_with_timeout`]: crate::message_devices::adb_message_transport::ADBMessageTransport::read_message_with_timeout
-fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result<()> {
-    match status {
-        Ok(()) => Ok(()),
-        Err(TransferError::Cancelled) => Err(RustADBError::ReadTimeout),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Map a `nusb` write-transfer status into the crate error type, with frame-atomic
 /// timeout semantics (Scheme B).
 ///
-/// Unlike the read path ([`map_transfer_status`]), a write timeout's meaning
+/// Unlike the read path ([`classify_read_completion`]), a write timeout's meaning
 /// depends on WHERE in the frame it lands. `at_frame_start` is true only for the
 /// frame's first transfer (zero bytes committed):
 /// - a timed-out transfer (`Cancelled`) at the start gate → recoverable
@@ -355,8 +339,8 @@ fn map_transfer_status(status: std::result::Result<(), TransferError>) -> Result
 ///   (the frame is truncated and unrecoverable);
 /// - any non-timeout transfer error → the usual [`RustADBError::UsbTransferError`].
 ///
-/// This is why the write path must NOT reuse `map_transfer_status` (which would
-/// turn every write `Cancelled` into the read-path `ReadTimeout`).
+/// This is why the write path must NOT reuse the read-path classification (which
+/// would turn every write `Cancelled` into the read-path `ReadTimeout`).
 fn map_write_status(
     status: std::result::Result<(), TransferError>,
     at_frame_start: bool,
@@ -514,6 +498,63 @@ impl ADBMessageTransport for USBTransport {
     }
 }
 
+/// What to do with a single bulk-IN completion, decided purely from its
+/// `(status, received_len)` — no I/O, no endpoint, so it is unit-testable
+/// without `nusb` or hardware (see tests).
+///
+/// The load-bearing case is [`Self::Salvage`]: a completion that carries bytes
+/// (`received_len > 0`) MUST have those bytes pushed into the [`FrameReadBuffer`]
+/// **even when its status is `Cancelled`** (a timed-out transfer). See
+/// [`classify_read_completion`] for why.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadCompletionAction {
+    /// The completion carries bytes: push them into the buffer and return `Ok`.
+    /// Reached for a successful transfer AND for a timed-out (`Cancelled`)
+    /// transfer that nonetheless drained real bytes — both are lossless.
+    Salvage,
+    /// An empty timed-out transfer: the transport-neutral idle signal. The
+    /// persistent reader loop treats this as `continue`.
+    Timeout,
+    /// A successful transfer that returned zero bytes — would spin forever.
+    Eof,
+    /// A genuine (non-timeout) transfer failure: propagate it unchanged.
+    Error(TransferError),
+}
+
+/// Decide what to do with a bulk-IN completion from its status and byte count.
+///
+/// # Why a timed-out completion can still carry bytes (the desync this prevents)
+///
+/// [`transfer_with_timeout`] implements the per-transfer timeout by calling
+/// `endpoint.cancel_all()` then draining the transfer with `next_complete()`,
+/// and **forcing** `status: Err(TransferError::Cancelled)` on the result. But a
+/// transfer that completed in the same instant the timer fired is drained with
+/// its real `actual_len` intact — the forced `Cancelled` masks bytes that are
+/// genuinely on the wire. The old code ran `map_transfer_status(status)?`
+/// BEFORE looking at `actual_len`, so on that race it returned `ReadTimeout` and
+/// dropped the drained bytes; the next read then resumed one chunk late and
+/// parsed a header out of mid-payload bytes → `ConversionError` → a fatal reader
+/// exit that tore down the whole multiplexed connection (the shell-v2 PTY
+/// streaming desync). Classifying on `(status, received_len)` together makes the
+/// timeout path lossless: bytes are salvaged whenever present, and `ReadTimeout`
+/// is reported only for a genuinely empty timed-out completion.
+fn classify_read_completion(
+    status: std::result::Result<(), TransferError>,
+    received_len: usize,
+) -> ReadCompletionAction {
+    match status {
+        // Real bytes are real regardless of status: a successful transfer OR a
+        // timed-out one that still drained data both salvage losslessly.
+        _ if received_len > 0 => ReadCompletionAction::Salvage,
+        // Empty + timed-out → the idle ReadTimeout signal.
+        Err(TransferError::Cancelled) => ReadCompletionAction::Timeout,
+        // Empty + a genuine transfer failure → propagate it.
+        Err(e) => ReadCompletionAction::Error(e),
+        // Empty + success → no data with no error would spin forever.
+        Ok(()) => ReadCompletionAction::Eof,
+    }
+}
+
 /// Issue ONE bulk IN transfer and append everything it returns to `buffer`.
 ///
 /// `nusb` requires the requested length of an IN transfer to be a nonzero
@@ -533,6 +574,11 @@ impl ADBMessageTransport for USBTransport {
 /// later transfer in the same field timed out, desyncing the stream. Pushing
 /// every received byte into the persistent `FrameReadBuffer` makes a timed-out
 /// transfer lossless: the buffer keeps what arrived and the next call resumes.
+///
+/// The completion is classified by [`classify_read_completion`] from
+/// `(status, actual_len)` so a timed-out transfer that nonetheless drained bytes
+/// salvages them BEFORE the timeout is reported — the lossless feed contract the
+/// shared [`FrameReadBuffer`] relies on.
 async fn read_into_buffer(
     endpoint: &mut nusb::Endpoint<Bulk, In>,
     buffer: &mut FrameReadBuffer,
@@ -545,19 +591,23 @@ async fn read_into_buffer(
     // buffer either way, so the exact request size only trades transfer count.
     let request_len = aligned_request_len(READ_TRANSFER_LEN, max_packet_size);
     let completion = transfer_with_timeout(endpoint, Buffer::new(request_len), timeout).await;
-    map_transfer_status(completion.status)?;
 
     let received = &completion.buffer[..completion.actual_len];
-    if received.is_empty() {
-        // A zero-length completion with no error would otherwise spin forever.
-        return Err(RustADBError::IOError(std::io::Error::new(
+    match classify_read_completion(completion.status, received.len()) {
+        // Salvage bytes BEFORE surfacing any timeout: a completion that drained
+        // data on the timeout race is lossless. This is the fix for the
+        // shell-v2 PTY streaming `ConversionError` desync.
+        ReadCompletionAction::Salvage => {
+            buffer.push(received);
+            Ok(())
+        }
+        ReadCompletionAction::Timeout => Err(RustADBError::ReadTimeout),
+        ReadCompletionAction::Eof => Err(RustADBError::IOError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "USB bulk read returned no data",
-        )));
+        ))),
+        ReadCompletionAction::Error(e) => Err(e.into()),
     }
-
-    buffer.push(received);
-    Ok(())
 }
 
 /// Round `remaining` up to a nonzero multiple of `max_packet_size`.
@@ -571,7 +621,9 @@ fn aligned_request_len(remaining: usize, max_packet_size: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{aligned_request_len, map_transfer_status, map_write_status};
+    use super::{
+        ReadCompletionAction, aligned_request_len, classify_read_completion, map_write_status,
+    };
     use crate::RustADBError;
     use nusb::transfer::TransferError;
 
@@ -620,30 +672,56 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_status_maps_to_read_timeout() {
-        // The reader loop relies on this: a timed-out transfer surfaces as
+    fn timed_out_completion_carrying_bytes_is_salvaged_not_a_timeout() {
+        // The load-bearing regression: a transfer that completed in the same
+        // instant the timer fired is drained with its real bytes intact but its
+        // status is forcibly `Cancelled` (see `transfer_with_timeout`). Those
+        // bytes are genuinely on the wire and MUST be salvaged, NOT dropped —
+        // dropping them shifts the read offset and desyncs the framed stream
+        // (the shell-v2 PTY `ConversionError` connection-fatal bug). With
+        // `received_len > 0`, a `Cancelled` status classifies as Salvage.
+        assert_eq!(
+            classify_read_completion(Err(TransferError::Cancelled), 64),
+            ReadCompletionAction::Salvage,
+            "a Cancelled completion that drained bytes must salvage them, not time out"
+        );
+    }
+
+    #[test]
+    fn successful_completion_with_bytes_is_salvaged() {
+        assert_eq!(
+            classify_read_completion(Ok(()), 64),
+            ReadCompletionAction::Salvage,
+            "a successful transfer with bytes must salvage them"
+        );
+    }
+
+    #[test]
+    fn empty_cancelled_completion_is_read_timeout() {
+        // The reader loop relies on this: an EMPTY timed-out transfer surfaces as
         // `TransferError::Cancelled` and MUST become the transport-neutral
-        // `RustADBError::ReadTimeout` so a normal poll timeout is not
-        // misclassified as a disconnect.
-        let mapped = map_transfer_status(Err(TransferError::Cancelled));
-        assert!(
-            matches!(mapped, Err(RustADBError::ReadTimeout)),
-            "Cancelled must map to ReadTimeout, got {mapped:?}"
+        // `ReadTimeout` so a normal idle poll is not misclassified as a disconnect.
+        assert_eq!(
+            classify_read_completion(Err(TransferError::Cancelled), 0),
+            ReadCompletionAction::Timeout,
+            "an empty Cancelled completion is the idle ReadTimeout signal"
         );
     }
 
     #[test]
-    fn ok_status_maps_to_ok() {
-        assert!(
-            map_transfer_status(Ok(())).is_ok(),
-            "successful transfer must map to Ok"
+    fn empty_successful_completion_is_eof() {
+        // A zero-length completion with no error would otherwise spin forever.
+        assert_eq!(
+            classify_read_completion(Ok(()), 0),
+            ReadCompletionAction::Eof,
+            "an empty successful completion must be EOF, not Salvage"
         );
     }
 
     #[test]
-    fn other_transfer_errors_are_not_timeouts() {
-        // A genuine disconnect / stall must NOT be classified as a timeout,
-        // otherwise the reader loop would keep looping on a dead pipe.
+    fn empty_completion_with_real_error_propagates_unchanged() {
+        // A genuine disconnect / stall on an EMPTY completion must NOT be a
+        // timeout, otherwise the reader loop would keep looping on a dead pipe.
         for err in [
             TransferError::Disconnected,
             TransferError::Stall,
@@ -651,12 +729,25 @@ mod tests {
             TransferError::InvalidArgument,
             TransferError::Unknown(0),
         ] {
-            let mapped = map_transfer_status(Err(err));
-            assert!(
-                matches!(mapped, Err(RustADBError::UsbTransferError(_))),
-                "{err:?} must map to UsbTransferError (not ReadTimeout), got {mapped:?}"
+            assert_eq!(
+                classify_read_completion(Err(err), 0),
+                ReadCompletionAction::Error(err),
+                "{err:?} on an empty completion must propagate as the transfer error"
             );
         }
+    }
+
+    #[test]
+    fn transfer_error_with_bytes_still_salvages_first() {
+        // Bytes drained alongside a non-timeout error are still real wire bytes:
+        // salvage them so the stream stays aligned (the next read surfaces the
+        // error once the completion is genuinely empty). `received_len > 0` wins
+        // over the error arm by construction.
+        assert_eq!(
+            classify_read_completion(Err(TransferError::Disconnected), 32),
+            ReadCompletionAction::Salvage,
+            "bytes present must be salvaged regardless of the accompanying error"
+        );
     }
 
     #[test]

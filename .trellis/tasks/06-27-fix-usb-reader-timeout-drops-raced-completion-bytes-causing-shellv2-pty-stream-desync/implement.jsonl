@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/06-27-fix-usb-reader-timeout-drops-raced-completion-bytes-causing-shellv2-pty-stream-desync/prd.md", "reason": "The task spec: root cause, requirements, acceptance criteria, ADR, and the salvage-fn design decision."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Framing/cancel-safety context — the 24-byte header + data_length framing and why a single mis-aligned frame is connection-fatal; the timeout-vs-desync invariant this fix restores."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "RustADBError variant conventions — the salvage classifier returns ReadTimeout (idle) vs propagates UsbTransferError (fatal); must follow the enum + #[from] idiom."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Edition 2024 / MSRV 1.88.0 / clippy + testing style the pure salvage fn and its unit tests must conform to."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "tracing emit-only conventions — any trace added on the salvage path must use tracing, not log, and follow the span/level conventions."}

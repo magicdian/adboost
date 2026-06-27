@@ -29,6 +29,26 @@
 //! retry. Because the buffer lives on the transport (not on the call stack), a
 //! cancelled chunk read loses nothing — every received byte is already buffered.
 //!
+//! # The feed-layer obligation (cancel-safety is only as strong as the feed)
+//!
+//! The buffer's losslessness holds **only if the feed layer pushes every byte a
+//! transfer actually delivered, including a transfer that timed out.** A chunk
+//! read that is cancelled to enforce a per-transfer timeout can still complete
+//! with real bytes (the transfer landed in the same instant the timer fired). The
+//! feed layer MUST push those bytes into [`push`](FrameReadBuffer::push) *before*
+//! surfacing the timeout — it MUST NOT return [`RustADBError::ReadTimeout`] while
+//! discarding a timed-out completion's payload. Doing so drops bytes that are
+//! genuinely on the wire, so the next read resumes at a shifted offset and
+//! [`try_parse`](FrameReadBuffer::try_parse) decodes a header out of mid-payload
+//! bytes → a fatal [`RustADBError::ConversionError`] that tears the whole
+//! multiplexed connection down. The USB transport hit exactly this: it ran its
+//! status→error mapping before reading the drained byte count and dropped the
+//! raced bytes, manifesting as an intermittent connection-fatal desync under
+//! sustained shell-v2 PTY output. The fix classifies a completion on
+//! `(status, byte_count)` together so bytes are always salvaged first (see
+//! `usb_transport::classify_read_completion`). A `ReadTimeout` is therefore only
+//! ever correct for a timed-out completion that delivered **zero** bytes.
+//!
 //! [`ADBMessageTransport`]: crate::message_devices::adb_message_transport::ADBMessageTransport
 
 use crate::{
