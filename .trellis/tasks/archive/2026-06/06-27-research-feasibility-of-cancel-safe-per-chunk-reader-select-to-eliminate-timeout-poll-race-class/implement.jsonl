@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/06-27-research-feasibility-of-cancel-safe-per-chunk-reader-select-to-eliminate-timeout-poll-race-class/prd.md", "reason": "The research brief: 6 research questions, hard constraints (reverted naive select!), and the go/no-go acceptance bar."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Framing/cancel-safety invariant the reader must preserve — the 24-byte header + data_length frame is the unit that must never be cancelled mid-flight; grounds RQ2/RQ3."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Device/transport trait layering + USB vs TCP split — a trait change is a two-transport change; grounds RQ3."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Testing-style + feature-gate conventions any proposed design's test strategy must fit; grounds RQ6 test-reachability."}

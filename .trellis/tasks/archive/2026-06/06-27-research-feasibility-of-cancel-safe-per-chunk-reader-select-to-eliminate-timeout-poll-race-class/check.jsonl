@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/06-27-research-feasibility-of-cancel-safe-per-chunk-reader-select-to-eliminate-timeout-poll-race-class/prd.md", "reason": "Verify the deliverable answers all 6 research questions, honors the reverted-naive-select constraint, and gives an explicit go/no-go."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Verify any proposed design preserves the framing/cancel-safety invariant (no mid-frame cancellation)."}
