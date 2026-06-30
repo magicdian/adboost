@@ -259,6 +259,55 @@ before its session's first frame is routed (otherwise the reply misroutes to the
 device-OPEN queue). Frame-read latency bounds how long a queued control message
 waits, which is short.
 
+### Design Decision: the timeout-poll reader is intentionally correct — do NOT "fix" it with a chunk-level `select!`
+
+**Context.** The reader uses a 1s per-transfer read timeout purely to return to
+its `drain_control` / death-observation point between frames. On timeout the USB
+path cancels the idle in-flight bulk transfer. A transfer that completes in the
+**same instant** the timer fires is drained with real bytes but a forced
+`Cancelled` status; if those bytes are dropped, the next read resumes at a shifted
+offset → a header is decoded out of mid-payload bytes → fatal `ConversionError`
+that tears down the whole multiplexed connection (the shell-v2 PTY streaming
+desync, `ping -c5 -W2` whose ~1s output cadence matched the 1s poll). See
+[[timeout-cancel-drops-raced-bytes]].
+
+**Resolution (shipped).** The feed layer is **lossless**: a completion is
+classified on `(status, byte_count)` *together* (`usb_transport::classify_read_completion`)
+so any drained bytes are salvaged into the persistent `FrameReadBuffer` BEFORE a
+`ReadTimeout` is reported. `ReadTimeout` is correct only for a genuinely empty
+timed-out completion. Combined with `drain_control` running between frames (and
+again before classify), this is a **coherent, deliberate** correct design — not a
+patch over a hazard. After the salvage fix the cancel-an-idle-transfer-to-poll
+race is harmless.
+
+**The tempting "root-cause" refactor was investigated and DEFERRED (NO-GO).**
+Replacing the timeout-poll with `select!`(cancel-safe `read_chunk()`, `control_rx`,
+`closed.wait()`) — so a transfer is never cancelled merely to poll — is feasible
+and elegant (nusb `next_complete()` is source-confirmed cancel-safe; a pending
+transfer survives a dropped future and is re-awaited intact; the death edge
+becomes strictly more prompt). It does **not** reproduce the reverted
+whole-frame-`select!` WRTE-corruption bug, because the cancellation unit drops from
+a multi-transfer **frame** (lossy) to a single **transfer** between frames
+(lossless — every byte is already in `FrameReadBuffer`). **But it is a cleanup, not
+a bug fix**: the race is already correct post-salvage; the efficiency gain (one 1Hz
+idle cancel+resubmit) is negligible; and the latency gain (control-apply "≤ one
+frame" → "immediate") is **non-load-bearing for every current consumer**
+(register-before-route is enforced by `drain_control`-before-classify, not by
+control-apply latency). Against the project bar ([[prefer-root-cause-fix-at-contract-layer]],
+[[user-maintainer-profile]]) it is not worth the two-transport contract risk + the
+`next_complete()`-panics-on-empty-queue footgun + the fact that its core safety
+property is only fully verifiable on hardware.
+
+> **Gotcha for a future contributor**: the 1s timeout-poll + idle-transfer cancel
+> is NOT an unfixed hazard — it is harmless given the salvage feed. Do not "clean it
+> up" with a naive `select!` against the **whole-frame** read: that exact attempt was
+> tried and reverted (it corrupted an in-flight WRTE; see the section above). The
+> validated *chunk-level* `select!` design is the reserved upgrade path, but only
+> flip to it when a **real driver** appears (a consumer that genuinely needs
+> sub-frame control-apply latency, or a measured cost in the 1Hz idle wake). The full
+> design + risk analysis is preserved in the task research under
+> `06-27-research-feasibility-of-cancel-safe-per-chunk-reader-select-*`.
+
 ## A transport MUST let a blocked read and a concurrent write proceed independently
 
 The persistent multiplexer spawns a reader task and a writer task, each holding a
