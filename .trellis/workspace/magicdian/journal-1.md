@@ -1414,3 +1414,36 @@ Root-caused an external bug report: a connection-fatal ConversionError desync un
 ### Next Steps
 
 - None - task complete
+
+
+## Session 34: Feasibility study: cancel-safe per-chunk reader select (NO-GO, design reserved)
+
+**Date**: 2026-06-30
+**Task**: Feasibility study: cancel-safe per-chunk reader select (NO-GO, design reserved)
+**Branch**: `main`
+
+### Summary
+
+Evaluated whether to do the root-cause refactor deferred by the prior salvage fix: have the USB reader select! a cancel-safe per-chunk read primitive vs control/death, so a bulk transfer is never cancelled merely to poll. Ran two parallel trellis-research strands (nusb source cancel-safety; in-repo design/risk), synthesized go/no-go. Verdict NO-GO: the design is feasible and elegant (nusb next_complete is source-confirmed cancel-safe; minimal 2-method trait delta; death observation becomes strictly more prompt; does NOT reproduce the reverted whole-frame-select WRTE-corruption because the cancellation unit drops to a single transfer) — but it is a cleanup not a bug fix (race already correct post-salvage), with negligible/non-load-bearing benefit and real two-transport contract risk plus a next_complete-panics-on-empty footgun. Took the NO-GO branch: documented the current timeout-poll+salvage design as intentionally-correct in the wire-protocol contract spec, with a gotcha warning future contributors off the reverted naive select and reserving the validated chunk-select as an upgrade path gated on a real driver. No production code changed.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `229df75` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

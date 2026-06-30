@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 33
-- **Last Active**: 2026-06-27
+- **Total Sessions**: 34
+- **Last Active**: 2026-06-30
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1416 | Active |
+| `journal-1.md` | ~1449 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 34 | 2026-06-30 | Feasibility study: cancel-safe per-chunk reader select (NO-GO, design reserved) | `229df75` | `main` |
 | 33 | 2026-06-27 | Fix USB reader timeout dropping raced-completion bytes (shell-v2 PTY desync) | `a121461` | `main` |
 | 32 | 2026-06-26 | shell-v2 shared layer: writable/streaming/cancelable + PTY, USB+proxy symmetric | `d19d252`, `0f14e92`, `eda01cc`, `4bc153e`, `a3bd4e2`, `227f049`, `b41aa75` | `main` |
 | 31 | 2026-06-26 | Release USB claim on PersistentConnection half-death edge | `0a16916` | `fix/persistent-release-claim-on-half-death` |
