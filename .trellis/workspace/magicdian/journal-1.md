@@ -1447,3 +1447,36 @@ Evaluated whether to do the root-cause refactor deferred by the prior salvage fi
 ### Next Steps
 
 - None - task complete
+
+
+## Session 35: Fix multi-device forward via device-pinned host-serial scoping (DeviceSelector)
+
+**Date**: 2026-07-01
+**Task**: Fix multi-device forward via device-pinned host-serial scoping (DeviceSelector)
+**Branch**: `main`
+
+### Summary
+
+External bug: ADBProxyDevice::forward failed 'more than one device/emulator' with >=2 devices — it sent host:transport:<serial> then a bare host:forward, but host:forward is a HOST service the server does not bind to the selected transport (shell/sync work because they are device services). Root-cause fix at the contract layer: new DeviceSelector{TransportId|Serial|Any} as the single source of transport_id->serial->any precedence, rendering transport_switch_command() (device services) and host_prefix() (device-pinned host services). Moved Forward/KillForward/KillForwardAll from ADBLocalCommand to ADBHostCommand with named {selector,local,remote} fields, emitting host-serial:<s>:forward:<l>;<r>. Kept killforward-all GLOBAL (AOSP is process-global; verified via research subagent against android-14 source). reverse unchanged (genuine device service). Wire-string unit tests are the regression net (NOT sim — own frontend tolerates the hack, which is why the bug escaped). selftest uses asymmetric ports + scoped killforward. clippy/fmt/365 lib+22 CLI tests green. Also PROVEN a separate CLI arg-order swap bug (local_commands.rs:35 passes local/remote reversed vs reverse arm) — filed as follow-up task, not fixed here (one bug/one commit). Spec + memory (forward-is-device-pinned-host-service) recorded.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b44bf4a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
