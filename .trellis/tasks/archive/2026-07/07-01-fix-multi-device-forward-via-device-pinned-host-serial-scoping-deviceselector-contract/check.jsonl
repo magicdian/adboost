@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Verify emitted forward/killforward wire strings conform to the host-serial/host-transport-id pinned-prefix contract and AOSP error semantics."}
+{"file": ".trellis/spec/backend/adb-wire-protocol-contract.md", "reason": "Assert exact wire strings (host-serial:<serial>:forward:tcp:<local>;tcp:<remote>, killforward form) match AOSP; no accidental norebind."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Enforced clippy(pedantic)/fmt/test bar + testing style; the new wire-string unit tests and selftest case must comply."}
+{"file": ".trellis/tasks/07-01-fix-multi-device-forward-via-device-pinned-host-serial-scoping-deviceselector-contract/research/native-adb-forward-norebind.md", "reason": "Ground truth to check the rebind (no-norebind) decision and reverse-family untouched."}
