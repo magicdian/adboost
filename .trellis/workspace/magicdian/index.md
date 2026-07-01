@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 35
+- **Total Sessions**: 36
 - **Last Active**: 2026-07-01
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1482 | Active |
+| `journal-1.md` | ~1515 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 36 | 2026-07-01 | Fix CLI forward arg-order swap (local/remote reversed to library) | `6fcb0b7` | `main` |
 | 35 | 2026-07-01 | Fix multi-device forward via device-pinned host-serial scoping (DeviceSelector) | `b44bf4a` | `main` |
 | 34 | 2026-06-30 | Feasibility study: cancel-safe per-chunk reader select (NO-GO, design reserved) | `229df75` | `main` |
 | 33 | 2026-06-27 | Fix USB reader timeout dropping raced-completion bytes (shell-v2 PTY desync) | `a121461` | `main` |

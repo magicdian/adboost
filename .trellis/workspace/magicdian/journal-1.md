@@ -1480,3 +1480,36 @@ External bug: ADBProxyDevice::forward failed 'more than one device/emulator' wit
 ### Next Steps
 
 - None - task complete
+
+
+## Session 36: Fix CLI forward arg-order swap (local/remote reversed to library)
+
+**Date**: 2026-07-01
+**Task**: Fix CLI forward arg-order swap (local/remote reversed to library)
+**Branch**: `main`
+
+### Summary
+
+Follow-up to the multi-device forward fix. CLI forward handler passed (local, remote) into the remote-first library forward(remote, local), so 'adb forward tcp:1111 tcp:2222' emitted host:forward:tcp:2222;tcp:1111 (ports swapped); adjacent reverse arm was already correct, only forward slipped (shipped 19aa24a), single-port selftest masked it. Investigated both consumers before deciding: research subagent confirmed native adb CLI is 'forward LOCAL REMOTE' (local-first) / 'reverse REMOTE LOCAL' (remote-first), mirrors sharing one wire mapping — adboost_cli clap defs already match. Read xdb source (/Volumes/MagicWork/.../xpeng-debug-bridge): xdb calls library forward() DIRECTLY and correctly (forward_tcp -> forward(remote,local), with a comment) and pins adboost by git rev — so flipping the library signature would silently break xdb. Chose option 1 (fix at the call site, library API unchanged). Routed the arm through a pure forward_library_args(local,remote)->(remote,local) helper so the CLI-library order cross is named, documented, and locked by a unit test with asymmetric ports (handler needs a live device, not unit-testable inline). clippy pedantic + fmt + 23 CLI tests + library forward/reverse tests all green. trellis-implement + trellis-check subagents both PASS; check independently validated the helper is warranted (not over-engineered) given a positional swap already shipped.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6fcb0b7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
