@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/07-01-fix-cli-forward-arg-order-swap-local-remote-passed-reversed-to-library-forward/research/native-adb-forward-cli-argorder.md", "reason": "Native adb CLI arg order: forward LOCAL REMOTE (local-first), reverse REMOTE LOCAL (remote-first). Confirms adboost_cli clap defs already match; only the handler call-site order is wrong."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "CLI definitions-vs-behavior split (models/ = clap defs, handlers/ = execution); forward-is-device-pinned-host-service convention + the arg-swap gotcha this task fixes."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Enforced clippy(pedantic)/fmt/test bar the regression test must meet."}

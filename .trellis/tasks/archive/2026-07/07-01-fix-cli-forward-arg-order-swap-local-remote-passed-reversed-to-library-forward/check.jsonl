@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/07-01-fix-cli-forward-arg-order-swap-local-remote-passed-reversed-to-library-forward/research/native-adb-forward-cli-argorder.md", "reason": "Verify the fixed handler produces the native-correct LOCAL;REMOTE order and did not disturb the reverse arm."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy(pedantic)/fmt/test gate the fix + regression test must pass."}

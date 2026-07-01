@@ -23,25 +23,41 @@ handler so the CLI forwards the ports in the order the user gave.
 - Single-port selftest (`selftest/mod.rs`, calls the library directly, symmetric
   ports) masked it end-to-end.
 
-## Decision needed (blocking): where to fix
+## Decision (RESOLVED by evidence): fix at the call site (option ①)
 
-Two ways to make the CLI correct — pick one, they are NOT both:
+Two ways to make the CLI correct:
 1. **Swap at the call site** (`local_commands.rs:35`): `forward(remote, local)`.
-   Smallest; library signature (remote-first) unchanged; matches the `reverse`
-   arm exactly.
-2. **Flip the library signature** to `forward(local, remote)` (+ its callers /
-   `selftest` / xdb). Larger blast radius; touches the public API + downstream.
+   Library signature (remote-first) unchanged; matches the `reverse` arm exactly.
+2. **Flip the library signature** to `forward(local, remote)`.
 
-Recommend **(1)** — the bug is purely in the handler; the library + its new
-`ADBHostCommand::Forward` are already correct and unit-tested. Confirm before
-implementing.
+**Chosen: (1).** Evidence makes (2) actively unsafe:
 
-## Downstream sync
+- **xdb calls the library `forward()` directly and ALREADY correctly** — with an
+  explicit comment. `xdb-core/src/adb.rs:417-427`:
+  ```rust
+  pub async fn forward_tcp(&mut self, local_port: u16, remote_port: u16) -> Result<()> {
+      // adboost: forward(remote, local) — param order reversed from CLI
+      let remote_str = format!("tcp:{}", remote_port);
+      let local_str  = format!("tcp:{}", local_port);
+      self.device.forward(remote_str, local_str).await …
+  ```
+  Flipping the library signature would SILENTLY break xdb (its
+  local/remote would swap). xdb pins adboost by git rev, so a signature flip is a
+  breaking change to the one confirmed downstream, to fix a bug that is NOT in the
+  library.
+- The library `forward(remote, local)` + `reverse(remote, local)` share one
+  remote-first convention (both inherent `ADBProxyDevice` methods, not in
+  `ADBDeviceExt`). Option (1) keeps forward/reverse handler arms symmetric.
+- The bug is purely in the CLI handler; the library + `ADBHostCommand::Forward`
+  are already correct and unit-tested (task 07-01-...-deviceselector-contract).
 
-- Maintainer confirmed there is exactly ONE downstream (xdb) and can sync it if
-  the library API changes. If we choose (1), the library API does NOT change, so
-  no downstream sync is needed — only the CLI behavior is corrected. This is
-  another point in favor of (1).
+## Research: native adb CLI arg order (see research file)
+
+`adb forward LOCAL REMOTE` (local-first); `adb reverse REMOTE LOCAL` (remote-first)
+— mirrors sharing one `forward:<arg0>;<arg1>` wire mapping. adboost_cli's clap
+defs already match this: `ForwardCommand::Add { local, remote }` (local-first),
+`ReverseCommand::Add { remote, local }` (remote-first). So ONLY the handler
+call-site order is wrong; the CLI surface is correct and must not change.
 
 ## Acceptance Criteria
 
