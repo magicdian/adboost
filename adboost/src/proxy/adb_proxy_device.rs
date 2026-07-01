@@ -1,6 +1,6 @@
 use crate::{
     ADBTransport, Result,
-    models::{ADBCommand, ADBHostCommand},
+    models::{ADBCommand, DeviceSelector},
     proxy::TCPProxyTransport,
 };
 use std::net::SocketAddrV4;
@@ -71,18 +71,34 @@ impl ADBProxyDevice {
         Ok(&mut self.transport)
     }
 
+    /// How this device is addressed on the ADB host protocol.
+    ///
+    /// The single source of truth for the selection precedence — `transport_id`
+    /// (unique even with duplicate serials) → `identifier` (serial) → auto — shared
+    /// by both the transport switch ([`set_serial_transport`](Self::set_serial_transport))
+    /// and the device-pinned host services (`forward` / `killforward`).
+    pub(crate) fn selector(&self) -> DeviceSelector {
+        if let Some(id) = self.transport_id {
+            DeviceSelector::TransportId(id)
+        } else if let Some(serial) = self.identifier.clone() {
+            DeviceSelector::Serial(serial)
+        } else {
+            DeviceSelector::Any
+        }
+    }
+
     /// Set device connection to use the configured transport.
     ///
     /// Prefers `transport_id` when set (unique even with duplicate serials), then falls back
     /// to `identifier` (serial), and finally to `transport-any` when neither is configured.
+    ///
+    /// This switches the connection into device-transport mode for a subsequent
+    /// *device* service (`shell:`, `sync:`, `reverse:forward:`, …). It is NOT the
+    /// right mechanism for device-pinned *host* services (`forward:` /
+    /// `killforward:`): those must carry their own `host-serial:`/`host-transport-id:`
+    /// prefix (see [`DeviceSelector::host_prefix`]).
     pub(crate) async fn set_serial_transport(&mut self) -> Result<()> {
-        let cmd = if let Some(id) = self.transport_id {
-            ADBHostCommand::TransportId(id)
-        } else if let Some(serial) = self.identifier.clone() {
-            ADBHostCommand::TransportSerial(serial)
-        } else {
-            ADBHostCommand::TransportAny
-        };
+        let cmd = self.selector().transport_switch_command();
         self.connect()
             .await?
             .send_adb_request(&ADBCommand::Host(cmd))

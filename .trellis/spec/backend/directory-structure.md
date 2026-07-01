@@ -176,6 +176,41 @@ were also draining that device, they would race for the same `A_OPEN`s. Reverse'
 **control plane** (build/remove/list rules) is link-agnostic; its **data plane**
 (accept inbound → dial host → bridge) belongs to whoever is the device's server.
 
+### Convention: `forward` is a device-pinned HOST service; `reverse` is a device service
+
+**What**: In the proxy client (`proxy/device_commands/`), address a specific
+device by the correct scoping mechanism for the *service class* — they are NOT
+symmetric:
+
+| Service | Class | How to scope to a device | Wire form |
+|---|---|---|---|
+| `forward` / `killforward` | **device-pinned host** service | the `host-serial:`/`host-transport-id:` **prefix** ([`DeviceSelector::host_prefix`]); **no** `set_serial_transport` first | `host-serial:<s>:forward:<local>;<remote>` |
+| `killforward-all` | **process-global** host service | not device-scoped at all | bare `host:killforward-all` |
+| `shell:` / `sync:` / `reverse:forward:` | **device** service | `set_serial_transport()` (a `host:transport:` switch) first, then the service | `host:transport:<s>` ⏎ `reverse:forward:<r>;<l>` |
+
+**Why**: `host:forward` is a *host* service the server runs; a preceding
+`host:transport:<serial>` switch does NOT bind it to that transport, so the
+server auto-selects and fails `more than one device/emulator` once ≥2 devices are
+attached (the multi-device forward bug). `reverse:forward:` really is issued
+*after* a transport switch (it's a device service), so it stays a plain
+`ADBLocalCommand::Reverse`. `DeviceSelector` (`models/device_selector.rs`) is the
+single source of the `transport_id → serial → any` precedence and renders BOTH
+forms so the precedence is never duplicated.
+
+> **Gotcha — `killforward-all` is GLOBAL, not per-device.** AOSP uses one global
+> listener registry (`remove_all_listeners()` takes no transport); native
+> `adb -s <serial> forward --remove-all` still sends bare `host:killforward-all`.
+> Do NOT "symmetrically" scope it to `host-serial:<serial>:killforward-all` — that
+> is non-standard and wrong. Only `forward` / `killforward` (single rule) scope.
+
+> **Gotcha — don't render a device selector as a positional tuple.** The `Forward`
+> / `KillForward` host commands carry named `{ selector, local, remote }` fields,
+> NOT a `(String, String)` tuple. A positional `(remote, local)` tuple is exactly
+> what let a caller swap the two ports silently (the CLI `forward` arg-order bug);
+> named fields make the swap a compile-visible mismatch.
+
+[`DeviceSelector::host_prefix`]: crate::models::DeviceSelector::host_prefix
+
 ### `ReverseEngine` contract (stable public API)
 
 ```rust

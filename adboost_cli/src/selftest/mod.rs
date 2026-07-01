@@ -325,23 +325,41 @@ async fn run_connect_parity_against_server(reporter: &mut Reporter, addr: std::n
     }
 }
 
-/// Forward control-plane case (through-server only): add an auto-assigned
-/// forward rule via the proxy client, then remove it. This drives the server's
-/// `host:forward` / `host:killforward` family end-to-end through a real client.
+/// Forward control-plane case (through-server only): add a forward rule via the
+/// proxy client, remove it by its local endpoint, then remove-all as cleanup.
+/// This drives the client's device-pinned `forward` / `killforward` family
+/// (`host-serial:<serial>:forward:…` when addressed by serial) end-to-end through
+/// a real server, plus the global `killforward-all`.
 ///
 /// We validate the control plane (rule add/remove succeed) rather than the data
 /// plane: a data-plane test needs a known device-side listener, which is not
 /// guaranteed on an arbitrary device.
+///
+/// **Asymmetric fixed ports (`local != remote`)** are deliberate: a `local;remote`
+/// order slip or a mis-scoped prefix cannot pass silently the way the old
+/// single-port `tcp:0` auto-assign could. **Coverage limit (honest):** driven
+/// against adboost's OWN in-process server, this proves the emitted wire strings
+/// are well-formed and accepted by a real host-protocol parser
+/// (`host-serial:<serial>:forward:…`); it does NOT reproduce the field
+/// `more than one device/emulator` auto-select failure, because that server
+/// tolerates a post-transport bare `host:forward` (the very quirk that let the
+/// bug escape). Reproducing the auto-select needs the official `adb` server,
+/// which cannot co-hold the single USB claim this phase's backend owns. The
+/// determinstic regression net is the wire-string unit test in
+/// `models/adb_host_command.rs`.
 async fn case_forward_control_plane(device: &mut ADBProxyDevice) -> Outcome {
-    // `forward(remote, local)` — local `tcp:0` lets the OS assign the host port.
-    if let Err(e) = device
-        .forward("tcp:5555".to_string(), "tcp:0".to_string())
-        .await
-    {
+    // Fixed, asymmetric host/device ports. `forward(remote, local)`.
+    let local = "tcp:17023".to_string();
+    let remote = "tcp:17024".to_string();
+    if let Err(e) = device.forward(remote, local.clone()).await {
         return Outcome::Failed(format!("forward add failed: {e}"));
     }
-    // Remove all rules (we don't know the assigned local port; remove-all is the
-    // robust teardown and also exercises killforward-all).
+    // Remove that exact rule by its local endpoint — exercises the serial-scoped
+    // `killforward:<local>` path (not just the global remove-all).
+    if let Err(e) = device.forward_remove(local).await {
+        return Outcome::Failed(format!("forward remove-by-local failed: {e}"));
+    }
+    // Global remove-all as robust teardown (also exercises `killforward-all`).
     match device.forward_remove_all().await {
         Ok(()) => Outcome::Passed,
         Err(e) => Outcome::Failed(format!("forward remove-all failed: {e}")),

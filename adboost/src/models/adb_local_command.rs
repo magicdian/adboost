@@ -85,9 +85,6 @@ pub enum ADBLocalCommand {
     Exec(String),
     Sync,
     Reboot(RebootType),
-    Forward(String, String),
-    ForwardRemove(String),
-    ForwardRemoveAll,
     Reverse(String, String),
     ReverseRemove(String),
     ReverseRemoveAll,
@@ -154,11 +151,6 @@ impl Display for ADBLocalCommand {
                 }
                 write!(f, " -S {size}")
             }
-            Self::Forward(remote, local) => {
-                write!(f, "host:forward:{local};{remote}")
-            }
-            Self::ForwardRemove(local) => write!(f, "host:killforward:{local}"),
-            Self::ForwardRemoveAll => write!(f, "host:killforward-all"),
             Self::Reverse(remote, local) => {
                 write!(f, "reverse:forward:{remote};{local}")
             }
@@ -184,17 +176,22 @@ impl Display for ADBLocalCommand {
 }
 
 #[test]
-fn test_forward_remove_command() {
-    let command = ADBLocalCommand::ForwardRemove("tcp:7100".to_string());
-
-    assert_eq!(command.to_string(), "host:killforward:tcp:7100");
-}
-
-#[test]
 fn test_reverse_remove_command() {
     let command = ADBLocalCommand::ReverseRemove("tcp:7100".to_string());
 
     assert_eq!(command.to_string(), "reverse:killforward:tcp:7100");
+}
+
+// Regression guard: unlike `forward`, `reverse:forward:` is a genuine
+// device-transport-scoped service (issued AFTER a `host:transport:` switch), so
+// it must stay a plain `reverse:` local command and must NOT gain a
+// `host-serial:` prefix. Locks that the forward fix did not "symmetrically"
+// touch reverse.
+#[test]
+fn reverse_add_stays_device_scoped_no_host_prefix() {
+    let command = ADBLocalCommand::Reverse("tcp:7100".to_string(), "tcp:8100".to_string());
+
+    assert_eq!(command.to_string(), "reverse:forward:tcp:7100;tcp:8100");
 }
 
 #[test]
