@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/07-09-support-vsock-socket-spec-in-forward-with-extensible-socketspec-enum/prd.md", "reason": "Acceptance criteria and test strategy to verify against."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Clippy pedantic, test style, formatting rules to check compliance."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error variant conventions to verify new parse errors follow."}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Wire format correctness: forward protocol, list-forward output format."}

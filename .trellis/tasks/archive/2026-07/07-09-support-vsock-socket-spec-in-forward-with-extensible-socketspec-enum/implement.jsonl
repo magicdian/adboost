@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/07-09-support-vsock-socket-spec-in-forward-with-extensible-socketspec-enum/prd.md", "reason": "Task contract: SocketSpec enum design (LocalSocketSpec/RemoteSocketSpec split), implementation plan, acceptance criteria, test strategy."}
+{"file": ".trellis/tasks/07-09-support-vsock-socket-spec-in-forward-with-extensible-socketspec-enum/research/aosp-socket-spec.md", "reason": "AOSP reference: vsock wire format (vsock:<cid>:<port>), local/remote validity rules, string-prefix dispatch pattern we're improving on."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Clippy pedantic, MSRV, edition, inline test style; ensures new socket_spec.rs follows project conventions."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error variant rules: how to add parse errors for socket spec, transport-neutral structured signals."}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Forward wire protocol format (host-serial:<s>:forward:<local>;<remote>), service dispatch, forward registry contract."}
