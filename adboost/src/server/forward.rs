@@ -10,72 +10,73 @@
 //!
 //! `host:forward:[norebind:]<local>;<remote>` asks the server to bind a
 //! host-side TCP listener on `<local>` and, for every inbound connection, open
-//! `<remote>` *on the selected device* and bridge the two. Only `tcp:<port>`
-//! endpoints are supported (the bundled backend opens device services via
-//! `tcp:` — `localabstract:` / `jdwp:` etc. are rejected with a clear FAIL).
+//! `<remote>` *on the selected device* and bridge the two. The remote endpoint
+//! is sent verbatim as the `A_OPEN` service string; supported specs are defined by
+//! [`RemoteSocketSpec`].
 //!
 //! [`DeviceBackend`]: super::DeviceBackend
+//! [`RemoteSocketSpec`]: crate::models::RemoteSocketSpec
 
 use std::collections::HashMap;
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::models::{LocalSocketSpec, RemoteSocketSpec};
+
 /// A parsed `host:forward:...` request (the part after `forward:`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ForwardRequest {
     /// `norebind:` was present — refuse to replace an existing rule for `local_port`.
     pub norebind: bool,
     /// `true` when the requested local endpoint was `tcp:0` (OS auto-assign);
     /// the resolved port is then echoed back to the client.
     pub local_is_zero: bool,
-    /// Host-side local TCP port to listen on (`0` ⇒ auto-assign).
-    pub local_port: u16,
-    /// Device-side remote TCP port to connect to per inbound connection.
-    pub remote_port: u16,
+    /// Host-side local endpoint.
+    pub local: LocalSocketSpec,
+    /// Device-side remote endpoint (sent as service string via `A_OPEN`).
+    pub remote: RemoteSocketSpec,
 }
 
 /// Parse the argument of `host:forward:<arg>` (everything after `forward:`).
 ///
-/// Grammar: `[norebind:]tcp:<local>;tcp:<remote>`. Only `tcp:` endpoints are
-/// supported. Returns the AOSP-style failure reason string on any error (the
-/// caller frames it into a single `FAIL`).
+/// Grammar: `[norebind:]<local>;<remote>`. Returns the AOSP-style failure
+/// reason string on any error (the caller frames it into a single `FAIL`).
 pub(super) fn parse_forward(arg: &str) -> Result<ForwardRequest, String> {
     let (norebind, rest) = match arg.strip_prefix("norebind:") {
         Some(r) => (true, r),
         None => (false, arg),
     };
-    let Some((local, remote)) = rest.split_once(';') else {
+    let Some((local_str, remote_str)) = rest.split_once(';') else {
         return Err(format!("bad forward: {arg}"));
     };
-    let local_port = parse_tcp_endpoint(local).ok_or_else(|| format!("bad forward: {arg}"))?;
-    let remote_port = parse_tcp_endpoint(remote).ok_or_else(|| format!("bad forward: {arg}"))?;
+    let local: LocalSocketSpec = local_str
+        .parse()
+        .map_err(|_| format!("bad forward: {arg}"))?;
+    let remote: RemoteSocketSpec = remote_str
+        .parse()
+        .map_err(|_| format!("bad forward: {arg}"))?;
+    let local_is_zero = local.tcp_port() == 0;
     Ok(ForwardRequest {
         norebind,
-        local_is_zero: local_port == 0,
-        local_port,
-        remote_port,
+        local_is_zero,
+        local,
+        remote,
     })
 }
 
 /// Parse the local endpoint of a `host:killforward:<local>` request — only the
-/// local side is given. Returns the local tcp port or an AOSP-style reason.
-pub(super) fn parse_killforward(arg: &str) -> Result<u16, String> {
-    parse_tcp_endpoint(arg).ok_or_else(|| format!("bad killforward: {arg}"))
-}
-
-/// Parse a single `tcp:<port>` endpoint to its port. `None` for any non-`tcp:`
-/// scheme or unparseable port (the host protocol only bridges tcp here).
-fn parse_tcp_endpoint(s: &str) -> Option<u16> {
-    let port_str = s.strip_prefix("tcp:")?;
-    port_str.parse::<u16>().ok()
+/// local side is given. Returns the parsed spec or an AOSP-style reason.
+pub(super) fn parse_killforward(arg: &str) -> Result<LocalSocketSpec, String> {
+    arg.parse::<LocalSocketSpec>()
+        .map_err(|_| format!("bad killforward: {arg}"))
 }
 
 /// Metadata for one live forward rule, keyed in the registry by its *resolved*
 /// local port. Dropping/aborting `task` tears down the host listener (freeing
 /// the port) and stops accepting new bridged connections.
 struct ForwardRule {
-    remote_port: u16,
+    remote: RemoteSocketSpec,
     serial: String,
     /// The host listener accept loop. Aborted on remove/remove-all.
     task: JoinHandle<()>,
@@ -102,7 +103,7 @@ impl ForwardRegistry {
     pub(super) async fn insert(
         &self,
         local_port: u16,
-        remote_port: u16,
+        remote: RemoteSocketSpec,
         serial: String,
         task: JoinHandle<()>,
     ) {
@@ -110,7 +111,7 @@ impl ForwardRegistry {
         if let Some(old) = rules.insert(
             local_port,
             ForwardRule {
-                remote_port,
+                remote,
                 serial,
                 task,
             },
@@ -175,8 +176,7 @@ impl ForwardRegistry {
     }
 
     /// Render the `host:list-forward` body: one `\n`-terminated line per rule,
-    /// `<serial> tcp:<local> tcp:<remote>\n`, sorted by local port for a stable
-    /// listing.
+    /// `<serial> <local> <remote>\n`, sorted by local port for a stable listing.
     pub(super) async fn list(&self) -> String {
         use std::fmt::Write as _;
         let rules = self.rules.lock().await;
@@ -186,8 +186,8 @@ impl ForwardRegistry {
         for port in ports {
             let rule = &rules[&port];
             let serial = &rule.serial;
-            let remote = rule.remote_port;
-            let _ = writeln!(out, "{serial} tcp:{port} tcp:{remote}");
+            let remote = &rule.remote;
+            let _ = writeln!(out, "{serial} tcp:{port} {remote}");
         }
         out
     }
@@ -205,8 +205,8 @@ mod tests {
             ForwardRequest {
                 norebind: false,
                 local_is_zero: false,
-                local_port: 5555,
-                remote_port: 5556,
+                local: LocalSocketSpec::Tcp(5555),
+                remote: RemoteSocketSpec::Tcp(5556),
             }
         );
     }
@@ -215,22 +215,48 @@ mod tests {
     fn parse_forward_norebind_flag() {
         let r = parse_forward("norebind:tcp:7000;tcp:8000").expect("valid");
         assert!(r.norebind, "norebind: prefix must set the flag");
-        assert_eq!(r.local_port, 7000);
-        assert_eq!(r.remote_port, 8000);
+        assert_eq!(r.local, LocalSocketSpec::Tcp(7000));
+        assert_eq!(r.remote, RemoteSocketSpec::Tcp(8000));
     }
 
     #[test]
     fn parse_forward_local_zero_is_flagged() {
         let r = parse_forward("tcp:0;tcp:9000").expect("valid");
         assert!(r.local_is_zero, "tcp:0 local must flag auto-assign");
-        assert_eq!(r.local_port, 0);
+        assert_eq!(r.local, LocalSocketSpec::Tcp(0));
     }
 
     #[test]
-    fn parse_forward_rejects_non_tcp() {
-        // Only tcp: endpoints are bridged; localabstract must be rejected.
-        assert!(parse_forward("localabstract:foo;tcp:9000").is_err());
-        assert!(parse_forward("tcp:1;localabstract:bar").is_err());
+    fn parse_forward_vsock_remote() {
+        let r = parse_forward("tcp:8885;vsock:2:46668").expect("valid vsock forward");
+        assert_eq!(r.local, LocalSocketSpec::Tcp(8885));
+        assert_eq!(
+            r.remote,
+            RemoteSocketSpec::Vsock {
+                cid: 2,
+                port: 46668
+            }
+        );
+    }
+
+    #[test]
+    fn parse_forward_rejects_non_tcp_local() {
+        assert!(
+            parse_forward("localabstract:foo;tcp:9000").is_err(),
+            "localabstract not supported as local"
+        );
+        assert!(
+            parse_forward("vsock:2:5555;tcp:9000").is_err(),
+            "vsock not supported as local"
+        );
+    }
+
+    #[test]
+    fn parse_forward_rejects_unsupported_remote() {
+        assert!(
+            parse_forward("tcp:1;localabstract:bar").is_err(),
+            "localabstract not yet supported as remote"
+        );
     }
 
     #[test]
@@ -240,8 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_killforward_extracts_local_port() {
-        assert_eq!(parse_killforward("tcp:5555").expect("valid"), 5555);
+    fn parse_killforward_extracts_local_spec() {
+        assert_eq!(
+            parse_killforward("tcp:5555").expect("valid"),
+            LocalSocketSpec::Tcp(5555)
+        );
         assert!(parse_killforward("localabstract:x").is_err());
     }
 
@@ -249,9 +278,14 @@ mod tests {
     async fn registry_insert_contains_remove() {
         let reg = ForwardRegistry::default();
         assert!(!reg.contains(5555).await);
-        // A no-op task stands in for the listener accept loop.
         let task = tokio::spawn(async {});
-        reg.insert(5555, 5556, "serialX".to_string(), task).await;
+        reg.insert(
+            5555,
+            RemoteSocketSpec::Tcp(5556),
+            "serialX".to_string(),
+            task,
+        )
+        .await;
         assert!(
             reg.contains(5555).await,
             "rule must be present after insert"
@@ -264,25 +298,67 @@ mod tests {
     #[tokio::test]
     async fn registry_list_is_sorted_and_formatted() {
         let reg = ForwardRegistry::default();
-        reg.insert(9000, 1, "B".to_string(), tokio::spawn(async {}))
-            .await;
-        reg.insert(8000, 2, "A".to_string(), tokio::spawn(async {}))
-            .await;
+        reg.insert(
+            9000,
+            RemoteSocketSpec::Tcp(1),
+            "B".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
+        reg.insert(
+            8000,
+            RemoteSocketSpec::Tcp(2),
+            "A".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
         let body = reg.list().await;
         // Sorted by local port: 8000 then 9000.
         assert_eq!(body, "A tcp:8000 tcp:2\nB tcp:9000 tcp:1\n");
     }
 
     #[tokio::test]
+    async fn registry_list_with_vsock_remote() {
+        let reg = ForwardRegistry::default();
+        reg.insert(
+            8885,
+            RemoteSocketSpec::Vsock {
+                cid: 2,
+                port: 46668,
+            },
+            "dev1".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
+        let body = reg.list().await;
+        assert_eq!(body, "dev1 tcp:8885 vsock:2:46668\n");
+    }
+
+    #[tokio::test]
     async fn registry_remove_by_serial_only_drops_that_serial() {
         let reg = ForwardRegistry::default();
         // Two rules for serialA, one for serialB.
-        reg.insert(8000, 1, "serialA".to_string(), tokio::spawn(async {}))
-            .await;
-        reg.insert(8001, 2, "serialA".to_string(), tokio::spawn(async {}))
-            .await;
-        reg.insert(9000, 3, "serialB".to_string(), tokio::spawn(async {}))
-            .await;
+        reg.insert(
+            8000,
+            RemoteSocketSpec::Tcp(1),
+            "serialA".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
+        reg.insert(
+            8001,
+            RemoteSocketSpec::Tcp(2),
+            "serialA".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
+        reg.insert(
+            9000,
+            RemoteSocketSpec::Tcp(3),
+            "serialB".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
 
         let removed = reg.remove_by_serial("serialA").await;
         assert_eq!(removed, 2, "both serialA rules must be removed");
@@ -306,10 +382,20 @@ mod tests {
     #[tokio::test]
     async fn registry_remove_all_clears() {
         let reg = ForwardRegistry::default();
-        reg.insert(1, 2, "s".to_string(), tokio::spawn(async {}))
-            .await;
-        reg.insert(3, 4, "s".to_string(), tokio::spawn(async {}))
-            .await;
+        reg.insert(
+            1,
+            RemoteSocketSpec::Tcp(2),
+            "s".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
+        reg.insert(
+            3,
+            RemoteSocketSpec::Tcp(4),
+            "s".to_string(),
+            tokio::spawn(async {}),
+        )
+        .await;
         reg.remove_all().await;
         assert!(
             reg.list().await.is_empty(),

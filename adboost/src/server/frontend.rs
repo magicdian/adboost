@@ -21,7 +21,7 @@ use super::forward::{ForwardRegistry, parse_forward, parse_killforward};
 use super::forward_handle::ForwardHandle;
 use super::on_disconnect::OnDisconnect;
 use super::protocol;
-use crate::models::{ADBLocalCommand, DeviceFeatureSet};
+use crate::models::{ADBLocalCommand, DeviceFeatureSet, RemoteSocketSpec};
 
 /// Builder for [`AdbServerFrontend`].
 pub struct AdbServerFrontendBuilder<B: DeviceBackend> {
@@ -862,14 +862,15 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         };
 
         // Enforce `norebind` against an existing rule BEFORE binding.
-        if req.norebind && self.forwards.contains(req.local_port).await {
+        let local_port = req.local.tcp_port();
+        if req.norebind && self.forwards.contains(local_port).await {
             return stream
                 .write_all(&protocol::fail("cannot rebind existing socket"))
                 .await;
         }
 
         // Bind the host-side listener (port 0 ⇒ OS auto-assign).
-        let bind_addr = SocketAddr::from(([127, 0, 0, 1], req.local_port));
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], local_port));
         let listener = match TcpListener::bind(bind_addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -878,19 +879,19 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     .await;
             }
         };
-        let resolved_port = listener.local_addr().map_or(req.local_port, |a| a.port());
+        let resolved_port = listener.local_addr().map_or(local_port, |a| a.port());
 
-        // Spawn the accept loop: each inbound connection opens `tcp:<remote>` on
+        // Spawn the accept loop: each inbound connection opens the remote spec on
         // the device and bridges the two byte streams.
         let backend = Arc::clone(&self.backend);
         let serial_owned = serial.to_string();
-        let remote_port = req.remote_port;
+        let remote = req.remote.clone();
         let task = tokio::spawn(async move {
-            run_forward_listener(listener, backend, serial_owned, remote_port).await;
+            run_forward_listener(listener, backend, serial_owned, remote).await;
         });
 
         self.forwards
-            .insert(resolved_port, req.remote_port, serial.to_string(), task)
+            .insert(resolved_port, req.remote, serial.to_string(), task)
             .await;
 
         // Reply: two OKAYs, plus the resolved port iff the client asked for tcp:0.
@@ -903,18 +904,18 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         }
     }
 
-    /// `killforward:tcp:<local>` — remove a rule (aborting its listener).
+    /// `killforward:<local>` — remove a rule (aborting its listener).
     async fn serve_killforward(&self, stream: &mut TcpStream, arg: &str) -> std::io::Result<()> {
-        let local_port = match parse_killforward(arg) {
-            Ok(p) => p,
+        let local_spec = match parse_killforward(arg) {
+            Ok(s) => s,
             Err(reason) => return stream.write_all(&protocol::fail(&reason)).await,
         };
-        if self.forwards.remove(local_port).await {
+        if self.forwards.remove(local_spec.tcp_port()).await {
             stream.write_all(&protocol::okay_twice()).await
         } else {
             stream
                 .write_all(&protocol::fail(&format!(
-                    "listener 'tcp:{local_port}' not found"
+                    "listener '{local_spec}' not found"
                 )))
                 .await
         }
@@ -1534,7 +1535,7 @@ async fn run_forward_listener<B: DeviceBackend>(
     listener: TcpListener,
     backend: Arc<B>,
     serial: String,
-    remote_port: u16,
+    remote: RemoteSocketSpec,
 ) {
     loop {
         let (client, peer) = match listener.accept().await {
@@ -1548,12 +1549,13 @@ async fn run_forward_listener<B: DeviceBackend>(
         enable_client_nodelay(&client, peer);
         let backend = Arc::clone(&backend);
         let serial = serial.clone();
+        let remote = remote.clone();
         tokio::spawn(async move {
-            let cmd = ADBLocalCommand::TcpConnect(remote_port);
+            let cmd = ADBLocalCommand::Raw(remote.to_string());
             match backend.open_local_service(&serial, &cmd).await {
                 Ok(session) => crate::usb::bridge_tcp_session(client, session).await,
                 Err(e) => {
-                    tracing::debug!("forward {peer}→tcp:{remote_port} open failed: {e}");
+                    tracing::debug!("forward {peer}→{remote} open failed: {e}");
                 }
             }
         });
@@ -1907,7 +1909,12 @@ mod tests {
         // Seed a forward rule for `serial` (no-op listener task stand-in).
         frontend
             .forwards
-            .insert(7000, 7001, serial.to_string(), tokio::spawn(async {}))
+            .insert(
+                7000,
+                RemoteSocketSpec::Tcp(7001),
+                serial.to_string(),
+                tokio::spawn(async {}),
+            )
             .await;
         (frontend, log)
     }
@@ -2992,6 +2999,61 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("device not found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn forward_vsock_remote_auto_assign_and_lists() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f.clone(), "host:forward:tcp:0;vsock:2:46668").await;
+        assert_eq!(
+            &resp[..8],
+            b"OKAYOKAY",
+            "vsock forward success is two OKAYs"
+        );
+        let len = usize::from_str_radix(std::str::from_utf8(&resp[8..12]).unwrap(), 16).unwrap();
+        let port_str = std::str::from_utf8(&resp[12..12 + len]).unwrap();
+        let resolved: u16 = port_str.parse().expect("decimal port");
+        assert_ne!(resolved, 0, "tcp:0 must resolve to a real port");
+
+        let listing = round_trip(f, "host:list-forward").await;
+        let body = String::from_utf8(listing[8..].to_vec()).unwrap();
+        assert!(
+            body.contains(&format!("solo tcp:{resolved} vsock:2:46668")),
+            "list-forward must show vsock remote, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_vsock_remote_invalid_cid_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:forward:tcp:0;vsock:abc:123").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(
+            body.starts_with("FAIL"),
+            "bad vsock cid must fail, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_vsock_remote_missing_port_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:forward:tcp:0;vsock:2").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(
+            body.starts_with("FAIL"),
+            "vsock missing port must fail, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_vsock_as_local_fails() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:forward:vsock:2:5555;tcp:9000").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(
+            body.starts_with("FAIL"),
+            "vsock as local must fail, got: {body}"
+        );
     }
 
     /// Build a frontend whose advertised capabilities are explicitly set (the

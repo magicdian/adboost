@@ -348,17 +348,26 @@ async fn run_connect_parity_against_server(reporter: &mut Reporter, addr: std::n
 /// determinstic regression net is the wire-string unit test in
 /// `models/adb_host_command.rs`.
 async fn case_forward_control_plane(device: &mut ADBProxyDevice) -> Outcome {
-    // Fixed, asymmetric host/device ports. `forward(remote, local)`.
+    // --- tcp→tcp rule ---
     let local = "tcp:17023".to_string();
     let remote = "tcp:17024".to_string();
     if let Err(e) = device.forward(remote, local.clone()).await {
-        return Outcome::Failed(format!("forward add failed: {e}"));
+        return Outcome::Failed(format!("forward add (tcp) failed: {e}"));
     }
-    // Remove that exact rule by its local endpoint — exercises the serial-scoped
-    // `killforward:<local>` path (not just the global remove-all).
     if let Err(e) = device.forward_remove(local).await {
-        return Outcome::Failed(format!("forward remove-by-local failed: {e}"));
+        return Outcome::Failed(format!("forward remove-by-local (tcp) failed: {e}"));
     }
+
+    // --- tcp→vsock rule (registration is lazy; device need not have vsock) ---
+    let local_vsock = "tcp:17025".to_string();
+    let remote_vsock = "vsock:2:46668".to_string();
+    if let Err(e) = device.forward(remote_vsock, local_vsock.clone()).await {
+        return Outcome::Failed(format!("forward add (vsock) failed: {e}"));
+    }
+    if let Err(e) = device.forward_remove(local_vsock).await {
+        return Outcome::Failed(format!("forward remove-by-local (vsock) failed: {e}"));
+    }
+
     // Global remove-all as robust teardown (also exercises `killforward-all`).
     match device.forward_remove_all().await {
         Ok(()) => Outcome::Passed,

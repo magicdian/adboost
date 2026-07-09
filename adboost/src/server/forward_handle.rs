@@ -138,10 +138,16 @@ mod tests {
     /// Build a registry pre-populated with forward rules. `(local_port, serial)`
     /// pairs; the listener task is a no-op stand-in.
     async fn registry_with(rules: &[(u16, &str)]) -> Arc<ForwardRegistry> {
+        use crate::models::RemoteSocketSpec;
         let reg = Arc::new(ForwardRegistry::default());
         for (port, serial) in rules {
-            reg.insert(*port, 1, (*serial).to_string(), tokio::spawn(async {}))
-                .await;
+            reg.insert(
+                *port,
+                RemoteSocketSpec::Tcp(1),
+                (*serial).to_string(),
+                tokio::spawn(async {}),
+            )
+            .await;
         }
         reg
     }
