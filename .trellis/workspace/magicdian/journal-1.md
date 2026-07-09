@@ -1513,3 +1513,36 @@ Follow-up to the multi-device forward fix. CLI forward handler passed (local, re
 ### Next Steps
 
 - None - task complete
+
+
+## Session 37: Support vsock socket-spec in forward
+
+**Date**: 2026-07-09
+**Task**: Support vsock socket-spec in forward
+**Branch**: `main`
+
+### Summary
+
+Added typed LocalSocketSpec/RemoteSocketSpec enums to the forward system, enabling vsock remote endpoints (adb forward tcp:X vsock:CID:PORT). Extensible design — future specs need only a new enum variant + parse arm.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8550a7b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

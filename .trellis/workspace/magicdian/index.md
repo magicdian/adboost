@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 36
-- **Last Active**: 2026-07-01
+- **Total Sessions**: 37
+- **Last Active**: 2026-07-09
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1515 | Active |
+| `journal-1.md` | ~1548 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 37 | 2026-07-09 | Support vsock socket-spec in forward | `8550a7b` | `main` |
 | 36 | 2026-07-01 | Fix CLI forward arg-order swap (local/remote reversed to library) | `6fcb0b7` | `main` |
 | 35 | 2026-07-01 | Fix multi-device forward via device-pinned host-serial scoping (DeviceSelector) | `b44bf4a` | `main` |
 | 34 | 2026-06-30 | Feasibility study: cancel-safe per-chunk reader select (NO-GO, design reserved) | `229df75` | `main` |
