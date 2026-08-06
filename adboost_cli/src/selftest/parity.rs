@@ -170,6 +170,51 @@ pub async fn case_official_adb_connect_routing(addr: SocketAddrV4) -> Outcome {
     }
 }
 
+/// Drive the official `adb` client's *bare* `get-state` against adboost's
+/// in-process server — **no `-s`**, so the client emits the transport-any
+/// `host:get-state` (not the serial-pinned `host-serial:<serial>:get-state`)
+/// that the frontend resolves against the single connected device.
+///
+/// This is the runtime guard for the originally-reported regression: AOSP
+/// `adb root`/`unroot` call `adb_get_state()` (bare `host:get-state`) before
+/// issuing `root:`/`unroot:`, and aborted the whole flow on
+/// `unknown host service: get-state`. Any structured reply (a state string like
+/// `device`, or an AOSP transport-any `FAIL` wording) proves the arm is wired;
+/// `unknown host service` means it is still missing. Like the connect case it
+/// is non-destructive, so it is safe in the automated phase.
+pub async fn case_official_adb_get_state(addr: SocketAddrV4) -> Outcome {
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "get-state"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if combined.contains("unknown host service") {
+                return Outcome::Failed(format!(
+                    "REGRESSION: bare `adb get-state` reported `unknown host service` — the \
+                     transport-any host:get-state arm is missing: {}",
+                    combined.trim()
+                ));
+            }
+            // With a single connected, state `device` device the client prints a
+            // success state word; with zero/multiple devices it prints an AOSP
+            // transport error we also route correctly. Any non-`unknown-host-service`
+            // outcome proves the arm is wired.
+            Outcome::Passed
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
 /// Run `adb -P <port> -s <tcp_serial> shell echo <marker>` against adboost's
 /// in-process server, where `tcp_serial` is a `host:connect`ed TCP/IP device.
 /// This is the `PR4b` end-to-end assertion: a client local service (`shell:`)

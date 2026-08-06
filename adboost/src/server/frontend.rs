@@ -291,13 +291,22 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return Ok(HostOutcome::Close);
         };
 
-        // Simple host *data queries* (version/features/devices/devices-l) all
-        // share the `OKAY` + framed-payload shape; compute the payload here and
-        // emit it uniformly, keeping this dispatcher focused on routing.
+        // Simple host *data queries* (version/features/devices/devices-l) — and
+        // the transport-any single-device queries (get-state/get-serialno) — all
+        // share the `OKAY` + framed-payload shape (or an AOSP FAIL for zero /
+        // multiple devices); compute and emit it here, keeping this dispatcher
+        // focused on routing.
         if let Some(payload) = self.host_data_query_payload(svc).await {
-            stream
-                .write_all(&reply_or_overflow(protocol::okay_data(&payload)))
-                .await?;
+            match payload {
+                Ok(payload) => {
+                    stream
+                        .write_all(&reply_or_overflow(protocol::okay_data(&payload)))
+                        .await?;
+                }
+                Err(reason) => {
+                    stream.write_all(&protocol::fail(&reason)).await?;
+                }
+            }
             return Ok(HostOutcome::Close);
         }
 
@@ -385,14 +394,46 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     }
 
     /// Payload for a simple host *data query* (`version`/`features`/`devices`/
-    /// `devices-l`), or `None` if `svc` is not one. The caller frames it as
-    /// `OKAY` + `%04x`+payload — these four share that exact shape.
-    async fn host_data_query_payload(&self, svc: &str) -> Option<String> {
+    /// `devices-l`/`get-state`/`get-serialno`), or `None` if `svc` is not one.
+    /// The caller frames it as `OKAY` + `%04x`+payload — these share that exact
+    /// shape.
+    ///
+    /// Returns `Option<Result<String, String>>` so the single-device queries
+    /// (`get-state`/`get-serialno`) can express the transport-any AOSP failure
+    /// wording: `Ok(payload)` is the single-device reply (byte-identical to the
+    /// already-working `host-serial:<serial>:<sub>` form via
+    /// [`Self::dispatch_host_serial`]), `Err(reason)` is a FAIL reason (zero /
+    /// multiple devices, from [`Self::resolve_single_serial`]).
+    async fn host_data_query_payload(&self, svc: &str) -> Option<Result<String, String>> {
         match svc {
-            "version" => Some(self.caps.version_hex().to_string()),
-            "features" => Some(self.caps.features_csv()),
-            "devices" => Some(format_devices(&self.backend.list_devices().await, false)),
-            "devices-l" => Some(format_devices(&self.backend.list_devices().await, true)),
+            "version" => Some(Ok(self.caps.version_hex().to_string())),
+            "features" => Some(Ok(self.caps.features_csv())),
+            "devices" => Some(Ok(format_devices(
+                &self.backend.list_devices().await,
+                false,
+            ))),
+            "devices-l" => Some(Ok(format_devices(&self.backend.list_devices().await, true))),
+            "get-state" | "get-serialno" => {
+                // Bare, no serial-prefixed form: resolve the single connected
+                // device (transport-any semantics) and reply with the payload
+                // the pinned `host-serial:<serial>:get-state`/`:get-serialno`
+                // form produces. Reuses the existing get-state/get-serialno
+                // logic so the bare and pinned forms stay byte-identical.
+                match self.resolve_single_serial().await {
+                    Ok(serial) => {
+                        let devices = self.backend.list_devices().await;
+                        let entry = devices.iter().find(|d| d.serial == serial);
+                        let payload = match svc {
+                            "get-state" => entry.map_or("offline", |d| d.state.as_wire()),
+                            _ => {
+                                return Some(Ok(serial));
+                            }
+                        };
+                        Some(Ok(payload.to_string()))
+                    }
+                    Err(reason) => Some(Err(reason)),
+                }
+            }
             _ => None,
         }
     }
@@ -2861,6 +2902,73 @@ mod tests {
         let body = String::from_utf8(resp).unwrap();
         assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(body.contains("no device for transport id"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn bare_get_state_with_single_device_replies_data() {
+        // Bare `host:get-state` resolves the single connected device
+        // (transport-any) and replies `OKAY0006device`, byte-identical to the
+        // pinned `host-serial:<serial>:get-state` form.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:get-state").await;
+        assert_eq!(resp, b"OKAY0006device");
+    }
+
+    #[tokio::test]
+    async fn bare_get_serialno_with_single_device_replies_serial() {
+        // Bare `host:get-serialno` replies `OKAY` + the single device's serial.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:get-serialno").await;
+        assert_eq!(resp, b"OKAY0004solo");
+    }
+
+    #[tokio::test]
+    async fn bare_get_state_with_no_devices_fails_no_devices() {
+        // transport-any with zero devices → AOSP `no devices/emulators found`.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:get-state").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices/emulators found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn bare_get_state_with_multiple_devices_fails_more_than_one() {
+        // transport-any with more than one device → AOSP
+        // `more than one device/emulator`.
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("aaa"),
+            DeviceEntry::new("zzz"),
+        ]));
+        let resp = round_trip(f, "host:get-state").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(
+            body.contains("more than one device/emulator"),
+            "got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_get_state_matches_pinned_get_state() {
+        // The bare transport-any form and the explicitly-pinned
+        // `host-serial:<serial>:get-state` form must be byte-identical for a
+        // single device (the PRD's "byte 一致" requirement).
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let bare = round_trip(Arc::clone(&f), "host:get-state").await;
+        let pinned = round_trip(Arc::clone(&f), "host-serial:solo:get-state").await;
+        assert_eq!(bare, pinned);
+        assert_eq!(bare, b"OKAY0006device");
+    }
+
+    #[tokio::test]
+    async fn bare_get_serialno_matches_pinned_get_serialno() {
+        // Bare + pinned get-serialno must be byte-identical.
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let bare = round_trip(Arc::clone(&f), "host:get-serialno").await;
+        let pinned = round_trip(Arc::clone(&f), "host-serial:solo:get-serialno").await;
+        assert_eq!(bare, pinned);
+        assert_eq!(bare, b"OKAY0004solo");
     }
 
     #[tokio::test]

@@ -98,6 +98,42 @@ kind):
 > bytes. `host:devices`/`devices-l` are **never** kind-filtered (AOSP lists all
 > transports regardless of `-d`/`-e`); only *selection* is filtered.
 
+## Bare `host:get-state` / `host:get-serialno` — transport-any single-device *data queries*
+
+Two second-class "bare" *host data queries* (`host:get-state` /
+`host:get-serialno`) carry **no serial prefix** and so must resolve the single
+connected device by *transport-any* semantics, mirroring the pinned
+`host-serial:<serial>:get-state` / `:get-serialno` forms exactly:
+
+| Service | Resolution | Reply on success | 0 devices | >1 devices |
+|---|---|---|---|---|
+| `host:get-state` | `host_data_query_payload` → `resolve_single_serial()` (= `resolve_single_by_kind(None)`) → `dispatch_host_serial` get-state | `OKAY` + `%04x`+`device` (or the device state) | `FAIL("no devices/emulators found")` | `FAIL("more than one device/emulator")` |
+| `host:get-serialno` | same funnel → get-serialno | `OKAY` + `%04x`+`<serial>` | same | same |
+
+Both live in **`host_data_query_payload`** (`frontend.rs`) — the same single
+dispatch point as `version`/`features`/`devices`/`devices-l` — and return
+`Option<Result<String, String>>`: `None`=not a data-query service; `Ok(payload)`
+= single-device reply (framed `okay_data`); `Err(reason)` = AOSP FAIL wording for
+zero / multiple devices. This is deliberate: `host:get-state`/`:get-serialno`
+are shape `OKAY`+framed-payload host queries with **no routing**, so they belong
+to the data-query single entry point, NOT as extra `match svc` routing arms in
+`dispatch_host_service`. That keeps `dispatch_host_service`'s `match` focused on
+routing and future bare single-device data queries land on the same point.
+
+> **Gotcha — the bare single-device reply MUST stay byte-identical to the pinned
+> `host-serial:<serial>:<sub>` form.** `get-state`/`get-serialno` share the
+> device-state/serial lookup logic via the same
+> `entry.map_or("offline", |d| d.state.as_wire())` / raw-serial payload that
+> `dispatch_host_serial` produces, so the two forms cannot drift. This is the
+> contract AOSP `adb root`/`unroot` rely on: they call `adb_get_state()` (which
+> sends `host:get-state`) before issuing `root:`/`unroot:`, and abort the whole
+> flow on a `FAIL unknown host service: get-state` — the pre-fix regression this
+> entry removes. Locked by the `bare_get_*_matches_pinned_*` unit tests.
+> `host:get-state` is **not** kind-filtered (it resolves transport-any over the
+> full set, like transport-any selection), and `host:get-devpath` is intentionally
+> **not** implemented (`DeviceEntry` has no devpath field — honest-capability
+> principle; a real field would need a separate feature).
+
 ---
 
 ## `host-serial:<serial>:<sub>` parsing — anchor on the sub-service, NOT a colon position
@@ -329,6 +365,15 @@ real client actually uses; same shared resolver / wording as `transport-usb`):
 - `host_transport_id_out_of_range_fails` → `no device for transport id`
 - `host_wait_for_disconnect_with_no_devices_returns_okay_immediately` → empty list → immediate `OKAY` (exercises the `disconnect` absent-target path without a 60 s wait)
 - `is_host_serial_sub_recognizes_wait_for_family` → proves a TCP `ip:port` serial with a `wait-for-*` sub splits correctly (lockstep with `dispatch_host_serial`)
+
+Bare `host:get-state` / `host:get-serialno` transport-any data-query assertion
+points (`frontend.rs` tests):
+
+- `bare_get_state_with_single_device_replies_data` → single device → `OKAY0006device`
+- `bare_get_serialno_with_single_device_replies_serial` → `OKAY` + the serial
+- `bare_get_state_with_no_devices_fails_no_devices` → `no devices/emulators found`
+- `bare_get_state_with_multiple_devices_fails_more_than_one` → `more than one device/emulator`
+- `bare_get_state_matches_pinned_get_state` / `bare_get_serialno_matches_pinned_get_serialno` → bare byte-equals the pinned `host-serial:<serial>:<sub>` form
 
 ### Runtime selftest (device-backed, `adboost_cli selftest`)
 

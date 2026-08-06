@@ -206,6 +206,10 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
     // host:connect routing parity: a whole-server property (not per serial), and
     // non-destructive (dials an unreachable port), so run it ONCE.
     run_connect_parity_against_server(reporter, server.addr()).await;
+    // Bare `adb get-state` (transport-any, no `-s`) routing parity: the runtime
+    // guard for the `unknown host service: get-state` regression that broke
+    // `adb root`/`unroot`. Whole-server property, non-destructive → ONCE.
+    run_get_state_parity_against_server(reporter, server.addr()).await;
 
     // Automated root → unroot cycle, ONCE on the FIRST serial, driven THROUGH this
     // SAME in-process server via a fresh `ADBProxyDevice`. Running it through the
@@ -320,6 +324,28 @@ async fn run_connect_parity_against_server(reporter: &mut Reporter, addr: std::n
             reporter,
             "parity",
             "official_adb_connect_routing",
+            Outcome::Skipped("official `adb` binary not found on PATH".into()),
+        );
+    }
+}
+
+/// Run the bare `host:get-state` routing parity case against the running
+/// adboost server, or SKIP when no `adb` binary is available. Non-destructive,
+/// so it runs once per run regardless of device count. This is the runtime
+/// guard for the originally-reported `unknown host service: get-state` bug
+/// (which broke `adb root`/`unroot`).
+async fn run_get_state_parity_against_server(
+    reporter: &mut Reporter,
+    addr: std::net::SocketAddrV4,
+) {
+    if parity::adb_available().await {
+        let outcome = parity::case_official_adb_get_state(addr).await;
+        run_one(reporter, "parity", "official_adb_get_state", outcome);
+    } else {
+        run_one(
+            reporter,
+            "parity",
+            "official_adb_get_state",
             Outcome::Skipped("official `adb` binary not found on PATH".into()),
         );
     }
