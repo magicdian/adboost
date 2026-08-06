@@ -1546,3 +1546,36 @@ Added typed LocalSocketSpec/RemoteSocketSpec enums to the forward system, enabli
 ### Next Steps
 
 - None - task complete
+
+
+## Session 38: 支持裸 host:get-state/get-serialno（transport-any 单设备数据查询）
+
+**Date**: 2026-08-06
+**Task**: 支持裸 host:get-state/get-serialno（transport-any 单设备数据查询）
+**Branch**: `main`
+
+### Summary
+
+修复外部下游 xdb 报告：adboost server 前端缺失裸 host:get-state/get-serialno（AOSP adb root/unroot 前调 adb_get_state()），落入兜底 arm 返回 unknown host service 中止整流程。将两个裸单设备数据查询并入 host_data_query_payload（单一数据查询分派点），复用 resolve_single_by_kind(None) transport-any 语义，与 host-serial:<serial>:<sub> 字节一致，0/多设备回 AOSP 措辞。明确不含 host:get-devpath（DeviceEntry 无 devpath 字段，诚实能力原则）。新增 round-trip 单测（single/zero/multi + 裸vs带前缀字节一致）与官方 adb parity case（裸 adb -P get-state）端到端锁定回归。单测 397 全绿、clippy clean；8155 实机 selftest 14/17 通过，parity.official_adb_get_state 通过；root_unroot_cycle 唯一失败系本机 Lemon 官方 adb server 抢占 USB claim 竞态（环境问题）。下游 xdb 需 bump rev 到 9498fea8242c4dce9983064dd1b9a607b478aba2 重编后做真机验证。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9498fea` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
