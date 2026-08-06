@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "Server host protocol契约：transport-selection单一funnel（resolve_single_by_kind/无AOSP措辞矩阵）、host数据查询framing(OKAY+%04x)、host:features双轴、adb root握手。本任务在其上扩展裸 host:get-state/get-serialno。"}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend spec索引，pre-dev checklist与目录指引。"}

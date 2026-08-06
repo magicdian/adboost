@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "check需对其transport-funnel不变量和AOSP错误措辞矩阵验证实现。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic/test风格/质量门禁。"}
