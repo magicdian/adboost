@@ -1579,3 +1579,36 @@ Added typed LocalSocketSpec/RemoteSocketSpec enums to the forward system, enabli
 ### Next Steps
 
 - None - task complete
+
+
+## Session 39: adb-server frontend: host:track-devices-l + unknown-service WARN logging
+
+**Date**: 2026-09-03
+**Task**: adb-server frontend: host:track-devices-l + unknown-service WARN logging
+**Branch**: `main`
+
+### Summary
+
+Implemented the xdb-reported AS blank-device-list fix: host:track-devices-l as a DeviceListFormat-parameterized streaming service sharing the single format_devices renderer (stream-vs-one-shot byte parity locked), and a warn_unsupported_service funnel covering all five unknown-service FAIL paths (FAIL wording unchanged, original request string threaded through pinned dispatchers). Added 7 frontend unit tests, a raw-smartsocket protocol_cases selftest module (automated track_devices_family + interactive track_devices_l_hotplug), live-verified against real hardware (old build FAIL reproduced on 5037, new build OKAY+long format on 5038, full selftest green incl. hotplug streaming). Spec: server-host-protocol.md gained the device-list family contract + unknown-service WARN funnel sections; P1 proto variants documented as must-ship-with-feature-flag.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `46df633` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
