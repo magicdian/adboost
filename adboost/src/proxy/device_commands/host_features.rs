@@ -5,7 +5,12 @@ use crate::{
 };
 
 impl ADBProxyDevice {
-    /// Lists available ADB server features.
+    /// Lists the features of the transport this device selects: a
+    /// **post-transport** `host:features` (the per-transport AOSP query behind
+    /// `adb features`), so the reply is the *device's* feature set — the
+    /// server's features intersected with the device's CNXN banner. NOT the
+    /// server-level `host:host-features` set. [`Self::shell_command`] gates
+    /// shell v1/v2 on exactly this reply.
     pub async fn host_features(&mut self) -> Result<Vec<HostFeatures>> {
         self.set_serial_transport().await?;
 

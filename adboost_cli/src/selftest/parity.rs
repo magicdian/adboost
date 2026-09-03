@@ -215,6 +215,211 @@ pub async fn case_official_adb_get_state(addr: SocketAddrV4) -> Outcome {
     }
 }
 
+/// Drive the official `adb` client's `host-features` against adboost's
+/// in-process server — the **server-level** feature query
+/// (`host:host-features`). This is the runtime guard for the second AS
+/// blank-device-list regression: adblib's `SessionDeviceTracker.pickBestFormat`
+/// queries host-features FIRST (before track-devices-l) and has no FAIL
+/// fallback, so a missing arm kept AS's device list empty even after
+/// `track-devices-l` landed. A successful feature listing proves the arm;
+/// `unknown host service` is the REGRESSION marker. Also locks the honesty
+/// invariant: the server set must NOT contain `devicetracker_proto_format`
+/// while the proto track-devices services are unimplemented. Non-destructive
+/// (no device touched) → automated, once per run.
+pub async fn case_official_adb_host_features(addr: SocketAddrV4) -> Outcome {
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "host-features"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if combined.contains("unknown host service") {
+                return Outcome::Failed(format!(
+                    "REGRESSION: `adb host-features` reported `unknown host service` — the \
+                     host:host-features arm is missing: {}",
+                    combined.trim()
+                ));
+            }
+            if !out.status.success() {
+                return Outcome::Failed(format!(
+                    "adb host-features exited {}: {}",
+                    out.status,
+                    combined.trim()
+                ));
+            }
+            if combined.contains("devicetracker_proto_format") {
+                return Outcome::Failed(format!(
+                    "host-features must NOT advertise devicetracker_proto_format while the \
+                     proto track-devices services are unimplemented: {}",
+                    combined.trim()
+                ));
+            }
+            Outcome::Passed
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
+/// Drive the official `adb` client's bare `features` against adboost's
+/// in-process server — the **per-transport** query (wire `host:features`, what
+/// `adb features` sends). Locks the AOSP-parity semantics the frontend now
+/// implements: single-device scenario must succeed with a feature listing (the
+/// per-device set — the always-safe `cmd` default survives every banner
+/// intersection); multi-device scenario must fail with the AOSP ambiguity
+/// wording, NOT the misleading `device not found`. `unknown host service` is
+/// the REGRESSION marker. Non-destructive → automated, once per run.
+pub async fn case_official_adb_features(addr: SocketAddrV4, multi: bool) -> Outcome {
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "features"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if combined.contains("unknown host service") {
+                return Outcome::Failed(format!(
+                    "REGRESSION: bare `adb features` reported `unknown host service` — the \
+                     per-transport host:features arm is missing: {}",
+                    combined.trim()
+                ));
+            }
+            if multi {
+                // No `-s` against multiple devices: the AOSP transport-any
+                // ambiguity, not a collapsed "device not found".
+                if combined.contains("more than one device") {
+                    Outcome::Passed
+                } else if combined.contains("device not found") {
+                    Outcome::Failed(format!(
+                        "REGRESSION: bare `adb features` against multiple devices reported \
+                         `device not found` instead of `more than one device`: {}",
+                        combined.trim()
+                    ))
+                } else {
+                    Outcome::Failed(format!(
+                        "bare `adb features` against multiple devices failed with unexpected \
+                         wording, expected `more than one device`: {}",
+                        combined.trim()
+                    ))
+                }
+            } else if out.status.success() && combined.contains("cmd") {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(format!(
+                    "bare `adb features` against a single device should list the device's \
+                     features (containing `cmd`), got: {}",
+                    combined.trim()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
+/// Drive the official `adb` client's `exec-out` against adboost's in-process
+/// server — the client-side driver of the `exec:` service (the shell-v2
+/// one-shot subprocess, PTY-free). This is the runtime guard for the Android
+/// Studio install regression: AS's whole deploy pipeline (its deployer agent
+/// `exec:/data/local/tmp/.studio/bin/installer …` and the streaming
+/// `exec:cmd package install-write … -`) rides `exec:`, which adboost used to
+/// reject with `service not supported`. The marker must round-trip
+/// byte-clean.
+pub async fn case_official_adb_exec_out(addr: SocketAddrV4, serial: &str) -> Outcome {
+    const MARKER: &str = "adboost_exec_out_marker_7c31";
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "-s", serial, "exec-out", "echo", MARKER])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.trim_end() == MARKER {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(format!(
+                    "official adb exec-out echo returned {:?}, expected {MARKER:?}",
+                    stdout.trim_end()
+                ))
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("service not supported") {
+                Outcome::Failed(format!(
+                    "REGRESSION: `adb exec-out` reported `service not supported` — the \
+                     exec: arm is missing (AS install depends on it): {}",
+                    stderr.trim_end()
+                ))
+            } else {
+                Outcome::Failed(format!(
+                    "official adb exec-out exited {}: {}",
+                    out.status,
+                    stderr.trim_end()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
+/// Drive the official `adb` client's `jdwp` against adboost's in-process
+/// server — the client-side driver of the `track-jdwp` streaming service
+/// (adbd's debuggable-process list). This is the runtime guard for the AS
+/// debug regression: the IDE's debugger process monitor polls `track-jdwp`
+/// (~1/s while a debug session is up), which adboost used to reject. Any pid
+/// listing — possibly empty, no debuggable process needs to be running —
+/// proves the arm; `service not supported` is the REGRESSION marker.
+pub async fn case_official_adb_jdwp(addr: SocketAddrV4, serial: &str) -> Outcome {
+    let port = addr.port().to_string();
+    let output = Command::new("adb")
+        .args(["-P", &port, "-s", serial, "jdwp"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => Outcome::Passed,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("service not supported") {
+                Outcome::Failed(format!(
+                    "REGRESSION: `adb jdwp` reported `service not supported` — the \
+                     track-jdwp arm is missing (AS debug depends on it): {}",
+                    stderr.trim_end()
+                ))
+            } else {
+                Outcome::Failed(format!(
+                    "official adb jdwp exited {}: {}",
+                    out.status,
+                    stderr.trim_end()
+                ))
+            }
+        }
+        Err(e) => Outcome::Failed(format!("could not invoke adb: {e}")),
+    }
+}
+
 /// Run `adb -P <port> -s <tcp_serial> shell echo <marker>` against adboost's
 /// in-process server, where `tcp_serial` is a `host:connect`ed TCP/IP device.
 /// This is the `PR4b` end-to-end assertion: a client local service (`shell:`)

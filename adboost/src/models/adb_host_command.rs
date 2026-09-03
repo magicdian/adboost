@@ -10,6 +10,13 @@ pub enum ADBHostCommand {
     Devices,
     DevicesLong,
     TrackDevices,
+    /// The **per-transport** feature query (wire `host:features`) — what native
+    /// `adb features` sends and what [`crate::proxy::ADBProxyDevice`]'s shell
+    /// v1/v2 gating reads AFTER a transport switch. NOT the server-level
+    /// `host:host-features` (`adb host-features`): the two queries have
+    /// different semantics in AOSP and are not interchangeable — sending this
+    /// one without a selected transport resolves transport-any (and FAILs on
+    /// zero/multiple devices) on an AOSP-parity server.
     HostFeatures,
     Connect(SocketAddrV4),
     Disconnect(SocketAddrV4),

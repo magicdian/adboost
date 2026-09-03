@@ -244,9 +244,18 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     // with this device's banner — native `adb -s <serial> shell`
                     // reads exactly this reply to pick shell v1 vs v2, so a device
                     // lacking `shell_v2` is correctly steered to v1 here.
+                    // `host-features` / `version` are SERVER-level (no transport
+                    // needed) — answered identically pre- and post-transport.
                     match svc {
                         "features" => {
                             let csv = self.device_features_csv(&serial).await;
+                            stream
+                                .write_all(&reply_or_overflow(protocol::okay_data(&csv)))
+                                .await?;
+                            return Ok(());
+                        }
+                        "host-features" => {
+                            let csv = self.caps.features_csv();
                             stream
                                 .write_all(&reply_or_overflow(protocol::okay_data(&csv)))
                                 .await?;
@@ -407,21 +416,44 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         Ok(HostOutcome::Close)
     }
 
-    /// Payload for a simple host *data query* (`version`/`features`/`devices`/
-    /// `devices-l`/`get-state`/`get-serialno`), or `None` if `svc` is not one.
-    /// The caller frames it as `OKAY` + `%04x`+payload — these share that exact
-    /// shape.
+    /// Payload for a simple host *data query* (`version`/`host-features`/
+    /// `features`/`devices`/`devices-l`/`get-state`/`get-serialno`), or `None`
+    /// if `svc` is not one. The caller frames it as `OKAY` + `%04x`+payload —
+    /// these share that exact shape.
     ///
     /// Returns `Option<Result<String, String>>` so the single-device queries
-    /// (`get-state`/`get-serialno`) can express the transport-any AOSP failure
-    /// wording: `Ok(payload)` is the single-device reply (byte-identical to the
-    /// already-working `host-serial:<serial>:<sub>` form via
-    /// [`Self::dispatch_host_serial`]), `Err(reason)` is a FAIL reason (zero /
-    /// multiple devices, from [`Self::resolve_single_serial`]).
+    /// (`features`/`get-state`/`get-serialno`) can express the transport-any
+    /// AOSP failure wording: `Ok(payload)` is the single-device reply
+    /// (byte-identical to the already-working `host-serial:<serial>:<sub>` form
+    /// via [`Self::dispatch_host_serial`]), `Err(reason)` is a FAIL reason
+    /// (zero / multiple devices, from [`Self::resolve_single_serial`]).
     async fn host_data_query_payload(&self, svc: &str) -> Option<Result<String, String>> {
         match svc {
             "version" => Some(Ok(self.caps.version_hex().to_string())),
-            "features" => Some(Ok(self.caps.features_csv())),
+            // `host:host-features` — the SERVER-level feature set (`adb
+            // host-features`). AOSP answers this from `supported_features()`
+            // with NO transport resolution, so it succeeds with zero devices —
+            // unlike the bare per-transport `features` below. This is the
+            // FIRST query Android Studio's adblib `SessionDeviceTracker`
+            // makes (pickBestFormat gates the track-devices format on it) and
+            // adblib has no FAIL fallback, so a missing arm aborts the whole
+            // tracker — which presented as AS's empty device list even after
+            // track-devices-l landed. Honest set only: no
+            // `devicetracker_proto_format` until the proto services exist, and
+            // none of real adb's extras (`libusb`, `push_sync`) we do not
+            // implement.
+            "host-features" => Some(Ok(self.caps.features_csv())),
+            // Bare `host:features` is PER-TRANSPORT in AOSP
+            // (`acquire_one_transport` then `t->features()`, the `adb features`
+            // query): resolve the single device transport-any style — the same
+            // shape as bare get-state/get-serialno — and reply the per-device
+            // CSV (byte-identical to the pinned `host-serial:<serial>:features`
+            // form). Zero/multiple devices get the AOSP transport-any wording,
+            // like the real server.
+            "features" => match self.resolve_single_serial().await {
+                Ok(serial) => Some(Ok(self.device_features_csv(&serial).await)),
+                Err(reason) => Some(Err(reason)),
+            },
             "devices" => Some(Ok(format_devices(
                 &self.backend.list_devices().await,
                 DeviceListFormat::Short,
@@ -1212,11 +1244,15 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         }
 
         // Look up the target device's real capabilities so the gate below can
-        // reject a wire-framing service (`shell,v2` / `sync:`) the device cannot
-        // satisfy, instead of passing the OPEN through to be `CLSE`d. Only the two
-        // framing services consult this, so the (possibly handshake-bound) query
-        // is skipped entirely for v1 `shell:` / `tcp:` / control services.
-        let device_caps = if service == "sync:" || service.starts_with("shell,") {
+        // reject a wire-framing service (`shell,v2` / `sync:` / `exec:`) the
+        // device cannot satisfy, instead of passing the OPEN through to be
+        // `CLSE`d. Only the framing services consult this, so the (possibly
+        // handshake-bound) query is skipped entirely for v1 `shell:` / `tcp:` /
+        // control / jdwp services.
+        let device_caps = if service == "sync:"
+            || service.starts_with("shell,")
+            || service.starts_with("exec:")
+        {
             self.device_capabilities(serial).await
         } else {
             None
@@ -1287,13 +1323,14 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     /// rejected before any device session is opened.
     ///
     /// `device_caps` is the target device's banner-advertised feature set
-    /// (`None` when unknown — not yet handshaked). The two **wire-framing**
-    /// services (`sync:`, `shell,v2`) require BOTH that the server advertised the
-    /// feature AND that this device supports it: passing `shell,v2` to a device
-    /// whose banner lacks it makes the device `CLSE` the OPEN (the bug this gate
-    /// prevents). The primary defense is the per-device `host:features` reply
-    /// (the client then picks v1 itself); this is the defense-in-depth fallback
-    /// for a client that opens v2 anyway.
+    /// (`None` when unknown — not yet handshaked). The **wire-framing**
+    /// services (`sync:`, `shell,v2`, `exec:`) require BOTH that the server
+    /// advertised the feature AND that this device supports it: passing
+    /// `shell,v2` to a device whose banner lacks it makes the device `CLSE`
+    /// the OPEN (the bug this gate prevents). The primary defense is the
+    /// per-device `host:features` reply (the client then picks v1 itself);
+    /// this is the defense-in-depth fallback for a client that opens v2
+    /// anyway.
     fn map_local_service(
         &self,
         service: &str,
@@ -1321,6 +1358,35 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         // Bare `shell:` is v1 (ShellCommand, no inner framing), NOT v2.
         if let Some(shell_cmd) = service.strip_prefix("shell:") {
             return Ok(ADBLocalCommand::ShellCommand(shell_cmd.to_string()));
+        }
+        // `exec:<command>` — the shell-v2 one-shot subprocess service (no PTY,
+        // raw byte stream in both directions; AOSP adbd `StartSubprocess(kRaw,
+        // kNone)`). Android Studio's whole deploy pipeline rides it: the
+        // deployer agent (`exec:/data/local/tmp/.studio/bin/installer …`) and
+        // the streaming APK write (`exec:cmd package install-write … -`, the
+        // trailing `-` reading the APK from stdin). Device-side like `shell:`,
+        // so it bridges verbatim; gated on the same two-axis `shell_v2` check
+        // as `shell,v2` (a pre-v2 adbd would CLSE the OPEN).
+        if service.starts_with("exec:") {
+            return if self.caps.device_has_feature("shell_v2", device_caps) {
+                Ok(ADBLocalCommand::Raw(service.to_string()))
+            } else {
+                Err(format!("service not supported: {service}"))
+            };
+        }
+        // Device-side JDWP services (adbd core, every adbd implements them, no
+        // capability gating): `track-jdwp` / `track-app` (streaming
+        // debuggable-process lists — framed by adbd itself, pushed on change,
+        // read-only; the IDE debugger's process monitor, ddmlib ClientMonitor),
+        // `jdwp` (the one-shot list socket the `adb jdwp` CLI opens), and
+        // `jdwp:<pid>` (the debugger's raw connection to a process's JDWP
+        // thread). All bridge verbatim like `shell:`.
+        if service == "track-jdwp"
+            || service == "track-app"
+            || service == "jdwp"
+            || service.starts_with("jdwp:")
+        {
+            return Ok(ADBLocalCommand::Raw(service.to_string()));
         }
         if let Some(port_str) = service.strip_prefix("tcp:") {
             return port_str
@@ -2205,16 +2271,102 @@ mod tests {
         assert_eq!(resp, b"OKAY00040029");
     }
 
+    /// `host:host-features` — the SERVER-level feature set. Distinct from the
+    /// per-transport bare `host:features` (below): it succeeds with ZERO
+    /// devices (no transport resolution), which is the property adblib's
+    /// `SessionDeviceTracker` depends on — host-features is its FIRST query
+    /// and a FAIL aborts the tracker (AS's empty device list).
     #[tokio::test]
-    async fn host_features_is_honest_minimal() {
+    async fn host_features_service_replies_server_set_with_zero_devices() {
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:host-features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        assert_eq!(
+            framed_payload(&body),
+            "cmd,stat_v2,fixed_push_mkdir,apex",
+            "host-features must return the honest server set"
+        );
+        assert!(
+            !body.contains("devicetracker_proto_format"),
+            "host-features must NOT advertise devicetracker_proto_format until the \
+             proto track-devices services exist"
+        );
+    }
+
+    /// Bare `host:features` is PER-TRANSPORT in AOSP (`adb features`): with a
+    /// single device it must reply the DEVICE's set — the server's features
+    /// intersected with the device's banner — not the server set. A device
+    /// whose banner lacks `shell_v2` must not be offered it even when the
+    /// server advertises it (this is what distinguishes the two queries).
+    #[tokio::test]
+    async fn bare_features_with_single_device_replies_per_device_csv() {
+        let caps = ServerCapabilities::default().with_shell_v2();
+        let stripped = DeviceFeatureSet {
+            shell_v2: false,
+            stat_v2: false,
+            ..DeviceFeatureSet::default()
+        };
+        let f = Arc::new(frontend_with_caps_and_devices(
+            caps,
+            vec![DeviceEntry::new("solo").with_capabilities(stripped)],
+        ));
+        let resp = round_trip(f, "host:features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        let csv = framed_payload(&body);
+        assert!(
+            !csv.contains("shell_v2"),
+            "a device whose banner lacks shell_v2 must not be offered it: {csv}"
+        );
+        assert!(csv.contains("cmd"), "always-safe defaults survive: {csv}");
+    }
+
+    #[tokio::test]
+    async fn bare_features_with_no_devices_fails_no_devices() {
+        // AOSP per-transport semantics: zero devices → transport-any wording.
         let f = Arc::new(frontend_with(vec![]));
         let resp = round_trip(f, "host:features").await;
         let body = String::from_utf8(resp).unwrap();
-        assert!(body.starts_with("OKAY"));
-        assert!(body.contains("cmd,stat_v2,fixed_push_mkdir,apex"));
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert!(body.contains("no devices/emulators found"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn bare_features_with_multiple_devices_fails_more_than_one() {
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("devA"),
+            DeviceEntry::new("devB"),
+        ]));
+        let resp = round_trip(f, "host:features").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
         assert!(
-            !body.contains("shell_v2"),
-            "default must not advertise shell_v2"
+            body.contains("more than one device/emulator"),
+            "got: {body}"
+        );
+    }
+
+    /// The bare and pinned feature forms must stay byte-identical — both
+    /// produce `device_features_csv(serial)` — the same contract the bare
+    /// get-state/get-serialno forms follow.
+    #[tokio::test]
+    async fn bare_features_matches_pinned_host_serial_features() {
+        let full = DeviceFeatureSet {
+            shell_v2: true,
+            stat_v2: true,
+            ..DeviceFeatureSet::default()
+        };
+        let f = Arc::new(frontend_with_caps_and_devices(
+            ServerCapabilities::default().with_shell_v2(),
+            vec![DeviceEntry::new("solo").with_capabilities(full)],
+        ));
+        let bare = round_trip(Arc::clone(&f), "host:features").await;
+        let pinned = round_trip(Arc::clone(&f), "host-serial:solo:features").await;
+        assert_eq!(
+            String::from_utf8(bare).unwrap(),
+            String::from_utf8(pinned).unwrap(),
+            "bare host:features must byte-equal the pinned host-serial:<s>:features form"
         );
     }
 
@@ -3595,16 +3747,81 @@ mod tests {
         }
     }
 
+    /// `exec:<command>` — the shell-v2 one-shot subprocess. Bridged verbatim
+    /// (Raw) when BOTH axes hold (server advertises `shell_v2` + the device's
+    /// banner has it) — this is the service Android Studio's whole deploy
+    /// pipeline rides (deployer agent + streaming `install-write … -`).
     #[test]
-    fn map_local_service_jdwp_and_localabstract_unsupported() {
+    fn map_local_service_exec_bridged_verbatim_when_shell_v2_on_both_axes() {
+        let f = frontend_with_caps(ServerCapabilities::default().with_shell_v2());
+        let full = full_device_caps();
+        for svc in [
+            "exec:cmd package install-write -S 29745841 527601734 app-debug.apk -",
+            "exec:/data/local/tmp/.studio/bin/installer -daemon",
+            "exec:true",
+        ] {
+            match f.map_local_service(svc, Some(&full)) {
+                Ok(ADBLocalCommand::Raw(s)) => assert_eq!(s, svc, "forwarded verbatim"),
+                Ok(_) => panic!("exec service {svc} must map to Raw (got another command)"),
+                Err(e) => panic!("exec {svc} must be accepted for a shell_v2 device: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_local_service_exec_denied_for_feature_less_device() {
+        // A device whose banner lacks shell_v2 must NOT be offered exec: —
+        // the pre-v2 adbd would CLSE the OPEN (same gate as `shell,v2`).
+        let f = frontend_with_caps(ServerCapabilities::default().with_shell_v2());
+        let stripped = DeviceFeatureSet {
+            shell_v2: false,
+            stat_v2: false,
+            ..DeviceFeatureSet::default()
+        };
+        match f.map_local_service("exec:true", Some(&stripped)) {
+            Ok(_) => panic!("feature-less device must be denied exec:"),
+            Err(e) => assert_eq!(
+                e, "service not supported: exec:true",
+                "the deny reason must stay the stable map-reject wording"
+            ),
+        }
+    }
+
+    #[test]
+    fn map_local_service_exec_denied_when_server_does_not_advertise() {
+        // Default (honest-minimal) caps do not advertise shell_v2 → deny.
+        let f = frontend_with_caps(ServerCapabilities::default());
+        assert!(
+            f.map_local_service("exec:true", Some(&full_device_caps()))
+                .is_err(),
+            "exec: must be denied when the server does not advertise shell_v2"
+        );
+    }
+
+    /// The device-side JDWP services bridge verbatim with NO capability gate
+    /// (every adbd implements them — adbd core since forever): the debug
+    /// process trackers and the debugger's per-pid connection.
+    #[test]
+    fn map_local_service_jdwp_family_bridged_verbatim() {
+        let f = frontend_with_caps(ServerCapabilities::default());
+        for svc in ["track-jdwp", "track-app", "jdwp", "jdwp:12345"] {
+            match f.map_local_service(svc, None) {
+                Ok(ADBLocalCommand::Raw(s)) => assert_eq!(s, svc, "forwarded verbatim"),
+                Ok(_) => panic!("jdwp-family service {svc} must map to Raw"),
+                Err(e) => panic!("jdwp-family {svc} must be accepted (adbd core): {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_local_service_localabstract_unsupported() {
+        // reverse: is routed by serve_reverse before map_local_service, so it is
+        // not exercised here. localabstract remains unbridged.
         let f = frontend_with_caps(
             ServerCapabilities::default()
                 .with_feature("sync_v2")
                 .with_shell_v2(),
         );
-        // reverse: is routed by serve_reverse before map_local_service, so it is
-        // not exercised here. jdwp/localabstract remain unbridged.
-        assert!(f.map_local_service("jdwp:1234", None).is_err());
         assert!(f.map_local_service("localabstract:foo", None).is_err());
     }
 

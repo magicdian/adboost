@@ -505,6 +505,49 @@ Rules:
   the project has no log-assertion machinery in unit tests, so the pure
   builder is the wording lock.
 
+## `exec:` and the JDWP family — the Android Studio deploy/debug services
+
+The AS acceptance round (`adboost` holding `:5037` + real Android Studio)
+surfaced a third class of missing local services, all caught live by the
+unknown-service WARN funnel:
+
+- **`exec:<command>`** — the shell-v2 one-shot subprocess (adbd
+  `StartSubprocess(kRaw, kNone)`: no PTY, raw byte stream both directions).
+  AS's whole deploy pipeline rides it: the deployer agent
+  (`exec:/data/local/tmp/.studio/bin/installer …`) and the streaming APK
+  write (`exec:cmd package install-write … -`, the trailing `-` reading the
+  APK from **stdin** — the bridge's bidirectional copy already carries it).
+  Bridged verbatim (`Raw(service)`), gated on the same two-axis `shell_v2`
+  check as `shell,v2` (a pre-v2 adbd would `CLSE` the OPEN).
+- **`track-jdwp` / `track-app` / `jdwp` / `jdwp:<pid>`** — adbd's core JDWP
+  services (no capability gating; every adbd implements them): the streaming
+  debuggable-process trackers (framed by adbd itself, pushed on change — the
+  IDE debugger's process monitor polls `track-jdwp` ~1/s), the one-shot list
+  socket the `adb jdwp` CLI opens (NOTE: bare `jdwp`, no pid — distinct from
+  `jdwp:<pid>`), and the debugger's raw per-pid connection. All bridge
+  verbatim.
+
+> **Gotcha — the services live in adbd, not the adb server.** All of the
+> above are `daemon_service_to_socket`/`daemon_service_to_fd` entries in
+> AOSP `daemon/services.cpp`, so adboost passes them through and lets adbd do
+> the work — no server-side JDWP tracker to reimplement. (The `adb jdwp` CLI
+> sends bare `jdwp`, NOT `track-jdwp`; AS sends `track-jdwp`. Both must be
+> bridged or one consumer silently breaks while the other works.)
+
+`serve_local_service`'s capability pre-lookup now covers `exec:` alongside
+`sync:`/`shell,` (the gate consults the device banner); the jdwp family skips
+it entirely.
+
+### Tests Required (assertion points)
+
+- `map_local_service_exec_bridged_verbatim_when_shell_v2_on_both_axes` /
+  `…_denied_for_feature_less_device` / `…_denied_when_server_does_not_advertise`
+- `map_local_service_jdwp_family_bridged_verbatim` (incl. bare `jdwp`)
+- Runtime parity: `parity.rs::case_official_adb_exec_out` (`adb exec-out echo`
+  marker — the CLI driver of `exec:`) and `case_official_adb_jdwp` (`adb jdwp`
+  — the CLI driver of the one-shot list; exit 0 with a possibly-empty pid
+  list is a pass). `service not supported` in either is the REGRESSION marker.
+
 ## Device control services are bridged verbatim like `shell:` v1
 
 `map_local_service` (`frontend.rs`) recognizes a **control-service** family —
@@ -582,7 +625,26 @@ asserts the uid returns to non-zero. All shell calls go through the proxy/server
 so the backend's `get_or_open` / `open_session_with_reopen` retry handles the
 post-restart not-ready window — no direct-USB settle waits are added.
 
-## `host:features` is **per-device** (capability negotiation is two-axis)
+## `host:features` is **per-device**; `host:host-features` is **server-level** (the two features queries are NOT interchangeable)
+
+AOSP has TWO features queries with different semantics (`adb.cpp::
+handle_host_request`), and adblib depends on both:
+
+- **`host:host-features`** (CLI `adb host-features`) — the SERVER-level set:
+  `FeatureSetToString(supported_features())`, no transport resolution, succeeds
+  with zero devices. This is the **FIRST query** Android Studio's adblib
+  `SessionDeviceTracker.pickBestFormat()` makes (it gates the track-devices
+  format choice on the reply) and adblib has **no FAIL fallback** — a missing
+  arm aborted the whole tracker, which kept AS's device list empty even after
+  `track-devices-l` landed (the second reported outage). Answered with
+  `caps.features_csv()` (the honest negotiated set; do NOT add
+  `devicetracker_proto_format` until the proto services exist, and do NOT fake
+  real adb's extras `libusb`/`push_sync` — adboost uses neither).
+- **`host:features`** (CLI `adb features`) — PER-TRANSPORT: AOSP
+  `acquire_one_transport` then `t->features()`. The bare pre-transport form
+  resolves transport-any (zero/multiple devices → the AOSP wording), exactly
+  the `get-state`/`get-serialno` bare-form pattern; the post-transport form
+  answers for the already-selected transport.
 
 Capability advertising/gating has **two axes**, and a wire-framing-changing
 feature (`shell_v2`, `sync_v2`) needs BOTH to be true before it is offered or
@@ -590,7 +652,7 @@ opened:
 
 1. **Backend-can-bridge** (server-global): `DeviceBackend::capabilities()` →
    `ServerCapabilities::negotiated_with` at `serve()` time. This is what
-   `adboost` *implements*.
+   `adboost` *implements* — and what `host:host-features` reports.
 2. **Device-supports** (per-device): the target device's own CNXN banner,
    parsed by `DeviceFeatureSet::from_banner` and exposed as
    `PersistentConnection::peer_features()`. Looked up on demand via
@@ -598,7 +660,7 @@ opened:
    `DefaultDeviceBackend` returns the connection's cached banner set, handshaking
    within the timeout if needed). `DeviceEntry.capabilities: Option<DeviceFeatureSet>`
    carries it through `list_devices`/`track-devices` (`None` = not yet known →
-   conservative).
+   conservative). This is what every `host:features` form reports.
 
 **Why this exists** (the bug it fixes): one backend can front devices of
 differing capability — e.g. a full Android adbd (banner has `shell_v2`) and a
@@ -612,9 +674,10 @@ stripped device, which `CLSE`s the OPEN (`open session failed`). Per-device
 
 | Site | `frontend.rs` | Rule |
 |---|---|---|
-| pre-transport `host:features` (no serial) | `host_data_query_payload` | global caps only (no device chosen yet — unavoidable) |
+| `host:host-features` (pre- or post-transport) | `host_data_query_payload` + post-transport routing | **server set** (`caps.features_csv()`); works with zero devices — adblib's FIRST query |
+| pre-transport bare `host:features` (no serial) | `host_data_query_payload` | **per-device**: transport-any single-device resolution → `device_features_csv(serial)`; AOSP FAIL wording on zero/multiple (was: global caps — the misalignment the second outage exposed) |
 | post-transport `host:features` | after `TransportSelected` | `intersected_with_device(serial)` — **per-device** (native `adb -s … shell` gates v1/v2 on this) |
-| `host-serial:<serial>:features` | `dispatch_host_serial` | `intersected_with_device(serial)` — **per-device** |
+| `host-serial:<serial>:features` | `dispatch_host_serial` | `intersected_with_device(serial)` — **per-device**; the bare form must stay byte-identical to it |
 | `shell,v2` / `sync:` open gate | `map_local_service(svc, device_caps)` | `device_has_feature(feat, device_caps)` — **defense-in-depth fallback**: FAIL cleanly instead of passing an OPEN the device will `CLSE` |
 
 **Banner → server-feature mapping**: `shell_v2`(server) ⟸ `shell_v2`(banner);
@@ -627,6 +690,40 @@ caps (unknown) drops both framing features — conservative.
 > advertise to the device") distinct from `peer_features()` ("what the *device*
 > advertised to us"). Per-device negotiation reads `peer_features()`. Conflating
 > them is exactly the misread the original bug report made.
+
+> **Gotcha — client-side naming trap.** adboost's own client enum variant
+> `ADBHostCommand::HostFeatures` renders the **per-transport** wire form
+> `host:features` (NOT the server-level `host:host-features`). It is correct
+> for its only consumer — `ADBProxyDevice::host_features()`, which always
+> sends it **post-transport** (`set_serial_transport()` first) so `shell_command`
+> can gate v1/v2 on the device's set. Do not "fix" its rendering to
+> `host:host-features`: that would make the v1/v2 gate read the SERVER set and
+> offer `shell,v2` to feature-less devices against real adb servers.
+
+### Tests Required (assertion points)
+
+Inline in `frontend.rs` (run with `--features "server,usb"`):
+
+- `host_features_service_replies_server_set_with_zero_devices` → OKAY +
+  honest csv with zero devices (the adblib first-query property); must NOT
+  contain `devicetracker_proto_format`
+- `bare_features_with_single_device_replies_per_device_csv` → the device's set
+  (a banner lacking `shell_v2` is not offered it even when the server
+  advertises it — what distinguishes the two queries)
+- `bare_features_with_no_devices_fails_no_devices` /
+  `bare_features_with_multiple_devices_fails_more_than_one` → AOSP
+  transport-any wording
+- `bare_features_matches_pinned_host_serial_features` → bare byte-equals
+  `host-serial:<s>:features`
+
+Runtime selftest (`adboost_cli selftest`, both once per run, non-destructive):
+
+- `parity.rs::case_official_adb_host_features` — `adb -P <port> host-features`
+  succeeds; `unknown host service` is the REGRESSION marker; also locks the
+  no-`devicetracker_proto_format` honesty invariant
+- `parity.rs::case_official_adb_features` — `adb -P <port> features`: single
+  device → a listing containing `cmd`; multi-device → the AOSP ambiguity
+  wording (NOT the collapsed `device not found`)
 
 ### Customizing the FAIL reason on a `map_local_service` rejection
 

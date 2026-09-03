@@ -12,7 +12,7 @@ pub enum LocalCommand {
 
 #[derive(Parser, Debug)]
 pub enum LocalDeviceCommand {
-    /// List available server features.
+    /// List the selected device's features (per-transport `host:features`).
     HostFeatures,
     /// Get logs of device
     Logcat {

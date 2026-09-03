@@ -216,6 +216,14 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
     // guard for the `unknown host service: get-state` regression that broke
     // `adb root`/`unroot`. Whole-server property, non-destructive → ONCE.
     run_get_state_parity_against_server(reporter, server.addr()).await;
+    // `adb host-features` (SERVER-level `host:host-features`) routing parity:
+    // adblib's FIRST query — a missing arm aborts its whole device tracker
+    // (the second AS blank-device-list regression). Whole-server property,
+    // non-destructive → ONCE.
+    run_host_features_parity_against_server(reporter, server.addr()).await;
+    // Bare `adb features` (per-transport `host:features`) parity: single-device
+    // happy path + multi-device AOSP ambiguity. Whole-server property → ONCE.
+    run_features_parity_against_server(reporter, server.addr(), multi).await;
 
     // Automated root → unroot cycle, ONCE on the FIRST serial, driven THROUGH this
     // SAME in-process server via a fresh `ADBProxyDevice`. Running it through the
@@ -275,7 +283,7 @@ async fn run_reverse_cases(reporter: &mut Reporter, device: &mut ADBProxyDevice)
     }
 }
 
-/// Run the official-adb parity case against the running adboost server, or
+/// Run the official-adb parity cases against the running adboost server, or
 /// SKIP the group when no `adb` binary is available.
 async fn run_parity_against_server(
     reporter: &mut Reporter,
@@ -285,13 +293,25 @@ async fn run_parity_against_server(
     if parity::adb_available().await {
         let outcome = parity::case_official_adb_shell(addr, serial).await;
         run_one(reporter, "parity", "official_adb_shell", outcome);
+        // `exec-out` drives the `exec:` service (AS's deploy/install pipeline);
+        // `jdwp` drives `track-jdwp` (the AS debugger's process monitor).
+        let outcome = parity::case_official_adb_exec_out(addr, serial).await;
+        run_one(reporter, "parity", "official_adb_exec_out", outcome);
+        let outcome = parity::case_official_adb_jdwp(addr, serial).await;
+        run_one(reporter, "parity", "official_adb_jdwp", outcome);
     } else {
-        run_one(
-            reporter,
-            "parity",
+        for case in [
             "official_adb_shell",
-            Outcome::Skipped("official `adb` binary not found on PATH".into()),
-        );
+            "official_adb_exec_out",
+            "official_adb_jdwp",
+        ] {
+            run_one(
+                reporter,
+                "parity",
+                case,
+                Outcome::Skipped("official `adb` binary not found on PATH".into()),
+            );
+        }
     }
 }
 
@@ -352,6 +372,51 @@ async fn run_get_state_parity_against_server(
             reporter,
             "parity",
             "official_adb_get_state",
+            Outcome::Skipped("official `adb` binary not found on PATH".into()),
+        );
+    }
+}
+
+/// Run the `host:host-features` routing parity case (the SERVER-level feature
+/// query, `adb host-features`) against the running adboost server, or SKIP
+/// when no `adb` binary is available. Non-destructive, so it runs once per run
+/// regardless of device count. This is the runtime guard for the second AS
+/// blank-device-list regression (adblib queries host-features FIRST, before
+/// track-devices-l, with no FAIL fallback).
+async fn run_host_features_parity_against_server(
+    reporter: &mut Reporter,
+    addr: std::net::SocketAddrV4,
+) {
+    if parity::adb_available().await {
+        let outcome = parity::case_official_adb_host_features(addr).await;
+        run_one(reporter, "parity", "official_adb_host_features", outcome);
+    } else {
+        run_one(
+            reporter,
+            "parity",
+            "official_adb_host_features",
+            Outcome::Skipped("official `adb` binary not found on PATH".into()),
+        );
+    }
+}
+
+/// Run the bare per-transport `host:features` parity case (`adb features`, no
+/// `-s`) against the running adboost server, or SKIP when no `adb` binary is
+/// available. Whole-server property (ambiguity under multi-device), so it runs
+/// once per run.
+async fn run_features_parity_against_server(
+    reporter: &mut Reporter,
+    addr: std::net::SocketAddrV4,
+    multi: bool,
+) {
+    if parity::adb_available().await {
+        let outcome = parity::case_official_adb_features(addr, multi).await;
+        run_one(reporter, "parity", "official_adb_features", outcome);
+    } else {
+        run_one(
+            reporter,
+            "parity",
+            "official_adb_features",
             Outcome::Skipped("official `adb` binary not found on PATH".into()),
         );
     }
