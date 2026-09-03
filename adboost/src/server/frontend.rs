@@ -285,6 +285,7 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         }
 
         let Some(svc) = service.strip_prefix("host:") else {
+            warn_unsupported_service(service, stream);
             stream
                 .write_all(&protocol::fail(&format!("unknown service: {service}")))
                 .await?;
@@ -312,27 +313,16 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
 
         match svc {
             "track-devices" => {
-                self.serve_track_devices(stream).await?;
+                self.serve_track_devices(stream, DeviceListFormat::Short)
+                    .await?;
                 Ok(HostOutcome::Close)
             }
-            "kill" => {
-                match self.caps.kill_policy() {
-                    KillPolicy::Reject => {
-                        stream
-                            .write_all(&protocol::fail("kill not permitted"))
-                            .await?;
-                    }
-                    KillPolicy::Shutdown => {
-                        stream.write_all(&protocol::okay()).await?;
-                        // The accept loop owns process lifetime; signal-based
-                        // shutdown is the CLI's job. Here we just accept and let
-                        // the socket close. A richer takeover hook can be added
-                        // when a shutdown channel is threaded through.
-                        tracing::info!("host:kill accepted (KillPolicy::Shutdown)");
-                    }
-                }
+            "track-devices-l" => {
+                self.serve_track_devices(stream, DeviceListFormat::Long)
+                    .await?;
                 Ok(HostOutcome::Close)
             }
+            "kill" => self.serve_host_kill(stream).await,
             "transport-any" => self.select_transport_any(stream).await,
             "transport-usb" => {
                 self.select_transport_kind(stream, Some(TransportKind::Usb))
@@ -385,12 +375,36 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 Ok(HostOutcome::Close)
             }
             other => {
+                // Log the full request string (with its `host:` prefix) — the
+                // FAIL reason strips it, but the diagnostic should carry
+                // exactly what the client sent.
+                warn_unsupported_service(service, stream);
                 stream
                     .write_all(&protocol::fail(&format!("unknown host service: {other}")))
                     .await?;
                 Ok(HostOutcome::Close)
             }
         }
+    }
+
+    /// `host:kill` — reply per the negotiated [`KillPolicy`]: refuse (FAIL) or
+    /// accept (bare OKAY). The accept loop owns process lifetime; signal-based
+    /// shutdown is the CLI's job, so accepting here just lets the socket close.
+    /// A richer takeover hook can be added when a shutdown channel is threaded
+    /// through.
+    async fn serve_host_kill(&self, stream: &mut TcpStream) -> std::io::Result<HostOutcome> {
+        match self.caps.kill_policy() {
+            KillPolicy::Reject => {
+                stream
+                    .write_all(&protocol::fail("kill not permitted"))
+                    .await?;
+            }
+            KillPolicy::Shutdown => {
+                stream.write_all(&protocol::okay()).await?;
+                tracing::info!("host:kill accepted (KillPolicy::Shutdown)");
+            }
+        }
+        Ok(HostOutcome::Close)
     }
 
     /// Payload for a simple host *data query* (`version`/`features`/`devices`/
@@ -410,9 +424,12 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             "features" => Some(Ok(self.caps.features_csv())),
             "devices" => Some(Ok(format_devices(
                 &self.backend.list_devices().await,
-                false,
+                DeviceListFormat::Short,
             ))),
-            "devices-l" => Some(Ok(format_devices(&self.backend.list_devices().await, true))),
+            "devices-l" => Some(Ok(format_devices(
+                &self.backend.list_devices().await,
+                DeviceListFormat::Long,
+            ))),
             "get-state" | "get-serialno" => {
                 // Bare, no serial-prefixed form: resolve the single connected
                 // device (transport-any semantics) and reply with the payload
@@ -453,7 +470,10 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         // sub-service anchor rather than the first colon.
         if let Some(rest) = service.strip_prefix("host-serial:") {
             if let Some((serial, sub)) = split_host_serial(rest) {
-                return Ok(Some(self.dispatch_host_serial(stream, serial, sub).await?));
+                return Ok(Some(
+                    self.dispatch_host_serial(stream, service, serial, sub)
+                        .await?,
+                ));
             }
             stream
                 .write_all(&protocol::fail("malformed host-serial request"))
@@ -469,7 +489,9 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             ("host-local:", TransportKind::Local),
         ] {
             if let Some(sub) = service.strip_prefix(prefix) {
-                return Ok(Some(self.dispatch_host_kind(stream, kind, sub).await?));
+                return Ok(Some(
+                    self.dispatch_host_kind(stream, service, kind, sub).await?,
+                ));
             }
         }
 
@@ -477,16 +499,26 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         // emitted by modern `adb` during the `adb root` reconnect handshake
         // (`host-transport-id:<N>:wait-for-any-disconnect`).
         if let Some(rest) = service.strip_prefix("host-transport-id:") {
-            return Ok(Some(self.dispatch_host_transport_id(stream, rest).await?));
+            return Ok(Some(
+                self.dispatch_host_transport_id(stream, service, rest)
+                    .await?,
+            ));
         }
 
         Ok(None)
     }
 
-    /// `host-serial:<serial>:<sub>` single-device queries.
+    /// `host-serial:<serial>:<sub>` single-device queries — also the funnel the
+    /// kind-pinned (`host-usb:`/`host-local:`) and id-pinned
+    /// (`host-transport-id:`) families run through, so every pinned form shares
+    /// identical sub-service semantics. `service` is the client's original
+    /// request string (the parsed `serial`/`sub` may have lost its family
+    /// prefix); it is carried along so an unknown sub-service logs exactly what
+    /// the client sent.
     async fn dispatch_host_serial(
         &self,
         stream: &mut TcpStream,
+        service: &str,
         serial: &str,
         sub: &str,
     ) -> std::io::Result<HostOutcome> {
@@ -547,6 +579,7 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                     .await?;
             }
             other => {
+                warn_unsupported_service(service, stream);
                 stream
                     .write_all(&protocol::fail(&format!(
                         "unknown host-serial sub-service: {other}"
@@ -562,14 +595,19 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     /// that kind — replying `FAIL` with the kind-specific AOSP wording on zero /
     /// more-than-one — then runs the sub-service through [`Self::dispatch_host_serial`]
     /// so kind- and serial-pinned queries share identical sub-service semantics.
+    /// `service` is the original request string, forwarded for diagnostics.
     async fn dispatch_host_kind(
         &self,
         stream: &mut TcpStream,
+        service: &str,
         kind: TransportKind,
         sub: &str,
     ) -> std::io::Result<HostOutcome> {
         match self.resolve_single_by_kind(Some(kind)).await {
-            Ok(serial) => self.dispatch_host_serial(stream, &serial, sub).await,
+            Ok(serial) => {
+                self.dispatch_host_serial(stream, service, &serial, sub)
+                    .await
+            }
             Err(reason) => {
                 stream.write_all(&protocol::fail(reason)).await?;
                 Ok(HostOutcome::Close)
@@ -584,10 +622,12 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
     /// uses for kind-pinned queries. Unlike `host-serial:`, `<N>` is a bare u64
     /// that never contains a colon, so a plain `split_once(':')` is correct.
     /// Failure wording mirrors [`Self::select_transport_by_id`] so every id-keyed
-    /// path reports the same AOSP-aligned errors.
+    /// path reports the same AOSP-aligned errors. `service` is the original
+    /// request string, forwarded for diagnostics.
     async fn dispatch_host_transport_id(
         &self,
         stream: &mut TcpStream,
+        service: &str,
         rest: &str,
     ) -> std::io::Result<HostOutcome> {
         let Some((id_str, sub)) = rest.split_once(':') else {
@@ -603,7 +643,8 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
             return Ok(HostOutcome::Close);
         };
         if let Some(serial) = self.serial_for_transport_id(id).await {
-            self.dispatch_host_serial(stream, &serial, sub).await
+            self.dispatch_host_serial(stream, service, &serial, sub)
+                .await
         } else {
             stream
                 .write_all(&protocol::fail("no device for transport id"))
@@ -1122,12 +1163,25 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         protocol::transport_id_for_index(id, &serials)
     }
 
-    /// `host:track-devices` — write OKAY, then a full snapshot on every change.
-    async fn serve_track_devices(&self, stream: &mut TcpStream) -> std::io::Result<()> {
+    /// `host:track-devices` / `host:track-devices-l` — write OKAY, then a full
+    /// snapshot (rendered in `format`) on every device-set change. The socket
+    /// stays open, streaming one framed listing per change, until the client
+    /// hangs up or the backend's change stream closes.
+    ///
+    /// `track-devices-l` is the service modern Android Studio (adblib
+    /// `SessionDeviceTracker`) tracks devices over: adblib picks the LONG
+    /// format whenever `host:features` lacks `devicetracker_proto_format` and
+    /// has **no fallback** to the legacy short service on FAIL — a missing arm
+    /// reads as an empty device list in the IDE.
+    async fn serve_track_devices(
+        &self,
+        stream: &mut TcpStream,
+        format: DeviceListFormat,
+    ) -> std::io::Result<()> {
         stream.write_all(&protocol::okay()).await?;
         let mut rx = self.backend.subscribe_changes().await;
         while let Some(snapshot) = rx.recv().await {
-            let listing = format_devices(&snapshot, false);
+            let listing = format_devices(&snapshot, format);
             let Some(frame) = protocol::encode_framed(&listing) else {
                 tracing::warn!("track-devices snapshot too large to frame, skipping");
                 continue;
@@ -1171,6 +1225,10 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
         let cmd = match self.map_local_service(service, device_caps.as_ref()) {
             Ok(cmd) => cmd,
             Err(default_reason) => {
+                // Log the frontend's routing decision (the backend hook below
+                // may rewrite the client-facing reason, but the fact that this
+                // service was not routable is the diagnostic).
+                warn_unsupported_service(service, &stream);
                 // The reason here is frontend-hardcoded; give the backend a chance
                 // to substitute an actionable one (e.g. a non-adbd bridge pointing
                 // at its own transfer path). `None` keeps the default verbatim, so
@@ -1343,6 +1401,7 @@ impl<B: DeviceBackend> AdbServerFrontend<B> {
                 Err(e) => stream.write_all(&protocol::fail(&format!("{e}"))).await,
             };
         }
+        warn_unsupported_service(service, stream);
         stream
             .write_all(&protocol::fail(&format!(
                 "unsupported reverse service: {service}"
@@ -1511,14 +1570,37 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<String>>
     })
 }
 
-/// Render a device list as `host:devices` (short) or `host:devices-l` (long).
-fn format_devices(devices: &[DeviceEntry], long: bool) -> String {
+/// The rendering format shared by the device-list services: the one-shot
+/// `host:devices`/`host:devices-l` data queries and the streaming
+/// `host:track-devices`/`host:track-devices-l` services.
+///
+/// AOSP's device-list family varies along exactly this axis (with
+/// `-proto-binary`/`-proto-text` as future extensions gated on the
+/// `devicetracker_proto_format` feature), and the one-shot and streaming
+/// variants of a format MUST render identical lines — a `track-devices-l`
+/// client (Android Studio's adblib `SessionDeviceTracker`) parses the stream
+/// with the same parser `adb devices -l` output feeds it — so both funnels
+/// take this enum instead of each choosing ad hoc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceListFormat {
+    /// `host:devices` / `host:track-devices` — `serial\tstate` lines (the
+    /// legacy short format the platform-tools CLI and old ddmlib consume).
+    Short,
+    /// `host:devices-l` / `host:track-devices-l` — `serial\tstate` plus
+    /// `key:value` extras including `transport_id`.
+    Long,
+}
+
+/// Render a device list in the given [`DeviceListFormat`] — the single
+/// renderer behind the one-shot `host:devices`/`host:devices-l` queries and
+/// the `host:track-devices`/`host:track-devices-l` streams.
+fn format_devices(devices: &[DeviceEntry], format: DeviceListFormat) -> String {
     let serials: Vec<String> = devices.iter().map(|d| d.serial.clone()).collect();
     let mut lines = Vec::with_capacity(devices.len());
     for d in devices {
-        if long {
+        let mut line = format!("{}\t{}", d.serial, d.state.as_wire());
+        if format == DeviceListFormat::Long {
             use std::fmt::Write as _;
-            let mut line = format!("{}\t{}", d.serial, d.state.as_wire());
             if let Some(p) = &d.product {
                 let _ = write!(line, " product:{p}");
             }
@@ -1531,10 +1613,8 @@ fn format_devices(devices: &[DeviceEntry], long: bool) -> String {
             if let Some(id) = protocol::transport_id_for(&d.serial, &serials) {
                 let _ = write!(line, " transport_id:{id}");
             }
-            lines.push(line);
-        } else {
-            lines.push(format!("{}\t{}", d.serial, d.state.as_wire()));
         }
+        lines.push(line);
     }
     lines.join("\n")
 }
@@ -1543,6 +1623,29 @@ fn format_devices(devices: &[DeviceEntry], long: bool) -> String {
 /// payloads) overflow, degrade to a FAIL rather than panic.
 fn reply_or_overflow(reply: Option<Vec<u8>>) -> Vec<u8> {
     reply.unwrap_or_else(|| protocol::fail("reply too large"))
+}
+
+/// The WARN line emitted for a service request this frontend cannot route.
+/// Pure so the diagnostic wording is unit-testable without a subscriber.
+fn unsupported_service_log_line(service: &str, peer: &str) -> String {
+    format!("unsupported adb service: {service} (peer: {peer})")
+}
+
+/// WARN-log a service request this frontend cannot route, with the requesting
+/// peer.
+///
+/// The wire FAIL reply is invisible to whoever operates the server, so an
+/// unimplemented service used to leave no server-side trace at all — the
+/// reported Android Studio blank-device-list outage (its adblib tracks devices
+/// via `host:track-devices-l`) could only be diagnosed by decompiling the
+/// client. Every unknown-service FAIL path funnels through here so the
+/// diagnostic wording cannot drift; the FAIL replies themselves stay
+/// byte-identical (logging is additive only).
+fn warn_unsupported_service(service: &str, stream: &TcpStream) {
+    let peer = stream
+        .peer_addr()
+        .map_or_else(|_| "unknown".to_string(), |p| p.to_string());
+    tracing::warn!("{}", unsupported_service_log_line(service, &peer));
 }
 
 /// Enable `TCP_NODELAY` on a freshly-accepted **client-facing** socket (SEG A:
@@ -1730,6 +1833,24 @@ mod tests {
 
     fn frontend_with(devices: Vec<DeviceEntry>) -> AdbServerFrontend<MockBackend> {
         AdbServerFrontend::builder(Arc::new(MockBackend { devices })).build()
+    }
+
+    /// Strip the 4-byte status + 4-hex length prefix from an `OKAY`/`FAIL`
+    /// reply and return the framed payload, asserting the declared length
+    /// matches what was actually sent (so a mis-framed reply fails loudly).
+    fn framed_payload(reply: &str) -> &str {
+        let rest = reply
+            .strip_prefix("OKAY")
+            .or_else(|| reply.strip_prefix("FAIL"))
+            .expect("reply starts with a 4-byte status");
+        let (len_str, payload) = rest.split_at(4);
+        let len = usize::from_str_radix(len_str, 16).expect("4-hex length prefix");
+        assert_eq!(
+            payload.len(),
+            len,
+            "framed length {len_str} must match the payload actually sent"
+        );
+        payload
     }
 
     /// Drive one request/response against `handle_client` over a real socketpair.
@@ -2123,6 +2244,122 @@ mod tests {
         assert!(body.contains("aaa\tdevice"));
         assert!(body.contains("transport_id:1"));
         assert!(body.contains("transport_id:2"));
+    }
+
+    // ---- streaming device-list family: track-devices / track-devices-l -------
+    //
+    // `host:track-devices-l` is the service modern Android Studio (adblib
+    // `SessionDeviceTracker`) lists devices over; adblib has NO fallback to the
+    // legacy short service on FAIL, so these lock both formats and — critically
+    // — that the streaming and one-shot renderers of a format produce identical
+    // bytes (one shared `format_devices` core).
+
+    #[tokio::test]
+    async fn track_devices_streams_short_format_snapshot() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("solo")]));
+        let resp = round_trip(f, "host:track-devices").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        // Legacy short format: `serial\tstate` only — no transport_id / extras.
+        assert_eq!(
+            framed_payload(&body),
+            "solo\tdevice",
+            "track-devices snapshot must stay the legacy short format"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_devices_l_streams_long_format_snapshot() {
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("zzz"),
+            DeviceEntry::new("aaa"),
+        ]));
+        let resp = round_trip(f, "host:track-devices-l").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("OKAY"), "got: {body}");
+        // Byte-locked long-format lines: state + transport_id over the sorted
+        // serial set. adblib's DeviceListTextParser(LONG_FORMAT) consumes exactly
+        // these columns (tab-split, optional key:value extras).
+        assert_eq!(
+            framed_payload(&body),
+            "zzz\tdevice transport_id:2\naaa\tdevice transport_id:1",
+            "track-devices-l snapshot must be the devices-l long format"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_devices_l_payload_matches_one_shot_devices_l() {
+        // The streaming and one-shot LONG renderers MUST agree byte-for-byte —
+        // they share `format_devices`, and a client parsing both (adblib) can
+        // only rely on the stream if the bytes are identical.
+        let f = Arc::new(frontend_with(vec![
+            DeviceEntry::new("zzz"),
+            DeviceEntry::new("aaa"),
+        ]));
+        let streamed = round_trip(Arc::clone(&f), "host:track-devices-l").await;
+        let one_shot = round_trip(Arc::clone(&f), "host:devices-l").await;
+        assert_eq!(
+            framed_payload(&String::from_utf8(streamed).unwrap()),
+            framed_payload(&String::from_utf8(one_shot).unwrap()),
+            "track-devices-l first snapshot must byte-equal the host:devices-l reply"
+        );
+    }
+
+    // ---- unknown-service FAILs: AOSP wording stays byte-identical ------------
+    //
+    // Requirement R2 adds WARN logging to every unknown-service path; these lock
+    // that the FAIL replies themselves did not change (logging is additive only).
+
+    #[tokio::test]
+    async fn unknown_service_fails_with_aosp_wording() {
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "bogus:xyz").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert_eq!(
+            framed_payload(&body),
+            "unknown service: bogus:xyz",
+            "non-host-prefixed unknown request wording must stay AOSP-exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_host_service_fails_with_aosp_wording() {
+        // `host:track-devices-proto-binary` is the deliberately-still-missing
+        // proto variant (P1: must ship together with the
+        // `devicetracker_proto_format` feature flag) — using it here doubles as
+        // documentation of that known gap.
+        let f = Arc::new(frontend_with(vec![]));
+        let resp = round_trip(f, "host:track-devices-proto-binary").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert_eq!(
+            framed_payload(&body),
+            "unknown host service: track-devices-proto-binary",
+            "unknown host service wording must stay AOSP-exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_host_serial_sub_fails_with_aosp_wording() {
+        let f = Arc::new(frontend_with(vec![DeviceEntry::new("known")]));
+        let resp = round_trip(f, "host-serial:known:bogus-sub").await;
+        let body = String::from_utf8(resp).unwrap();
+        assert!(body.starts_with("FAIL"), "got: {body}");
+        assert_eq!(
+            framed_payload(&body),
+            "unknown host-serial sub-service: bogus-sub",
+            "unknown host-serial sub-service wording must stay AOSP-exact"
+        );
+    }
+
+    #[test]
+    fn unsupported_service_log_line_includes_service_and_peer() {
+        assert_eq!(
+            unsupported_service_log_line("host:track-devices-l", "127.0.0.1:54321"),
+            "unsupported adb service: host:track-devices-l (peer: 127.0.0.1:54321)",
+            "the WARN diagnostic must name the service and the requesting peer"
+        );
     }
 
     #[tokio::test]
@@ -3009,9 +3246,12 @@ mod tests {
             capabilities: None,
             kind: None,
         }];
-        assert_eq!(format_devices(&devices, false), "s1\tdevice");
         assert_eq!(
-            format_devices(&devices, true),
+            format_devices(&devices, DeviceListFormat::Short),
+            "s1\tdevice"
+        );
+        assert_eq!(
+            format_devices(&devices, DeviceListFormat::Long),
             "s1\tdevice product:prod model:mod device:dev transport_id:1"
         );
     }

@@ -22,6 +22,7 @@ mod cases;
 mod channels;
 mod interactive;
 mod parity;
+mod protocol_cases;
 mod report;
 mod reverse_cases;
 
@@ -124,10 +125,10 @@ pub async fn run(cmd: SelftestCommand) -> ADBCliResult<()> {
 }
 
 /// Approximate automated cases per device, for the run banner count only:
-/// 4 `usb_direct` + 5 `through_server` + forward + parity ≈ 11. The banner is an
-/// estimate; the final summary reports exact counts.
+/// 4 `usb_direct` + 5 `through_server` + forward + parity + protocol ≈ 12. The
+/// banner is an estimate; the final summary reports exact counts.
 fn estimated_cases_per_device() -> usize {
-    11
+    12
 }
 
 /// Run the automated `root → unroot` cycle ONCE, on the FIRST serial, THROUGH the
@@ -197,6 +198,11 @@ async fn run_through_server_phase(reporter: &mut Reporter, serials: &[String], m
         // Optional parity: drive the SAME adboost server with the official `adb`
         // client (auto-detected; SKIPPED when adb is absent).
         run_parity_against_server(reporter, server.addr(), serial).await;
+        // Raw-wire device-list streaming family — speaks the smartsocket
+        // protocol directly (the adblib/Android-Studio-shaped client, which no
+        // `adb` CLI invocation covers), always runnable (no external binary).
+        let outcome = protocol_cases::case_track_devices_family(server.addr(), serial).await;
+        run_one(reporter, "protocol", "track_devices_family", outcome);
     }
     // Ambiguous-selection parity: only meaningful with >1 device, and it tests
     // ambiguity across the whole device set, so it runs ONCE (not per serial).

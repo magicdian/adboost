@@ -78,6 +78,14 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
         forward_release,
     );
 
+    let track_hotplug = case_track_devices_l_hotplug(&subject).await;
+    record(
+        reporter,
+        "interactive",
+        "track_devices_l_hotplug",
+        track_hotplug,
+    );
+
     let pty_hup = case_pty_hup_kills_process_group(&subject).await;
     record(reporter, "interactive", "pty_hup_process_group", pty_hup);
 
@@ -92,6 +100,87 @@ pub async fn run_interactive_phase(reporter: &mut Reporter, devices: &[&Discover
     // ALWAYS LAST — see the ordering invariant above.
     let reboot = case_reboot_recovery(&subject).await;
     record(reporter, "interactive", "reboot_recovery", reboot);
+}
+
+/// Streaming `host:track-devices-l` on real hotplug: open the stream against an
+/// in-process server, verify the initial long-format snapshot, then have the
+/// operator unplug and re-plug the device — asserting fresh snapshots arrive on
+/// the SAME connection without re-requesting. That push-on-change contract is
+/// what Android Studio's device tracker relies on (its device list must follow
+/// plug/unplug live), and no `adb` CLI invocation exercises it.
+async fn case_track_devices_l_hotplug(serial: &str) -> Outcome {
+    if is_tcpip_serial(serial) {
+        return Outcome::Skipped("subject is a tcpip device, not a USB-unplug subject".into());
+    }
+    let server = match InProcessServer::start().await {
+        Ok(s) => s,
+        Err(e) => return Outcome::Skipped(format!("cannot start in-process server: {e}")),
+    };
+    // Run the body separately so the server is ALWAYS shut down gracefully on
+    // every exit path (one shutdown call, not one per return).
+    let outcome = track_devices_l_hotplug_body(serial, server.addr()).await;
+    server.shutdown().await;
+    outcome
+}
+
+/// The [`case_track_devices_l_hotplug`] body, against an already-running
+/// in-process server.
+async fn track_devices_l_hotplug_body(serial: &str, addr: std::net::SocketAddrV4) -> Outcome {
+    /// How long to wait, after each prompt, for the expected snapshot.
+    const HOTPLUG_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let mut tracker =
+        match super::protocol_cases::TrackStream::open(addr, "host:track-devices-l").await {
+            Ok(t) => t,
+            Err(e) => return Outcome::Failed(format!("host:track-devices-l: {e}")),
+        };
+    let initial = match tracker.next_snapshot(HOTPLUG_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => return Outcome::Failed(format!("initial snapshot: {e}")),
+    };
+    if !super::protocol_cases::snapshot_has_serial(&initial, serial) {
+        return Outcome::Failed(format!(
+            "initial track-devices-l snapshot lacks a line for {serial}: {initial:?}"
+        ));
+    }
+    if !initial.contains("transport_id:") {
+        return Outcome::Failed(format!(
+            "track-devices-l snapshot is not the LONG format (no transport_id): {initial:?}"
+        ));
+    }
+
+    println!();
+    println!("[track_devices_l] Please UNPLUG the device {serial} now.");
+    loop {
+        let snapshot = match tracker.next_snapshot(HOTPLUG_TIMEOUT).await {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(format!("waiting for removal snapshot: {e}")),
+        };
+        if !super::protocol_cases::snapshot_has_serial(&snapshot, serial) {
+            break;
+        }
+    }
+    println!("[track_devices_l] Removal seen in the stream. Now RE-PLUG the device {serial}.");
+    loop {
+        let snapshot = match tracker.next_snapshot(HOTPLUG_TIMEOUT).await {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(format!("waiting for return snapshot: {e}")),
+        };
+        if super::protocol_cases::snapshot_has_serial(&snapshot, serial) {
+            break;
+        }
+    }
+
+    // Best-effort readiness gate (mirrors `case_usb_forward_release_on_unplug`):
+    // hand the device back stable so the next case does not open a
+    // not-yet-ready device. A failure here MUST NOT change the conclusion —
+    // the streaming contract was already proven above.
+    if let Outcome::Failed(reason) = verify_shell_after_recovery(serial).await {
+        tracing::warn!(
+            "[track_devices_l] device {serial} returned but did not stabilize: {reason}"
+        );
+    }
+    Outcome::Passed
 }
 
 /// PTY-HUP process-group kill: open a PTY-allocated `shell,v2` session running a

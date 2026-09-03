@@ -394,6 +394,117 @@ what issues `host:tport:any` before `shell:`). Covered by a parity case:
 
 ---
 
+## The device-list family: `devices`/`devices-l`/`track-devices`/`track-devices-l` share ONE renderer
+
+The four device-list services differ along exactly two axes — one-shot vs
+streaming, and short vs long rendering — so both axes are modeled once and
+every service is a thin combination of shared pieces:
+
+| Service | Shape | Format |
+|---|---|---|
+| `host:devices` | one-shot `OKAY`+framed (`host_data_query_payload`) | `Short` |
+| `host:devices-l` | one-shot (`host_data_query_payload`) | `Long` |
+| `host:track-devices` | streaming (`serve_track_devices`) | `Short` |
+| `host:track-devices-l` | streaming (`serve_track_devices`) | `Long` |
+
+- `DeviceListFormat` (`frontend.rs`, private enum `Short`/`Long`) is the
+  rendering axis; `format_devices(devices, format)` is the single renderer;
+  `serve_track_devices(stream, format)` is the single streaming loop. A new
+  device-list service = one `dispatch_host_service` arm + (at most) one enum
+  variant — never a second renderer.
+- **The invariant**: the one-shot and streaming variants of a format MUST
+  render byte-identical lines. A `track-devices-l` client (Android Studio's
+  adblib `SessionDeviceTracker`) parses the stream with the same
+  `DeviceListTextParser(LONG_FORMAT)` that handles `devices-l` output. Locked
+  by `track_devices_l_payload_matches_one_shot_devices_l` and the runtime
+  `protocol.track_devices_family` selftest case.
+- Streaming services live in `dispatch_host_service`'s `match svc` arms, NOT
+  in `host_data_query_payload` — that funnel is only for one-shot
+  `OKAY`+framed-payload (or FAIL) data queries.
+
+> **Why `track-devices-l` exists (the reported outage)**: modern Android
+> Studio's adblib `SessionDeviceTracker.pickBestFormat` picks its tracking
+> service from `host:features`: without the `devicetracker_proto_format`
+> feature it chooses LONG and sends `host:track-devices-l`, with **no FAIL
+> fallback** to legacy `track-devices`. A missing arm therefore reads as an
+> EMPTY device list in the IDE while `adb devices` works fine (reported by
+> xdb: AS 2026.1.4 against an xdb-owned `:5037`).
+
+> **Gotcha — the proto variants (P1) must ship together with their feature
+> flag.** `track-devices-proto-binary`/`-proto-text` and the
+> `devicetracker_proto_format` `host:features` entry are ONE unit:
+> advertising the flag without the service steers adblib onto the proto path
+> and re-breaks AS with `unknown host service: track-devices-proto-binary`;
+> shipping the service without the flag is merely feature-less (AS keeps
+> using `track-devices-l`, which works). Implement both in one change or
+> neither.
+
+### Tests Required (assertion points)
+
+Inline in `frontend.rs` (run with `--features "server,usb"`):
+
+- `track_devices_streams_short_format_snapshot` → `OKAY` + framed
+  `serial\tstate` (legacy regression: NO `transport_id`)
+- `track_devices_l_streams_long_format_snapshot` → byte-locked long payload
+  (`zzz\tdevice transport_id:2\naaa\tdevice transport_id:1`)
+- `track_devices_l_payload_matches_one_shot_devices_l` → the streaming first
+  snapshot byte-equals the `host:devices-l` reply
+- `format_devices_short_and_long` (the pure renderer, both formats)
+
+Runtime selftest (`adboost_cli selftest`):
+
+- `adboost_cli/src/selftest/protocol_cases.rs::case_track_devices_family` —
+  speaks the smartsocket protocol DIRECTLY over TCP (the
+  adblib/Android-Studio-shaped client; `adb` CLI invocations never send
+  `track-devices-l`), wired once per serial in `run_through_server_phase`
+  under the `protocol` suite: the first `track-devices-l` snapshot is
+  long-format, contains the serial + `transport_id`, and byte-equals
+  `host:devices-l`; the legacy `track-devices` snapshot byte-equals
+  `host:devices`. `protocol_cases::TrackStream` (open + `next_snapshot` with
+  timeout) is the reusable raw-protocol driver.
+- `interactive.rs::case_track_devices_l_hotplug` — operator unplug/replug with
+  the stream open; fresh snapshots must arrive on the SAME connection without
+  re-requesting (the push-on-change contract AS's device list depends on).
+
+## Unknown-service requests WARN-log through one funnel
+
+**The bug this prevents**: every unknown-service FAIL branch used to emit no
+log at all, so a protocol gap was invisible server-side — the AS
+blank-device-list outage above could only be diagnosed by decompiling the
+client. Since then, every client-triggerable "cannot route this service" FAIL
+funnels through `warn_unsupported_service(service, stream)` (`frontend.rs`),
+which logs one line with the exact service string and the requesting peer:
+
+```
+WARN adboost::server::frontend: unsupported adb service: host:track-devices-l (peer: 127.0.0.1:60583)
+```
+
+The five funneled sites (keep in lockstep when adding a new rejection path):
+
+| Site | FAIL wording (AOSP-exact, unchanged) |
+|---|---|
+| `dispatch_host_service` (no `host:`/family prefix) | `unknown service: {service}` |
+| `dispatch_host_service` (`other` arm) | `unknown host service: {other}` |
+| `dispatch_host_serial` (`other` arm) | `unknown host-serial sub-service: {other}` |
+| `serve_local_service` (`map_local_service` reject) | `service not supported: {svc}` (the client-facing reason may be rewritten by the `local_service_reject_reason` backend hook; the log records the frontend's routing decision) |
+| `serve_reverse` (unknown `reverse:` sub) | `unsupported reverse service: {service}` |
+
+Rules:
+
+- **Logging is additive only**: the FAIL reply bytes are the AOSP wire
+  contract and must not change (locked by the
+  `unknown_{service,host_service,host_serial_sub}_fails_with_aosp_wording`
+  tests).
+- The pinned-prefix dispatchers (`dispatch_host_serial` /
+  `dispatch_host_kind` / `dispatch_host_transport_id`) carry the client's
+  ORIGINAL `service` string down to the log — the parsed `serial`/`sub` have
+  lost their family prefix, and the diagnostic must show exactly what the
+  client sent.
+- The message shape is built by the pure `unsupported_service_log_line`
+  (unit-tested via `unsupported_service_log_line_includes_service_and_peer`);
+  the project has no log-assertion machinery in unit tests, so the pure
+  builder is the wording lock.
+
 ## Device control services are bridged verbatim like `shell:` v1
 
 `map_local_service` (`frontend.rs`) recognizes a **control-service** family —
