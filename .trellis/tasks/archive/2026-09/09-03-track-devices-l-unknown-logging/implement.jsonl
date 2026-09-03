@@ -1,0 +1,6 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend spec index: pre-dev checklist routing"}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "the host-protocol contract this task extends (dispatch funnels, error wording, test conventions)"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "tracing macro style/levels for the new warn logs"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, inline-test style, quality gate commands"}
+{"file": ".trellis/tasks/09-03-track-devices-l-unknown-logging/research/wire-contract-and-touchpoints.md", "reason": "verified wire contract + exact code touch points for this task"}
