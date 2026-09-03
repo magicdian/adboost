@@ -1612,3 +1612,36 @@ Implemented the xdb-reported AS blank-device-list fix: host:track-devices-l as a
 ### Next Steps
 
 - None - task complete
+
+
+## Session 40: AS acceptance round: host-features + exec:/JDWP bridging
+
+**Date**: 2026-09-03
+**Task**: AS acceptance round: host-features + exec:/JDWP bridging
+**Branch**: `main`
+
+### Summary
+
+Acceptance-driven round: ran adboost itself on :5037 with the USB claim against real Android Studio. Device visibility confirmed (track-devices-l + host-features from 46df633 working). AS install then failed on the exec: service gap (NOT track-jdwp) — WARN funnel caught the full picture: exec:×15 (deployer agent + streaming install-write), track-jdwp×534 (debug monitor). AOSP-verified all are adbd-side services → bridged verbatim: exec: (two-axis shell_v2 gate) and the JDWP family (track-jdwp/track-app/jdwp/jdwp:<pid>, no gate). Also implemented host:host-features (adblib's FIRST query, server-level, zero-device-safe) and aligned bare host:features to AOSP per-transport semantics; corrected client-side HostFeatures docs (per-transport form, do not re-render). Full acceptance passed: AS sees device, app install succeeded, zero unknown-service WARNs post-fix (only documented-benign re-enumeration noise). 9 new unit tests + 4 parity cases (host-features/features/exec-out/jdwp); spec gained the features-duality section and the exec:/JDWP section.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2695f12` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 39
+- **Total Sessions**: 40
 - **Last Active**: 2026-09-03
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1614 | Active |
+| `journal-1.md` | ~1647 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 40 | 2026-09-03 | AS acceptance round: host-features + exec:/JDWP bridging | `2695f12` | `main` |
 | 39 | 2026-09-03 | adb-server frontend: host:track-devices-l + unknown-service WARN logging | `46df633` | `main` |
 | 38 | 2026-08-06 | 支持裸 host:get-state/get-serialno（transport-any 单设备数据查询） | `9498fea` | `main` |
 | 37 | 2026-07-09 | Support vsock socket-spec in forward | `8550a7b` | `main` |
