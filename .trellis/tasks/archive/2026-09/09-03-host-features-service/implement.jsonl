@@ -1,0 +1,5 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/server-host-protocol.md", "reason": "host-protocol contract: data-query funnel, features two-axis section this task edits"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "tracing style"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "clippy/test conventions"}
+{"file": ".trellis/tasks/09-03-host-features-service/research/host-features-contract.md", "reason": "verified AOSP semantics + touch points"}
