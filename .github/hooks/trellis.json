@@ -3,15 +3,15 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "python3 .github/copilot/hooks/session-start.py",
+        "command": "python3 .github/copilot/hooks/phronia-hook.py --event session-start --platform copilot",
         "timeout": 30
       }
     ],
     "userPromptSubmitted": [
       {
         "type": "command",
-        "bash": "python3 .github/copilot/hooks/inject-workflow-state.py",
-        "powershell": "python3 .github/copilot/hooks/inject-workflow-state.py",
+        "bash": "python3 .github/copilot/hooks/phronia-hook.py --event user-prompt --platform copilot",
+        "powershell": "python3 .github/copilot/hooks/phronia-hook.py --event user-prompt --platform copilot",
         "timeoutSec": 15
       }
     ]

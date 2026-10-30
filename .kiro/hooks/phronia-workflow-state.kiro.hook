@@ -1,0 +1,14 @@
+{
+  "version": "1.0.0",
+  "enabled": true,
+  "name": "phronia-workflow-state",
+  "description": "Inject Phronia workflow state on each prompt",
+  "when": {
+    "type": "promptSubmit"
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "python3 .kiro/hooks/phronia-hook.py --event user-prompt --platform kiro",
+    "timeout": 30
+  }
+}

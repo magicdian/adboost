@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .qoder/hooks/session-start.py",
+            "command": "python3 .qoder/hooks/phronia-hook.py --event session-start --platform qoder",
             "timeout": 30
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .qoder/hooks/session-start.py",
+            "command": "python3 .qoder/hooks/phronia-hook.py --event session-start --platform qoder",
             "timeout": 30
           }
         ]
@@ -26,8 +26,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .qoder/hooks/session-start.py",
+            "command": "python3 .qoder/hooks/phronia-hook.py --event session-start --platform qoder",
             "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|run_in_terminal",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .qoder/hooks/phronia-hook.py --event pre-shell --platform qoder",
+            "timeout": 5
           }
         ]
       }
@@ -37,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .qoder/hooks/inject-workflow-state.py",
+            "command": "python3 .qoder/hooks/phronia-hook.py --event user-prompt --platform qoder",
             "timeout": 15
           }
         ]
