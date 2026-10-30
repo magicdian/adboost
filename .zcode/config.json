@@ -1,0 +1,11 @@
+{
+  "plugins": {
+    "enabled": true,
+    "dirs": [
+      "/Users/magicdian/Documents/personal_project/adboost/.zcode/plugins/phronia"
+    ],
+    "enabledPlugins": {
+      "phronia@inline": true
+    }
+  }
+}
