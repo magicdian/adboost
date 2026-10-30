@@ -54,7 +54,11 @@ adboost/src/
 │   ├── commands/                      one ADB op per file (push, pull, shell, ...)
 │   ├── models/                        adb_rsa_key.rs → ADBRsaKey
 │   ├── usb/                           USBTransport, ADBUSBDevice, persistent.rs
-│   └── tcp/                           TcpTransport, ADBTcpDevice  [+ README.md]
+│   ├── tcp/                           TcpTransport, ADBTcpDevice  [+ README.md]
+│   ├── stream/                        StreamTransport (caller-provided byte stream)  [+ README.md]
+│   ├── framed_read.rs                 sans-io cancel-safe frame parser (`FrameReadBuffer`)
+│   ├── framed_stream.rs               async framing driver shared by tcp/stream
+│   └── adb_transport_message.rs       header/payload wire types + MAX_PAYLOAD
 ├── models/                 data types (selectively re-exported)
 ├── server/                 talks to the local adb server daemon  [+ README.md]
 │   ├── adb_server.rs                  struct ADBServer
@@ -71,6 +75,26 @@ There is **no `transports/` directory** — each transport file is co-located
 with its owning module. There is **no `utils/` directory** in `adboost/src`
 (it is the single file `utils.rs`; nested file-level utils exist, e.g.
 `message_devices/utils.rs`, `message_devices/commands/utils/`).
+
+### Byte-stream transports share one framing driver
+
+`message_devices/tcp/`, `message_devices/stream/` and the USB stack are three
+*connections* over the same wire framing, not three framings:
+
+- `framed_read.rs` (`FrameReadBuffer`) is the **sans-io** half: header decode,
+  `MAX_PAYLOAD` bound, payload assembly, magic integrity, and the "never consume
+  a partial frame" invariant.
+- `framed_stream.rs` is the **async** half: `FrameReader` feeds one chunk read at
+  a time into that buffer (cancel-safe), `write_frame_atomic` implements the
+  frame-atomic write contract, and `FramedStream` owns the independent
+  read/write locks + write-poisoning policy.
+- `TcpTransport` adds only `connect` + the TLS upgrade; `StreamTransport` adds
+  only "already connected" + a diagnostic label.
+
+**Rule**: a new `AsyncRead + AsyncWrite` transport must use `FramedStream`
+rather than re-deriving the lock topology, per-read timeout handling, or write
+poisoning. Copying `FrameReadBuffer`/`write_frame_atomic` into a transport is the
+duplication this split exists to prevent.
 
 ---
 

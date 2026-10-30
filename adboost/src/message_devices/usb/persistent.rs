@@ -62,6 +62,7 @@ use crate::message_devices::adb_transport_message::{
 };
 use crate::message_devices::message_commands::MessageCommand;
 use crate::message_devices::models::{ADBRsaKey, read_adb_private_key};
+use crate::message_devices::stream::StreamTransport;
 use crate::message_devices::usb::flow_control::{
     FlowControl, INITIAL_DELAYED_ACK_BYTES, MAX_PAYLOAD, encode_okay_payload, parse_okay_delta,
 };
@@ -854,6 +855,46 @@ impl PersistentConnection<TcpTransport> {
         };
         let transport = TcpTransport::new(addr, &key_path);
         Self::new_with_features(transport, opts.private_key_path, opts.features).await
+    }
+}
+
+/// Stream-only constructors. Wrap an **already-connected** full-duplex byte
+/// stream (another ADB link's local-service pipe, a Unix socket, an in-memory
+/// duplex pair, a TLS tunnel established by the caller) in a
+/// [`StreamTransport`] and run the same CNXN/AUTH + multiplexer the USB and TCP
+/// paths use.
+///
+/// `connect()` on the transport is a no-op: the caller owns connection setup and
+/// reconnection. For a custom diagnostic label use
+/// `Self::new(StreamTransport::new(stream, label), key)`.
+impl PersistentConnection<StreamTransport> {
+    /// Create a persistent connection over an already-connected stream.
+    ///
+    /// Advertises the honest [`DeviceFeatureSet::default`] banner. To advertise
+    /// a custom feature set, use [`Self::from_stream_with_features`].
+    pub async fn from_stream<S>(stream: S, private_key_path: Option<PathBuf>) -> Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::from_stream_with_features(stream, private_key_path, DeviceFeatureSet::default()).await
+    }
+
+    /// Create a persistent connection over an already-connected stream,
+    /// advertising an explicit feature set.
+    ///
+    /// Use this when the caller knows the wrapped adbd's real capabilities and
+    /// must deliberately avoid advertising features it cannot honor (e.g. a
+    /// legacy adbd that would reject `delayed_ack`).
+    pub async fn from_stream_with_features<S>(
+        stream: S,
+        private_key_path: Option<PathBuf>,
+        features: DeviceFeatureSet,
+    ) -> Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let transport = StreamTransport::new(stream, "stream");
+        Self::new_with_features(transport, private_key_path, features).await
     }
 }
 

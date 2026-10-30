@@ -6,6 +6,11 @@ pub mod usb;
 /// Device reachable over TCP related definition
 pub mod tcp;
 
+/// Device reachable over a caller-provided full-duplex byte stream
+/// (`AsyncRead + AsyncWrite`) — nested/layered ADB links, pipes, TLS tunnels,
+/// in-memory duplex pairs, Unix sockets, `MultiplexedSession`s.
+pub mod stream;
+
 pub(crate) mod adb_message_device;
 mod adb_message_device_commands;
 pub(crate) mod adb_message_transport;
@@ -13,6 +18,10 @@ pub mod adb_session;
 pub(crate) mod adb_transport_message;
 mod commands;
 pub(crate) mod framed_read;
+/// Shared async framing driver (cancel-safe reads, frame-atomic writes,
+/// independent read/write locks, write poisoning) for every byte-stream
+/// transport. The sans-io parser itself lives in [`framed_read`].
+pub(crate) mod framed_stream;
 pub(crate) mod message_commands;
 mod models;
 /// Shared shell-v2 inner-frame codec (used by both the USB and proxy paths).
@@ -24,4 +33,5 @@ mod utils;
 pub use adb_message_device::ADBMessageDevice;
 pub use shell_v2_codec::{FrameHeader, ShellChannel, decode_header, encode};
 pub use shell_v2_session::{ShellFrame, ShellV2Output, ShellV2Session};
+pub use stream::{AsyncStream, StreamConnection, StreamTransport};
 pub use utils::BinaryDecodable;

@@ -126,6 +126,7 @@ persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
 | ------ | ---- |
 | `adb_client::proxy` | **Client** that proxies commands through an *external* adb server daemon (`ADBProxyServer` / `ADBProxyDevice`). Formerly `server` / `server_device`. |
 | `adb_client::usb` / `tcp` | Clients that connect **directly** to a device. |
+| `adb_client::stream` | ADB device protocol over a caller-provided byte stream — nested ADB links, pipes, TLS tunnels (`StreamTransport`). |
 | `adb_client::server` | adboost acting **as** an ADB server (feature `server`). |
 
 ## TODO

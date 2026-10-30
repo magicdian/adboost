@@ -331,11 +331,18 @@ lock the writer needs for `write_message_with_timeout`. The reader loops with a
   arm (both arms are `Unpin` → safe `Pin::new`, no `unsafe`). The TLS upgrade
   `unsplit`s the two halves back into the whole socket for the handshake, then
   re-`split`s and stores the new halves in the same `Arc` guards.
+- **Ownership of the invariant now lives in one place**: `FramedStream`
+  (`message_devices/framed_stream.rs`) owns the split halves, the independent
+  locks, the per-read timeout loop, and write poisoning. `TcpTransport` and
+  `StreamTransport` both use it, so the TCP anti-pattern cannot be reintroduced
+  by a new byte-stream transport.
 
 > **Rule for any new transport**: if reads and writes can be in flight on separate
 > tasks, they must use separate locks (or a lock-free full-duplex primitive).
 > Never hold a lock across a blocking-read `await` that the write path also needs.
 > A single `Arc<Mutex<wholesocket>>` shared by reader+writer is the anti-pattern.
+> For an `AsyncRead + AsyncWrite` transport, use `framed_stream::FramedStream`
+> instead of writing a new lock topology.
 
 ## Bug #3 status: RESOLVED (root cause found + device-verified)
 
@@ -420,3 +427,11 @@ That is the safe, AOSP-faithful default for a freshly TLS-upgraded link; the
 USB/non-STLS branch is unchanged and still negotiates `delayed_ack` from the real
 CNXN banner. USB's `upgrade_connection` is the trait-default no-op, so USB never
 enters this branch and its behavior is unaffected.
+
+`StreamTransport::upgrade_connection` is the third case: a caller-owned wrapped
+stream cannot be re-established as TLS in place, so it returns
+`RustADBError::UpgradeError` naming the stream label. `do_connect` propagates that
+error; it MUST NOT fall back to plaintext after answering `STLS` (that would tell
+the device the link is encrypted while sending cleartext). A caller that needs
+encryption establishes TLS **before** wrapping the stream, in which case the
+device does not request STLS.
