@@ -1,0 +1,4 @@
+{"file": ".phronia/spec/backend/directory-structure.md", "reason": "module layout, transport layering, and the shared framed_stream rule this task establishes"}
+{"file": ".phronia/spec/backend/adb-wire-protocol-contract.md", "reason": "cancel-safety, independent read/write locks, write poisoning, and the STLS upgrade contract"}
+{"file": ".phronia/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, inline test style, feature-gated verification"}
+{"file": ".phronia/tasks/10-30-stream-transport-framed-stream-core/research/stream-transport-neutral-design.md", "reason": "neutral design, value/risk register, rollback and evaluation checklist"}

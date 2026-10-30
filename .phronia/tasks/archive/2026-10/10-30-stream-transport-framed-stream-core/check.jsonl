@@ -1,0 +1,4 @@
+{"file": ".phronia/spec/backend/adb-wire-protocol-contract.md", "reason": "verify framing invariants and STLS behavior against the contract"}
+{"file": ".phronia/spec/backend/quality-guidelines.md", "reason": "quality gate commands and test expectations"}
+{"file": ".phronia/tasks/10-30-stream-transport-framed-stream-core/prd.md", "reason": "acceptance criteria and evidence"}
+{"file": ".phronia/tasks/10-30-stream-transport-framed-stream-core/research/stream-transport-neutral-design.md", "reason": "risk register and independent decision checklist"}
