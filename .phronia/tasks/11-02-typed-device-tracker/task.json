@@ -33,6 +33,15 @@
       "last_error": null,
       "log_ref": ".phronia/.runtime/integration-logs/typed-device-tracker-2026-11-02T04-29-29-962Z.log",
       "updated_at": "2026-11-02T04:30:22.781Z"
+    },
+    "spec_sync": {
+      "status": "synced",
+      "commit": "0cdabbfe7207aa714b367252f89026799c54811c",
+      "synced_at": "2026-11-02T04:33:37.103Z",
+      "refs": [
+        ".phronia/tasks/11-02-typed-device-tracker"
+      ],
+      "mode": "agent"
     }
   }
 }
