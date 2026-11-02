@@ -1,0 +1,7 @@
+{"file": ".phronia/spec/backend/directory-structure.md", "reason": "module layout, models/commands split, and where the tracker and shared host-service seam belong"}
+{"file": ".phronia/spec/backend/error-handling.md", "reason": "TrackerError vs RustADBError, no new CLI exhaustive-match variant, error mapping conventions"}
+{"file": ".phronia/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, inline tests, feature-gated verification, quality gate"}
+{"file": ".phronia/spec/backend/server-host-protocol.md", "reason": "host:host-features vs host:features, device-list renderer contract, proto-flag honesty rule"}
+{"file": ".phronia/spec/backend/logging-guidelines.md", "reason": "tracing levels and no payload logging in negotiation/reconnect paths"}
+{"file": ".phronia/tasks/11-02-typed-device-tracker/research/typed-device-tracker-feature-request.md", "reason": "source requirements, API proposal, wire formats, compatibility matrix, test corpus"}
+{"file": ".phronia/tasks/11-02-typed-device-tracker/design.md", "reason": "layering, public API, codec algorithms, negotiation and reconnect state machine"}

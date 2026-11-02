@@ -5,6 +5,7 @@ mod adb_proxy_device_commands;
 mod adb_proxy_server;
 mod commands;
 mod device_commands;
+pub(crate) mod host_service;
 mod models;
 mod tcp_proxy_transport;
 

@@ -76,3 +76,34 @@ impl FromStr for DeviceState {
         }
     }
 }
+
+/// Bridge the tracker's proto-complete state into the legacy proxy state.
+///
+/// `Any` and `Unknown` have no legacy representation, so they remain an
+/// `UnknownDeviceState` error (the same outcome the old regex parsers produced
+/// for unrecognized state text).
+impl TryFrom<crate::tracker::ConnectionState> for DeviceState {
+    type Error = RustADBError;
+
+    fn try_from(state: crate::tracker::ConnectionState) -> Result<Self, Self::Error> {
+        use crate::tracker::ConnectionState;
+
+        match state {
+            ConnectionState::Connecting => Ok(Self::Connecting),
+            ConnectionState::Authorizing => Ok(Self::Authorizing),
+            ConnectionState::Unauthorized => Ok(Self::Unauthorized),
+            ConnectionState::NoPermission => Ok(Self::NoPerm),
+            ConnectionState::Detached => Ok(Self::Detached),
+            ConnectionState::Offline => Ok(Self::Offline),
+            ConnectionState::Bootloader => Ok(Self::Bootloader),
+            ConnectionState::Device => Ok(Self::Device),
+            ConnectionState::Host => Ok(Self::Host),
+            ConnectionState::Recovery => Ok(Self::Recovery),
+            ConnectionState::Sideload => Ok(Self::Sideload),
+            ConnectionState::Rescue => Ok(Self::Rescue),
+            ConnectionState::Any | ConnectionState::Unknown => {
+                Err(RustADBError::UnknownDeviceState(state.to_string()))
+            }
+        }
+    }
+}

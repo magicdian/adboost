@@ -22,6 +22,14 @@ mod models;
 /// server daemon (the classic `adb` server on `:5037`). This is a client, not a
 /// server — for adboost's own ADB server frontend, see the [`server`] module.
 pub mod proxy;
+
+/// Typed client-side adb device tracker: negotiates
+/// `host:track-devices-proto-binary` / `host:track-devices-l`, returns one
+/// complete [`tracker::DeviceSnapshot`] per framed update, and validates every
+/// [`tracker::DeviceSerial`]. Always compiled; independent of the `usb` and
+/// `server` features.
+pub mod tracker;
+
 mod utils;
 
 /// ADB **server** frontend: listen on TCP and serve native `adb`/`scrcpy`

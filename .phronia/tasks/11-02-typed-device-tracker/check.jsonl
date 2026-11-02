@@ -1,0 +1,6 @@
+{"file": ".phronia/tasks/11-02-typed-device-tracker/prd.md", "reason": "requirements and acceptance criteria"}
+{"file": ".phronia/tasks/11-02-typed-device-tracker/design.md", "reason": "architecture, API contracts, decisions, risks"}
+{"file": ".phronia/tasks/11-02-typed-device-tracker/implement.md", "reason": "ordered checklist, validation commands, review gates"}
+{"file": ".phronia/spec/backend/server-host-protocol.md", "reason": "verify the host-features duality and the server-side proto-flag honesty invariant"}
+{"file": ".phronia/spec/backend/quality-guidelines.md", "reason": "quality gate commands and test expectations"}
+{"file": ".phronia/spec/backend/error-handling.md", "reason": "verify no RustADBError variant was added and legacy error mappings remain sane"}

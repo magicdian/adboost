@@ -1,12 +1,12 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::str::FromStr;
 
 use byteorder::{ByteOrder, LittleEndian};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ADBTransport;
-use crate::models::{ADBCommand, AdbRequestStatus, SyncCommand};
+use crate::models::{ADBCommand, SyncCommand};
+use crate::proxy::host_service::{self, HostStatus};
 use crate::{Result, RustADBError};
 
 const DEFAULT_SERVER_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -149,41 +149,15 @@ impl TCPProxyTransport {
     /// If an error occurred, a [`RustADBError`] is returned with the response error string.
     pub(crate) async fn send_adb_request(&mut self, command: &ADBCommand) -> Result<()> {
         let adb_command_string = command.to_string();
-        let adb_request = format!("{:04x}{}", adb_command_string.len(), adb_command_string);
-
-        self.get_raw_connection()?
-            .write_all(adb_request.as_bytes())
-            .await?;
-
+        host_service::send_request(self.get_raw_connection()?, &adb_command_string).await?;
         self.read_adb_response().await
     }
 
     /// Read a response from ADB server
     pub(crate) async fn read_adb_response(&mut self) -> Result<()> {
-        // Reads returned status code from ADB server
-        let mut request_status = [0; 4];
-        self.get_raw_connection()?
-            .read_exact(&mut request_status)
-            .await?;
-
-        match AdbRequestStatus::from_str(std::str::from_utf8(request_status.as_ref())?)? {
-            AdbRequestStatus::Fail => {
-                // We can keep reading to get further details
-                let length = self.get_hex_body_length().await?;
-
-                let mut body = vec![
-                    0;
-                    length
-                        .try_into()
-                        .map_err(|_| RustADBError::ConversionError)?
-                ];
-                if length > 0 {
-                    self.get_raw_connection()?.read_exact(&mut body).await?;
-                }
-
-                Err(RustADBError::ADBRequestFailed(String::from_utf8(body)?))
-            }
-            AdbRequestStatus::Okay => Ok(()),
+        match host_service::read_status(self.get_raw_connection()?).await? {
+            HostStatus::Okay => Ok(()),
+            HostStatus::Fail(reason) => Err(RustADBError::ADBRequestFailed(reason)),
         }
     }
 }

@@ -115,7 +115,7 @@ persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
 
 | Crate           | Description                                                        |
 | --------------- | ------------------------------------------------------------------ |
-| `adb_client`    | Core Rust library: ADB client (`proxy` to an external daemon, direct `usb`/`tcp`) + ADB `server` frontend. |
+| `adboost`       | Core Rust library: ADB client (`proxy` to an external daemon, direct `usb`/`tcp`) + ADB `server` frontend. |
 | `adboost_cli`   | CLI binary built on top of the library.                            |
 | `pyadb_client`  | Python bindings exposing the library to Python.                    |
 | `examples/mdns` | Example: mDNS device discovery.                                    |
@@ -124,10 +124,11 @@ persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
 
 | Module | Role |
 | ------ | ---- |
-| `adb_client::proxy` | **Client** that proxies commands through an *external* adb server daemon (`ADBProxyServer` / `ADBProxyDevice`). Formerly `server` / `server_device`. |
-| `adb_client::usb` / `tcp` | Clients that connect **directly** to a device. |
-| `adb_client::stream` | ADB device protocol over a caller-provided byte stream — nested ADB links, pipes, TLS tunnels (`StreamTransport`). |
-| `adb_client::server` | adboost acting **as** an ADB server (feature `server`). |
+| `adboost::proxy` | **Client** that proxies commands through an *external* adb server daemon (`ADBProxyServer` / `ADBProxyDevice`). Formerly `server` / `server_device`. |
+| `adboost::usb` / `tcp` | Clients that connect **directly** to a device. |
+| `adboost::stream` | ADB device protocol over a caller-provided byte stream — nested ADB links, pipes, TLS tunnels (`StreamTransport`). |
+| `adboost::tracker` | Typed client-side device tracker: negotiates `host:track-devices-proto-binary` / `host:track-devices-l`, returns one complete `DeviceSnapshot` per framed update, validates every `DeviceSerial`, and exposes reconnect health. |
+| `adboost::server` | adboost acting **as** an ADB server (feature `server`). |
 
 ## TODO
 

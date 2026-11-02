@@ -1,14 +1,8 @@
-use std::str::FromStr;
-use std::sync::LazyLock;
-use std::{fmt::Display, str};
+use std::fmt::Display;
 
 use crate::RustADBError;
 use crate::proxy::DeviceState;
-use regex::bytes::Regex;
-
-static DEVICES_LONG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<identifier>\S+)\s+(?P<state>\w+)\s+(usb:(?P<usb1>\S+)|(?P<usb2>\S+))?\s*(product:(?P<product>.*)\s+model:(?P<model>.*)\s+device:(?P<device>\S+)\s+)?transport_id:(?P<transport_id>\d+)$").expect("cannot build devices long regex")
-});
+use crate::tracker::wire::parse_line;
 
 /// Represents a new device with more informations.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,51 +43,16 @@ impl TryFrom<&[u8]> for DeviceLong {
     type Error = RustADBError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let groups = DEVICES_LONG_REGEX
-            .captures(value)
-            .ok_or(RustADBError::RegexParsingError)?;
+        let device = parse_line(value).map_err(|()| RustADBError::RegexParsingError)?;
 
         Ok(Self {
-            identifier: String::from_utf8(
-                groups
-                    .name("identifier")
-                    .ok_or(RustADBError::RegexParsingError)?
-                    .as_bytes()
-                    .to_vec(),
-            )?,
-            state: DeviceState::from_str(&String::from_utf8(
-                groups
-                    .name("state")
-                    .ok_or(RustADBError::RegexParsingError)?
-                    .as_bytes()
-                    .to_vec(),
-            )?)?,
-            usb: match groups.name("usb1") {
-                None => match groups.name("usb2") {
-                    None => "Unk".to_string(),
-                    Some(usb) => String::from_utf8(usb.as_bytes().to_vec())?,
-                },
-                Some(usb) => String::from_utf8(usb.as_bytes().to_vec())?,
-            },
-            product: match groups.name("product") {
-                None => "Unk".to_string(),
-                Some(product) => String::from_utf8(product.as_bytes().to_vec())?,
-            },
-            model: match groups.name("model") {
-                None => "Unk".to_string(),
-                Some(model) => String::from_utf8(model.as_bytes().to_vec())?,
-            },
-            device: match groups.name("device") {
-                None => "Unk".to_string(),
-                Some(device) => String::from_utf8(device.as_bytes().to_vec())?,
-            },
-            transport_id: (str::from_utf8(
-                groups
-                    .name("transport_id")
-                    .ok_or(RustADBError::RegexParsingError)?
-                    .as_bytes(),
-            )?)
-            .parse::<u32>()?,
+            identifier: device.serial.to_string(),
+            state: DeviceState::try_from(device.state)?,
+            usb: device.bus_address.unwrap_or_else(|| "Unk".to_string()),
+            product: device.product.unwrap_or_else(|| "Unk".to_string()),
+            model: device.model.unwrap_or_else(|| "Unk".to_string()),
+            device: device.device.unwrap_or_else(|| "Unk".to_string()),
+            transport_id: device.transport_id.ok_or(RustADBError::RegexParsingError)?,
         })
     }
 }
