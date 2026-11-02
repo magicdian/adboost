@@ -430,6 +430,14 @@ every service is a thin combination of shared pieces:
 > EMPTY device list in the IDE while `adb devices` works fine (reported by
 > xdb: AS 2026.1.4 against an xdb-owned `:5037`).
 
+> **Client-side counterpart.** `adboost::tracker` (always compiled) owns the
+> client side of this family: it negotiates proto-binary vs long text from
+> `host:host-features`, decodes AOSP space-padded and adboost tab-padded rows
+> into typed snapshots, and shares its long-text parser with
+> `DeviceLong`/`DeviceShort`. It does not change this frontend. The server
+> must still keep the proto flag/service honesty rule below. See
+> [`adb-device-tracker.md`](./adb-device-tracker.md).
+
 > **Gotcha — the proto variants (P1) must ship together with their feature
 > flag.** `track-devices-proto-binary`/`-proto-text` and the
 > `devicetracker_proto_format` `host:features` entry are ONE unit:

@@ -60,14 +60,23 @@ adboost/src/
 │   ├── framed_stream.rs               async framing driver shared by tcp/stream
 │   └── adb_transport_message.rs       header/payload wire types + MAX_PAYLOAD
 ├── models/                 data types (selectively re-exported)
-├── server/                 talks to the local adb server daemon  [+ README.md]
-│   ├── adb_server.rs                  struct ADBServer
-│   ├── commands/                      impl ADBServer (connect, devices, ...)
-│   └── models/                        device_short, device_long, ...
-├── server_device/          a device reached *through* the server  [+ README.md]
-│   ├── adb_server_device.rs           struct ADBServerDevice
-│   ├── adb_server_device_commands.rs  impl ADBDeviceExt for ADBServerDevice
-│   └── commands/                      forward, install, push, send, ...
+├── proxy/                  client of an EXTERNAL adb server daemon  [+ README.md]
+│   ├── adb_proxy_server.rs            ADBProxyServer (connect/start/devices)
+│   ├── adb_proxy_device.rs            ADBProxyDevice (one device through the server)
+│   ├── commands/                      impl ADBProxyServer (devices, track, connect, ...)
+│   ├── device_commands/               impl ADBProxyDevice (shell, sync, forward, ...)
+│   ├── models/                        device_short, device_long, device_state, ...
+│   └── host_service.rs                crate-internal smart-socket seam
+├── tracker/                typed client-side device tracker (always compiled)
+│   ├── device_tracker.rs              DeviceTracker + per-connection state
+│   ├── commands/                      connect / next_snapshot / features impls
+│   ├── models/                        DeviceSerial, DeviceInfo, snapshot, policy, ...
+│   └── wire/                          long-text + protobuf decoders
+├── server/                 adboost acting AS an adb server  cfg(feature = "server")
+│   ├── frontend.rs                    smartsocket host protocol + local-service bridge
+│   ├── backend.rs                     DeviceBackend trait + DeviceEntry
+│   ├── default_backend.rs             USB-backed default backend
+│   └── sim_backend.rs                 deterministic in-memory backend
 └── mdns/                   cfg(feature = "mdns") device discovery
 ```
 
@@ -95,6 +104,30 @@ with its owning module. There is **no `utils/` directory** in `adboost/src`
 rather than re-deriving the lock topology, per-read timeout handling, or write
 poisoning. Copying `FrameReadBuffer`/`write_frame_atomic` into a transport is the
 duplication this split exists to prevent.
+
+### Host-service clients share one smart-socket seam
+
+`proxy/host_service.rs` owns the external adb server's `%04x`
+request/status/frame contract: `send_request`, `read_status`, and the
+cancel-safe `FrameDecoder`. `TCPProxyTransport` and `tracker/` both use it.
+Do not copy the `%04x` handling into a new client, and do not add a second
+cancel-safe frame reader.
+
+### The device tracker has one model and two wire codecs
+
+`tracker/` is the client-side owner of the device-tracker family:
+
+- `wire/long_text.rs` parses **both** AOSP's space-padded `%-22s %s` rows and
+  adboost's tab-padded rows, plus bare/`usb:` bus addresses and the
+  `no permissions (...)` help text.
+- `wire/proto.rs` decodes `adb.proto.Devices` (unknown fields/enums tolerated).
+- Both produce the same `DeviceSnapshot`; `DeviceLong` / `DeviceShort` delegate
+  to the shared `parse_line`.
+
+**Rule**: downstream code must not parse an adb device line. Add a field or
+service to `tracker/` instead of a third parser. The server frontend's renderer
+remains separate (see `server-host-protocol.md`), but must not advertise
+`devicetracker_proto_format` until the proto services exist.
 
 ---
 
