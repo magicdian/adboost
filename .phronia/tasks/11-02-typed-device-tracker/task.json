@@ -15,12 +15,24 @@
   "branch": "phronia/typed-device-tracker",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
+  "commit": "f7725d73a6f7a0ea82be93b0bf7f879ce91781fa",
   "pr_url": null,
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
   "notes": "",
-  "meta": {}
+  "meta": {
+    "integration": {
+      "mode": "local",
+      "outcome": "landed",
+      "base_sha": "f7725d73a6f7a0ea82be93b0bf7f879ce91781fa",
+      "commit": "f7725d73a6f7a0ea82be93b0bf7f879ce91781fa",
+      "pr_url": null,
+      "verified": true,
+      "last_error": null,
+      "log_ref": ".phronia/.runtime/integration-logs/typed-device-tracker-2026-11-02T04-29-29-962Z.log",
+      "updated_at": "2026-11-02T04:30:22.781Z"
+    }
+  }
 }
