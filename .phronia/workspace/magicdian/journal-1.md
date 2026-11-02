@@ -1645,3 +1645,37 @@ Acceptance-driven round: ran adboost itself on :5037 with the USB claim against 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 41: Typed negotiated device tracker
+<!-- phronia-session: v=2 fp=7b4bb4ab582b07cb -->
+
+**Date**: 2026-11-02
+**Task**: Typed negotiated device tracker
+**Branch**: `main`
+
+### Summary
+
+Added adboost::tracker: typed snapshots, proto/long negotiation, shared host-service framing, serial validation, cancel-safe reads, and reconnect health. Verified with 171/483 tests, real adb 35.0.2, and CLI devices paths.
+
+### Main Changes
+
+- New always-compiled adboost::tracker module with DeviceTracker, DeviceSnapshot/DeviceInfo, DeviceSerial, ServerFeatures negotiation, and long-text/protobuf decoders.
+- Extracted proxy/host_service smart-socket request/status/frame seam; TCPProxyTransport and tracker share cancel-safe framing.
+- DeviceLong/DeviceShort delegate to the shared long-text parser; tracker spec and docs updated.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f7725d7` | feat(tracker): add typed negotiated device tracker |
+
+### Testing
+
+- [OK] cargo test -p adboost: 171 passed, 6 doctests.
+- [OK] cargo test -p adboost --all-features: 483 passed, 8 doctests.
+- [OK] Real adb 35.0.2: auto proto-binary and explicit long-text decoded YTGUSCNFMFAIK7ZP; CLI host devices/-l matched native adb.
+
+### Status
+
+[OK] **Completed**

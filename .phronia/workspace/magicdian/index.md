@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 40
-- **Last Active**: 2026-09-03
+- **Total Sessions**: 41
+- **Last Active**: 2026-11-02
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1647 | Active |
+| `journal-1.md` | ~1681 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 41 | 2026-11-02 | Typed negotiated device tracker | `f7725d7` | `main` |
 | 40 | 2026-09-03 | AS acceptance round: host-features + exec:/JDWP bridging | `2695f12` | `main` |
 | 39 | 2026-09-03 | adb-server frontend: host:track-devices-l + unknown-service WARN logging | `46df633` | `main` |
 | 38 | 2026-08-06 | 支持裸 host:get-state/get-serialno（transport-any 单设备数据查询） | `9498fea` | `main` |
