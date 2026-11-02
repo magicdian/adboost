@@ -2,7 +2,7 @@
 
 ## Target files
 
-- `.phronia/spec/backend/adb-device-tracker.md` (new)
+- `.phronia/spec/backend/adb-device-tracker.md`
 - `.phronia/spec/backend/index.md`
 - `.phronia/spec/backend/directory-structure.md`
 - `.phronia/spec/backend/server-host-protocol.md`
