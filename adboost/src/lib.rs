@@ -84,8 +84,9 @@ pub use message_devices::*;
 
 pub use models::{
     ADBListItem, ADBListItemType, ADBLocalCommand, ADBStatExtendedResponse, ADBStatMapping,
-    AdbStatResponse, DeviceFeatureSet, HostFeatures, RebootType, RemountInfo, ShellPtyMode,
-    ShellV2Service,
+    AdbStatResponse, DEFAULT_INSTALL_PROGRESS_INTERVAL_BYTES, DeviceFeatureSet, HostFeatures,
+    InstallControl, InstallOptions, InstallOutcome, InstallProgress, RebootType, RemountInfo,
+    RemountOutcome, RootOutcome, RootState, ShellPtyMode, ShellV2Service, UninstallOutcome,
 };
 pub use tcp::TcpTransport;
 /// Building blocks for holding a persistent ADB connection — re-exported at the

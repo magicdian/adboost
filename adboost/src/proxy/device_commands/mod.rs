@@ -7,6 +7,7 @@ mod reboot;
 mod reconnect;
 mod recv;
 mod remount;
+mod response;
 mod reverse;
 mod root;
 mod send;
@@ -20,6 +21,9 @@ mod verity;
 
 #[cfg(feature = "framebuffer")]
 mod framebuffer;
+
+#[cfg(test)]
+mod fake_server;
 
 use crate::{Result, RustADBError, message_devices::adb_transport_message::MAX_PAYLOAD};
 

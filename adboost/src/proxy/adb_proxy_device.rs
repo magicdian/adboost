@@ -104,6 +104,16 @@ impl ADBProxyDevice {
             .send_adb_request(&ADBCommand::Host(cmd))
             .await
     }
+
+    /// Close the underlying socket, leaving the transport disconnected.
+    ///
+    /// Used by the cancel path of streamed operations (e.g. install) so the
+    /// device observes EOF and abandons the in-flight service. Failures are
+    /// ignored: the socket is being discarded either way, and the next operation
+    /// reconnects through the transport switch.
+    pub(crate) async fn close_connection(&mut self) {
+        let _ = self.transport.disconnect().await;
+    }
 }
 
 // NOTE (async teardown, P0-②): `disconnect` is now an async transport method and

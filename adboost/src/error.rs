@@ -60,6 +60,39 @@ pub enum RustADBError {
     /// Indicates that remount operation failed
     #[error("Cannot remount filesystem: {0}")]
     RemountError(String),
+    /// The device reported an install failure (`Failure [REASON]`).
+    ///
+    /// `reason` is the device's `INSTALL_FAILED_*`-style token when parseable;
+    /// `raw` preserves the complete device reply for diagnostics.
+    #[error("install failed: {reason} (raw: {raw})")]
+    InstallFailed {
+        /// Device-reported failure reason.
+        reason: String,
+        /// Complete device reply.
+        raw: String,
+    },
+    /// The device reported an uninstall failure (`Failure [REASON]`).
+    #[error("uninstall failed: {reason} (raw: {raw})")]
+    UninstallFailed {
+        /// Device-reported failure reason.
+        reason: String,
+        /// Complete device reply.
+        raw: String,
+    },
+    /// The device refused to restart adbd with root permissions
+    /// (`adbd cannot run as root in production builds`).
+    #[error("adb root refused by device: {raw}")]
+    RootRefused {
+        /// Complete device receipt.
+        raw: String,
+    },
+    /// A device operation was cancelled through its control token.
+    ///
+    /// Cancellation of an install is best-effort: the local transfer stops and
+    /// the connection closes, but the device may already have completed the
+    /// installation.
+    #[error("operation cancelled")]
+    OperationCancelled,
     /// An error occurred when getting device's framebuffer image
     #[cfg(feature = "framebuffer")]
     #[error(transparent)]

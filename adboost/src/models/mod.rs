@@ -7,11 +7,17 @@ mod adb_stat_response;
 mod device_feature_set;
 mod device_selector;
 mod host_features;
+mod install_control;
+mod install_options;
+mod install_outcome;
 mod list_info;
 mod reboot_type;
 mod remount_info;
+mod remount_outcome;
+mod root_outcome;
 mod socket_spec;
 mod sync_command;
+mod uninstall_outcome;
 
 #[cfg(feature = "framebuffer")]
 mod framebuffer_info;
@@ -30,11 +36,19 @@ pub use device_selector::DeviceSelector;
 #[cfg(feature = "usb")]
 pub use device_feature_set::FEATURE_DELAYED_ACK;
 pub use host_features::HostFeatures;
+pub use install_control::{
+    DEFAULT_INSTALL_PROGRESS_INTERVAL_BYTES, InstallControl, InstallProgress,
+};
+pub use install_options::InstallOptions;
+pub use install_outcome::InstallOutcome;
 pub use list_info::{ADBListItem, ADBListItemType};
 pub use reboot_type::RebootType;
 pub use remount_info::RemountInfo;
+pub use remount_outcome::RemountOutcome;
+pub use root_outcome::{RootOutcome, RootState};
 pub use socket_spec::{LocalSocketSpec, RemoteSocketSpec};
 pub use sync_command::SyncCommand;
+pub use uninstall_outcome::UninstallOutcome;
 
 #[cfg(feature = "framebuffer")]
 pub use framebuffer_info::{FrameBufferInfoV1, FrameBufferInfoV2};

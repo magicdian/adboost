@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use crate::RebootType;
+use crate::models::InstallOptions;
 
 /// PTY-allocation mode for a shell-v2 service — the mutually-exclusive final
 /// argument in the AOSP `shell[,v2][,TERM=…][,pty|raw]:cmd` grammar.
@@ -93,7 +94,11 @@ pub enum ADBLocalCommand {
     DisableVerity,
     EnableVerity,
     Uninstall(String, Option<String>),
+    /// Compatibility form of [`Self::InstallWithOptions`] predating
+    /// [`InstallOptions`]: renders `exec:cmd package 'install' [--user X] -S <n>`.
     Install(u64, Option<String>),
+    /// Streamed install with typed flags; see [`InstallOptions`].
+    InstallWithOptions(u64, InstallOptions),
     TcpIp(u16),
     Usb,
     Root,
@@ -145,12 +150,15 @@ impl Display for ADBLocalCommand {
                 write!(f, " {package}")
             }
             Self::Install(size, user) => {
-                write!(f, "exec:cmd package 'install'")?;
-                if let Some(user) = user {
-                    write!(f, " --user {user}")?;
-                }
-                write!(f, " -S {size}")
+                // Compatibility variant: one renderer, so it can never drift
+                // from the typed `InstallWithOptions` form.
+                let options = InstallOptions {
+                    user: user.clone(),
+                    ..InstallOptions::default()
+                };
+                Self::write_install(f, *size, &options)
             }
+            Self::InstallWithOptions(size, options) => Self::write_install(f, *size, options),
             Self::Reverse(remote, local) => {
                 write!(f, "reverse:forward:{remote};{local}")
             }
@@ -172,6 +180,19 @@ impl Display for ADBLocalCommand {
             #[cfg(feature = "framebuffer")]
             Self::FrameBuffer => write!(f, "framebuffer:"),
         }
+    }
+}
+
+impl ADBLocalCommand {
+    /// Render the single install service string shared by both install variants.
+    fn write_install(
+        f: &mut std::fmt::Formatter<'_>,
+        size: u64,
+        options: &InstallOptions,
+    ) -> std::fmt::Result {
+        write!(f, "exec:cmd package 'install'")?;
+        options.write_flags(f)?;
+        write!(f, " -S {size}")
     }
 }
 
@@ -211,6 +232,52 @@ fn test_usb_command_encoding() {
 fn test_unroot_command_encoding() {
     // `adb unroot` opens the `unroot:` device service (no argument), mirroring `root:`.
     assert_eq!(ADBLocalCommand::Unroot.to_string(), "unroot:");
+}
+
+#[test]
+fn install_with_options_renders_flags_in_stable_order() {
+    let options = InstallOptions {
+        replace: true,
+        grant: true,
+        test_only: true,
+        downgrade: true,
+        user: Some("10".to_string()),
+    };
+    assert_eq!(
+        ADBLocalCommand::InstallWithOptions(1234, options).to_string(),
+        "exec:cmd package 'install' -r -g -t -d --user 10 -S 1234",
+        "install service string order is part of the wire contract"
+    );
+}
+
+#[test]
+fn install_default_options_render_like_legacy_install() {
+    assert_eq!(
+        ADBLocalCommand::InstallWithOptions(7, InstallOptions::default()).to_string(),
+        "exec:cmd package 'install' -S 7",
+        "default options must reproduce the pre-options service string"
+    );
+    assert_eq!(
+        ADBLocalCommand::Install(7, None).to_string(),
+        "exec:cmd package 'install' -S 7",
+        "legacy install variant must render identically"
+    );
+}
+
+#[test]
+fn legacy_install_user_renders_like_typed_options() {
+    assert_eq!(
+        ADBLocalCommand::Install(42, Some("0".to_string())).to_string(),
+        ADBLocalCommand::InstallWithOptions(
+            42,
+            InstallOptions {
+                user: Some("0".to_string()),
+                ..InstallOptions::default()
+            }
+        )
+        .to_string(),
+        "both install variants must share one renderer"
+    );
 }
 
 #[test]

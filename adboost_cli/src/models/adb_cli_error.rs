@@ -93,6 +93,10 @@ impl From<adboost::RustADBError> for ADBCliError {
             | RustADBError::AddrParseError(_)
             | RustADBError::ReadTimeout
             | RustADBError::WriteTimeout
+            | RustADBError::InstallFailed { .. }
+            | RustADBError::UninstallFailed { .. }
+            | RustADBError::RootRefused { .. }
+            | RustADBError::OperationCancelled
             | RustADBError::DeviceBusy => Self::Standard(value),
         }
     }
