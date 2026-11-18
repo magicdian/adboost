@@ -1,5 +1,12 @@
 # Spec delta: device ops first-class API
 
+## Target files
+
+- `.phronia/spec/backend/directory-structure.md`
+- `.phronia/spec/backend/error-handling.md`
+
+## Intended changes
+
 Updated `.phronia/spec/backend/`:
 
 ## `directory-structure.md`
