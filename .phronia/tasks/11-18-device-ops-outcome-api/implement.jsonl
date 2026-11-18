@@ -1,0 +1,4 @@
+{"file": ".phronia/spec/backend/directory-structure.md", "reason": "models/ vs device_commands/ split, one-op-per-file, mod.rs conventions, reuse-the-seam rules"}
+{"file": ".phronia/spec/backend/error-handling.md", "reason": "additive RustADBError variants and the exhaustive CLI classification requirement"}
+{"file": ".phronia/spec/backend/quality-guidelines.md", "reason": "clippy pedantic, MSRV, inline tests, no unwrap/allow, feature-gated verification"}
+{"file": ".phronia/spec/backend/logging-guidelines.md", "reason": "tracing levels for install/root/remount outcomes"}
