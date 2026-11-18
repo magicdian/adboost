@@ -65,6 +65,7 @@ adboost/src/
 │   ├── adb_proxy_device.rs            ADBProxyDevice (one device through the server)
 │   ├── commands/                      impl ADBProxyServer (devices, track, connect, ...)
 │   ├── device_commands/               impl ADBProxyDevice (shell, sync, forward, ...)
+│   │   └── response.rs                shared control-service reply read/classification
 │   ├── models/                        device_short, device_long, device_state, ...
 │   └── host_service.rs                crate-internal smart-socket seam
 ├── tracker/                typed client-side device tracker (always compiled)
@@ -112,6 +113,32 @@ request/status/frame contract: `send_request`, `read_status`, and the
 cancel-safe `FrameDecoder`. `TCPProxyTransport` and `tracker/` both use it.
 Do not copy the `%04x` handling into a new client, and do not add a second
 cancel-safe frame reader.
+
+### Device control services share one reply seam
+
+`proxy/device_commands/response.rs` owns the reply grammar for the one-shot
+device control services (`install`, `uninstall`, `root`, `unroot`):
+
+- `read_reply` — read to EOF, capped at 64 KiB, optionally cancellable;
+- `parse_success_or_failure` — the `Success` / `Failure [REASON]` verdict,
+  tolerant of fragmented replies and leading warning lines;
+- `classify_root_receipt` — restarting / already / refused / unknown, with a
+  separate `RootDirection` so `unroot` wording is not forced through root-only
+  branches.
+
+Remount's success/failure markers live next to its line grammar in
+`models/remount_info.rs` (`from_str_response`). Do not reintroduce a single
+fixed-size read or an exact `"Success\n"` comparison in a new control-service
+command — extend these seams instead.
+
+```rust
+// Typed outcome surface on ADBProxyDevice (all additive; legacy wrappers delegate).
+install_with_options(path, &InstallOptions, InstallControl) -> InstallOutcome
+uninstall_with_outcome(package, user)                     -> UninstallOutcome
+root_with_outcome() / unroot_with_outcome()               -> RootOutcome
+remount_with_outcome()                                    -> RemountOutcome
+```
+
 
 ### The device tracker has one model and two wire codecs
 

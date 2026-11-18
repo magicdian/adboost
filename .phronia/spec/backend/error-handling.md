@@ -51,6 +51,23 @@ mdns_sd, chrono, …). Because `std::sync::PoisonError<T>` is generic, it gets a
 **Rule:** add a new foreign error with `#[from]` + `#[error(transparent)]`; add a
 new domain error as a named variant with a `{0}`-style format message.
 
+### Device operation outcomes (`InstallFailed` / `UninstallFailed` / `RootRefused` / `OperationCancelled`)
+
+The proxy device operations separate "the device said no" from "the transport
+broke", and preserve device text:
+
+| Variant | Produced by | Consumer contract |
+|---|---|---|
+| `InstallFailed { reason, raw }` | install reply `Failure [REASON]`, or an unrecognized reply (`reason = "unknown response"`) | branch on `reason` (`INSTALL_FAILED_*`); show `raw` for diagnosis |
+| `UninstallFailed { reason, raw }` | uninstall reply `Failure [REASON]` | same shape as install |
+| `RootRefused { raw }` | legacy `root()`/`unroot()` when the device answers `adbd cannot run as root …` | a refusal is **not** success; `root_with_outcome()` returns `RootState::Refused` instead |
+| `OperationCancelled` | `InstallControl::cancel` fired mid-install | best-effort: the device may already have completed; requery package state if needed |
+
+All four are user-facing conditions, so `adb_cli_error.rs` classifies them as
+`Standard` (inside the exhaustive match, never a `_` arm). `RemountError(String)`
+stays the remount failure type and carries the full device reply.
+
+
 ### USB error variants (`nusb`, feature = "usb")
 
 The USB transport uses **`nusb`** (pure-Rust, not `rusb`/libusb). Two
