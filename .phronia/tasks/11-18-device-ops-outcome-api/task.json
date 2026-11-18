@@ -15,12 +15,24 @@
   "branch": null,
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
+  "commit": "693e4a4a17ca374717f08f310fc9e3a3df674b9b",
   "pr_url": null,
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
   "notes": "",
-  "meta": {}
+  "meta": {
+    "integration": {
+      "mode": "local",
+      "outcome": "landed",
+      "base_sha": "5275bb5db47a4f08ed1e31d6c661acddb6423730",
+      "commit": "693e4a4a17ca374717f08f310fc9e3a3df674b9b",
+      "pr_url": null,
+      "verified": true,
+      "last_error": null,
+      "log_ref": ".phronia/.runtime/integration-logs/device-ops-outcome-api-2026-11-18T14-23-20-570Z.log",
+      "updated_at": "2026-11-18T14:23:54.038Z"
+    }
+  }
 }
