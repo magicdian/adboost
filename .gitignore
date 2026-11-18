@@ -8,3 +8,8 @@ __pycache__
 
 # stray build artifact from tooling
 check_duration
+
+# PHRONIA:START
+# Task worktrees created by `phronia task workspace ensure`
+/.phronia-workspace/
+# PHRONIA:END

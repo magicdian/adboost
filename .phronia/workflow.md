@@ -502,6 +502,63 @@ phronia task workspace ensure <task-dir> --json
 
 Session identity is required: pass `--session-key <key>` or set `PHRONIA_CONTEXT_ID`. Do **not** fall back to a CLI process pid — every `phronia` invocation is a new process, so pid liveness is meaningless. If another task owns `main` and this task does not exist yet, `phronia task workspace prepare --for-new-task "<title>"` creates a provisional workspace first; `task.py create` can then bind the task to it.
 
+Worktrees live under the resolved root (`parallel.worktree_dir`, default `.phronia-workspace/` at the repository root). The JSON result carries `worktreeRoot` with the absolute root and whether git ignores it. If `gitignore.ignored` is false, add the printed pattern before starting work: an unignored root leaves the main checkout dirty and the next `ensure` refuses.
+
+**Base selection for a new worktree.** One resolver owns the fork point:
+`--base` → `task.base_branch` → `parallel.integration.branch` →
+`parallel.base.mode` (`remote`: `origin/HEAD` → `origin/main` →
+`origin/master`; `local`: `main` → `master`) → explicit `HEAD`. There is no
+silent `main` fallback: when nothing resolves, `ensure`/`prepare` refuse with
+`WORKTREE_BASE_UNRESOLVED` and a `--base` next step. The JSON result reports
+`baseSource`, `baseCommit`, `remote`, `freshness`, `behind`, `ahead`,
+`shouldAsk`, and `alternatives`.
+
+- `parallel.base.mode`: `auto` (default), `local`, `remote`.
+- `parallel.base.confirm`: `auto` (ask for remote bases), `always`, `never`.
+- `parallel.base.fetch`: `never` (default) or `always`. `--fetch` /
+  `--no-fetch` override it for one invocation. A remote base without a fetch is
+  reported as `freshness: "unverified"`; a fetch failure is a warning, not a
+  refusal.
+- `shouldAsk: true` means the agent must ask the user, then re-run with
+  `--base <ref>`. The CLI never reads stdin.
+
+#### Detached hotfix (no task)
+
+A session that must fix something in parallel without creating a task uses the
+provisional workspace path. It never claims `main` and never touches the
+active-task pointer:
+
+```bash
+phronia task workspace prepare \
+  --for-new-task "fix xdb bench leak" \
+  --branch fix/xdb-benches-session-scope \
+  --base origin/master \
+  --isolate \
+  --session-key <key> \
+  --json
+```
+
+- The worktree is created under the resolved root (`.phronia-workspace/` by
+  default) and is gitignored.
+- Call it once per fix; multiple provisional workspaces coexist. If a task is
+  created later, attach it with
+  `phronia task workspace bind <task-ref> --path <worktree>`.
+- Detached worktrees do not participate in `parallel plan` or footprints. They
+  integrate through a hand-written commit/PR and are cleaned with
+  `git worktree remove` or `phronia task worktree prune --older-than`.
+- `--isolate` is required when `main` is clean and unclaimed; without it
+  `prepare` claims `main` instead of creating a worktree.
+- `--branch` must be a real feature branch (not `main`/`master`/`HEAD`/the
+  integration branch) and must not already exist.
+- Harnesses that cannot move a session (ZCode, Codex): open a new
+  session/window in the printed path. If that is impossible, `cd` there and
+  work sequentially; never run parallel mutating sub-agents from one session.
+
+`phronia task worktree list --include-unmanaged --json` shows git worktrees
+that Phronia did not create (`managed: false`, `insideRoot`, `outsideRepo`).
+`phronia doctor` reports them as `unmanaged git worktrees`; Phronia never moves
+or deletes them automatically.
+
 #### 1.5 Completion criteria
 
 | Condition | Required |
