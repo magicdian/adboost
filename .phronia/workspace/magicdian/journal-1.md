@@ -1679,3 +1679,26 @@ Added adboost::tracker: typed snapshots, proto/long negotiation, shared host-ser
 ### Status
 
 [OK] **Completed**
+
+
+## Session 42: Typed device ops: install options/progress/cancel + structured outcomes
+<!-- phronia-session: v=2 fp=4fe4c649b684ad00 -->
+
+**Date**: 2026-11-18
+**Task**: Typed device ops: install options/progress/cancel + structured outcomes
+**Branch**: `main`
+
+### Summary
+
+Added ADBProxyDevice::install_with_options (-r/-g/-t/-d/--user, 1 MiB progress, CancellationToken cancel), uninstall_with_outcome, root_with_outcome/unroot_with_outcome, and remount_with_outcome; legacy methods now delegate. Reply grammar moved to proxy/device_commands/response.rs (read to EOF with 64 KiB cap, Success/Failure parsing, root classification) and root() stops treating production-build refusal as success. Verified with unit/fake-server tests (516 workspace, 326 with usb) and on a connected mtk8676 userdebug device (root Restarting/AlreadyRoot, remount 8 partitions incl. vendor wording, install flags/progress, uninstall), documented in the archived task verification.md.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `27c62cd` | feat(proxy): typed device ops with structured outcomes |
+| `693e4a4` | chore(task): record planning, verification and real-device probe |
+
+### Status
+
+[OK] **Completed**
