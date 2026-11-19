@@ -117,7 +117,7 @@ persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
 | --------------- | ------------------------------------------------------------------ |
 | `adboost`       | Core Rust library: ADB client (`proxy` to an external daemon, direct `usb`/`tcp`) + ADB `server` frontend. |
 | `adboost_cli`   | CLI binary built on top of the library.                            |
-| `pyadb_client`  | Python bindings exposing the library to Python.                    |
+| `pyadb_client`  | Python bindings (not currently built or supported; excluded from the workspace and CI). |
 | `examples/mdns` | Example: mDNS device discovery.                                    |
 
 ### Library module roles
@@ -132,7 +132,7 @@ persistent multiplexer is transport-generic, so `adb -s <ip>:<port> shell`/
 
 ## TODO
 
-- [ ] Installation instructions (library, CLI, Python package)
+- [ ] Installation instructions (library, CLI)
 - [ ] Document direct USB/TCP device connections + framebuffer
 - [ ] Document the persistent-connection capabilities
 - [ ] ADB server: port `forward` family + `shell_v2`/`sync`

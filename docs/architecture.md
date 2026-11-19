@@ -10,7 +10,7 @@
 |---|---|
 | `adboost` | Core async ADB library (client + server frontend). |
 | `adboost_cli` | CLI over the local library. |
-| `pyadb_client` / `examples/mdns` | Excluded from the active workspace build. |
+| `pyadb_client` / `examples/mdns` | Excluded from the active workspace build; `pyadb_client` has no CI build while Python support is paused. |
 
 ## ADB client layers
 
