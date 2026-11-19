@@ -738,9 +738,7 @@ async fn wait_until(timeout: Duration, cond: impl Fn() -> bool) -> Result<(), ()
 
 /// Whether a device with `serial` is currently enumerated.
 fn serial_present(serial: &str) -> bool {
-    discover_devices()
-        .map(|devs| devs.iter().any(|d| d.serial.as_deref() == Some(serial)))
-        .unwrap_or(false)
+    discover_devices().is_ok_and(|devs| devs.iter().any(|d| d.serial.as_deref() == Some(serial)))
 }
 
 /// Heuristic: adb-over-tcpip serials are `host:port` (contain a `:`), whereas

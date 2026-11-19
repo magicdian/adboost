@@ -95,7 +95,7 @@ pub enum ADBLocalCommand {
     EnableVerity,
     Uninstall(String, Option<String>),
     /// Compatibility form of [`Self::InstallWithOptions`] predating
-    /// [`InstallOptions`]: renders `exec:cmd package 'install' [--user X] -S <n>`.
+    /// [`InstallOptions`] — renders `exec:cmd package 'install' [--user X] -S <n>`.
     Install(u64, Option<String>),
     /// Streamed install with typed flags; see [`InstallOptions`].
     InstallWithOptions(u64, InstallOptions),
@@ -103,7 +103,7 @@ pub enum ADBLocalCommand {
     Usb,
     Root,
     Unroot,
-    /// Open a TCP connection to a port on the device (formats to "tcp:<port>")
+    /// Open a TCP connection to a port on the device (formats to `tcp:<port>`)
     TcpConnect(u16),
     /// A verbatim local-service string, formatted as-is (no transformation).
     ///

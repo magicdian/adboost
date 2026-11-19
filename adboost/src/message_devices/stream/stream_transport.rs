@@ -35,7 +35,7 @@ pub type StreamConnection = Box<dyn AsyncStream + Unpin + Send + 'static>;
 /// the caller.
 ///
 /// Framing, cancel-safety, independent read/write locks, and write poisoning are
-/// the shared `FramedStream` driver used by [`TcpTransport`](crate::TcpTransport);
+/// the shared `FramedStream` driver used by [`crate::TcpTransport`];
 /// this type only owns the stream and its diagnostic label.
 ///
 /// [`PersistentConnection`]: crate::usb::PersistentConnection
@@ -63,7 +63,7 @@ impl StreamTransport {
     ///
     /// ADB multiplexing is small-packet and interactive, so `TCP_NODELAY` matters
     /// for shell latency (same rationale as
-    /// [`TcpTransport`](crate::TcpTransport)); a socket-option failure is surfaced
+    /// [`crate::TcpTransport`]); a socket-option failure is surfaced
     /// rather than silently ignored.
     ///
     /// # Errors

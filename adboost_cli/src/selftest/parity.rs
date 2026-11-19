@@ -24,8 +24,7 @@ pub async fn adb_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Run `adb -P <port> shell echo <marker>` against adboost's in-process server

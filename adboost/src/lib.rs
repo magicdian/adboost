@@ -3,6 +3,14 @@
 #![allow(missing_debug_implementations)]
 #![allow(missing_docs)]
 #![allow(clippy::missing_errors_doc)]
+// Architecture docs intentionally link private items (transport traits, session
+// internals, internal routing helpers). Those links stay useful when building
+// with `--document-private-items`; they simply do not render in public docs.
+#![allow(rustdoc::private_intra_doc_links)]
+// Explicit link targets are kept because bare-label resolution differs across
+// rustdoc versions; the redundancy is intentional and keeps docs stable on the
+// MSRV toolchain as well as current stable.
+#![allow(rustdoc::redundant_explicit_links)]
 #![doc = include_str!("../README.md")]
 // Feature `doc_cfg` is currently only available on nightly builds.
 // It is activated when cfg `docsrs` is enabled.

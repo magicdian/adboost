@@ -33,16 +33,14 @@ async fn device_shell(device: &mut ADBProxyDevice, cmd: &str) -> Result<String, 
 pub async fn device_has_nc(device: &mut ADBProxyDevice) -> bool {
     device_shell(device, "which nc || command -v nc")
         .await
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+        .is_ok_and(|s| !s.trim().is_empty())
 }
 
 /// Whether the device has `iperf3`.
 pub async fn device_has_iperf3(device: &mut ADBProxyDevice) -> bool {
     device_shell(device, "which iperf3 || command -v iperf3")
         .await
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+        .is_ok_and(|s| !s.trim().is_empty())
 }
 
 /// Basic reverse connectivity: host echo server ← device `nc` client through the

@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn empty_devices_message_is_an_empty_snapshot() {
         let snapshot = decode(&[]).expect("empty protobuf message");
-        assert!(snapshot.devices.is_empty());
+        assert_eq!(snapshot.devices, []);
         assert_eq!(snapshot.malformed_rows, 0);
     }
 

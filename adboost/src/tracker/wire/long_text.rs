@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn empty_body_is_an_authoritative_empty_snapshot() {
         let snapshot = decode(b"");
-        assert!(snapshot.devices.is_empty());
+        assert_eq!(snapshot.devices, []);
         assert_eq!(snapshot.malformed_rows, 0);
     }
 

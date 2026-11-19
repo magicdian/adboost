@@ -98,7 +98,7 @@ mod tests {
             }]),
         )
         .expect("proto");
-        assert!(proto_snapshot.devices.is_empty());
+        assert_eq!(proto_snapshot.devices, []);
         assert_eq!(proto_snapshot.malformed_rows, 1);
     }
 

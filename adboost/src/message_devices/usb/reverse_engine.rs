@@ -450,6 +450,6 @@ mod tests {
         assert!(!rules.remove("tcp:1").await, "second remove → false");
         rules.add("tcp:3".into(), "tcp:4".into()).await;
         rules.clear().await;
-        assert!(rules.list().await.is_empty());
+        assert_eq!(rules.list().await, "");
     }
 }

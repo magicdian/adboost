@@ -2,8 +2,8 @@
 //!
 //! Each `case_*` function performs one self-contained check against a device and
 //! returns an [`Outcome`]. They are deliberately generic so the SAME logic runs
-//! against both channels — a USB-direct [`ADBUSBDevice`] and a
-//! through-the-server [`ADBProxyDevice`] — proving parity between adboost's
+//! against both channels — a USB-direct [`ADBUSBDevice`](adboost::usb::ADBUSBDevice) and a
+//! through-the-server [`ADBProxyDevice`](adboost::proxy::ADBProxyDevice) — proving parity between adboost's
 //! direct path and its server frontend.
 //!
 //! Cases avoid leaving persistent device state: files are written under

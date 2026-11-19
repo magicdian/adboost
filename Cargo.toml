@@ -18,6 +18,11 @@ rust-version = "1.88.0"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
+# Many `DeviceBackend` / `ADBDeviceExt` impls answer synchronously, but the async
+# trait contract (AFIT + `trait_variant` Send futures) requires the `async fn`
+# shape. Rewriting them as `fn -> impl Future` would be churn with no behavioral
+# gain, so this style lint is disabled project-wide.
+unused_async_trait_impl = "allow"
 
 [profile.release]
 codegen-units = 1

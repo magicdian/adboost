@@ -2,9 +2,9 @@
 //!
 //! A channel is a way to reach a device:
 //!
-//! - **USB-direct** ([`ADBUSBDevice`]) — adboost talks straight to the device
+//! - **USB-direct** ([`ADBUSBDevice`](adboost::usb::ADBUSBDevice)) — adboost talks straight to the device
 //!   over USB (no adb server in the path). Validates the library's own stack.
-//! - **Through-server** ([`ADBProxyDevice`]) — adboost stands up its OWN ADB
+//! - **Through-server** ([`ADBProxyDevice`](adboost::proxy::ADBProxyDevice)) — adboost stands up its OWN ADB
 //!   server frontend (on an ephemeral loopback port, so it never disturbs a
 //!   real `:5037`) and connects to it as a client. Validates the server
 //!   frontend end-to-end against the same device.
